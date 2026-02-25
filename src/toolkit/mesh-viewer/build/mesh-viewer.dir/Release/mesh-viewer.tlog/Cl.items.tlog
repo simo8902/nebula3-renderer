@@ -1,0 +1,8 @@
+C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\main.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\main.obj
+C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\MeshViewer.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\MeshViewer.obj
+C:\Users\Simeon\Documents\NDEVC\libs\imgui-1.92.5\imgui.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\imgui.obj
+C:\Users\Simeon\Documents\NDEVC\libs\imgui-1.92.5\imgui_draw.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\imgui_draw.obj
+C:\Users\Simeon\Documents\NDEVC\libs\imgui-1.92.5\imgui_tables.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\imgui_tables.obj
+C:\Users\Simeon\Documents\NDEVC\libs\imgui-1.92.5\imgui_widgets.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\imgui_widgets.obj
+C:\Users\Simeon\Documents\NDEVC\libs\imgui-1.92.5\backends\imgui_impl_glfw.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\imgui_impl_glfw.obj
+C:\Users\Simeon\Documents\NDEVC\libs\imgui-1.92.5\backends\imgui_impl_opengl3.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\mesh-viewer.dir\Release\imgui_impl_opengl3.obj

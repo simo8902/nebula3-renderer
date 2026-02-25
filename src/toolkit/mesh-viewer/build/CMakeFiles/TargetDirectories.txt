@@ -1,0 +1,5 @@
+C:/Users/Simeon/Documents/NDEVC/toolkit/mesh-viewer/build/CMakeFiles/glad.dir
+C:/Users/Simeon/Documents/NDEVC/toolkit/mesh-viewer/build/CMakeFiles/ndevc_core.dir
+C:/Users/Simeon/Documents/NDEVC/toolkit/mesh-viewer/build/CMakeFiles/mesh-viewer.dir
+C:/Users/Simeon/Documents/NDEVC/toolkit/mesh-viewer/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/Simeon/Documents/NDEVC/toolkit/mesh-viewer/build/CMakeFiles/ZERO_CHECK.dir

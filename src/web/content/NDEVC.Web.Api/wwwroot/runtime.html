@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NDEVC Runtime Snapshot</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --line: #d8dde3;
+      --text: #1f2833;
+      --muted: #647383;
+      --accent: #0b63ce;
+      --danger-bg: #fff2f2;
+      --danger-line: #f3baba;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Tahoma, sans-serif;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 20px auto;
+      padding: 0 16px 24px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    h1 { margin: 0 0 10px; font-size: 22px; }
+    h2 { margin: 0 0 10px; font-size: 17px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 8px;
+      align-items: center;
+    }
+    input[type="text"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 14px;
+      color: #fff;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    button.alt { background: #4c6076; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 8px;
+    }
+    .kv {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fcfdff;
+    }
+    .kv .k {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      padding: 6px 8px;
+      vertical-align: top;
+    }
+    th { background: #f8f9fb; }
+    code {
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    .error {
+      background: var(--danger-bg);
+      border: 1px solid var(--danger-line);
+      color: #912e2e;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 13px;
+      margin-top: 8px;
+    }
+    .nav {
+      margin-top: 8px;
+      font-size: 13px;
+    }
+    .nav a { color: var(--accent); text-decoration: none; }
+    #meshesBody tr.mesh-missing td {
+      background: #ffe9e9;
+      color: #8a1f1f;
+    }
+    #meshesBody tr.mesh-missing code {
+      background: #ffd6d6;
+      color: #8a1f1f;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Runtime Snapshot</h1>
+      <div class="muted">Imports runtime-loaded data from C++ and enriches each mesh with NVX2 metadata.</div>
+      <div class="toolbar">
+        <input id="pathInput" type="text" placeholder="Snapshot path (leave empty for default path)" />
+        <button id="importBtn" type="button">Import</button>
+        <button id="refreshBtn" class="alt" type="button">Refresh Current</button>
+      </div>
+      <div class="nav">
+        <a href="/nvx2.html">Open standalone NVX2 inspector</a>
+        |
+        <a href="/stream.html">Open live model stream</a>
+        |
+        <a href="/linq-demo.html">Open LINQ + EF Core demos</a>
+      </div>
+      <div id="errorBox"></div>
+    </div>
+
+    <div class="card">
+      <h2>Snapshot Summary</h2>
+      <div id="summaryGrid" class="grid"></div>
+    </div>
+
+    <div class="card">
+      <h2>Runtime Draw Counts</h2>
+      <div id="drawCountsGrid" class="grid"></div>
+    </div>
+
+    <div class="card">
+      <h2>Meshes</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Mesh Resource</th>
+            <th>Mesh Path</th>
+            <th>Runtime Vertices</th>
+            <th>Runtime Indices</th>
+            <th>Runtime Groups</th>
+            <th>File Size</th>
+            <th>NVX2 Groups</th>
+            <th>NVX2 Vertices</th>
+            <th>NVX2 Expected Indices</th>
+            <th>NVX2 Warnings</th>
+          </tr>
+        </thead>
+        <tbody id="meshesBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Map Instances (first 200)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Index</th>
+            <th>Template</th>
+            <th>Group</th>
+            <th>Event</th>
+            <th>Position</th>
+            <th>Rotation</th>
+            <th>Scale</th>
+          </tr>
+        </thead>
+        <tbody id="instancesBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const pathInput = document.getElementById("pathInput");
+    const importBtn = document.getElementById("importBtn");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const errorBox = document.getElementById("errorBox");
+    const summaryGrid = document.getElementById("summaryGrid");
+    const drawCountsGrid = document.getElementById("drawCountsGrid");
+    const meshesBody = document.getElementById("meshesBody");
+    const instancesBody = document.getElementById("instancesBody");
+
+    function fmt(n) {
+      if (n === null || n === undefined) return "";
+      return Number(n).toLocaleString();
+    }
+
+    function fmtVec(v, take = 3) {
+      if (!Array.isArray(v)) return "";
+      return `(${v.slice(0, take).map(x => Number(x).toFixed(3)).join(", ")})`;
+    }
+
+    function setError(message) {
+      errorBox.innerHTML = message ? `<div class="error">${message}</div>` : "";
+    }
+
+    function row(k, v) {
+      return `<div class="kv"><div class="k">${k}</div><div>${v}</div></div>`;
+    }
+
+    async function getDefaultPath() {
+      const res = await fetch("/api/runtime/default-path");
+      if (!res.ok) return "";
+      const data = await res.json();
+      return data.defaultPath || "";
+    }
+
+    async function importSnapshot(path) {
+      const res = await fetch("/api/runtime/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Import failed");
+      }
+      return data;
+    }
+
+    async function loadCurrent() {
+      const res = await fetch("/api/runtime/current");
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "No snapshot loaded");
+      }
+      return data;
+    }
+
+    function render(state) {
+      summaryGrid.innerHTML = "";
+      drawCountsGrid.innerHTML = "";
+      meshesBody.innerHTML = "";
+      instancesBody.innerHTML = "";
+
+      const snap = state.snapshot || {};
+      const runtime = snap.runtime || {};
+      const map = snap.map || {};
+
+      summaryGrid.innerHTML = [
+        row("Imported UTC", state.importedUtc || ""),
+        row("Snapshot Generated UTC", snap.generatedUtc || ""),
+        row("Reason", snap.reason || ""),
+        row("Source Path", `<code>${state.sourcePath || ""}</code>`),
+        row("Map Source Path", `<code>${snap.mapSourcePath || ""}</code>`),
+        row("Schema", `<code>${snap.schema || ""}</code>`),
+        row("Map Instance Count", fmt(map.instanceCount || 0)),
+        row("Loaded Model Instances", fmt(runtime.loadedModelInstanceCount || 0)),
+        row("Meshes in Snapshot", fmt((snap.meshes || []).length)),
+      ].join("");
+
+      const dc = runtime.drawCounts || {};
+      drawCountsGrid.innerHTML = [
+        row("Solid", fmt(dc.solid || 0)),
+        row("AlphaTest", fmt(dc.alphaTest || 0)),
+        row("SimpleLayer", fmt(dc.simpleLayer || 0)),
+        row("Decal", fmt(dc.decal || 0)),
+        row("Water", fmt(dc.water || 0)),
+        row("Refraction", fmt(dc.refraction || 0)),
+        row("Environment", fmt(dc.environment || 0)),
+        row("EnvironmentAlpha", fmt(dc.environmentAlpha || 0)),
+        row("PostAlphaUnlit", fmt(dc.postAlphaUnlit || 0)),
+        row("Particle", fmt(dc.particle || 0))
+      ].join("");
+
+      for (const m of snap.meshes || []) {
+        const nvx2 = m.nvx2Info || null;
+        const warnings = nvx2 && Array.isArray(nvx2.warnings) ? nvx2.warnings.length : 0;
+        const nvx2WarnText = m.nvx2Error
+          ? `Error: ${m.nvx2Error}`
+          : `${warnings}`;
+        const hasMissingMeshFields = !m.meshResourceId || !m.meshPath;
+        const meshResourceText = m.meshResourceId || "MISSING_RESOURCE_ID";
+        const meshPathText = m.meshPath || "MISSING_PATH";
+
+        const tr = document.createElement("tr");
+        if (hasMissingMeshFields) {
+          tr.classList.add("mesh-missing");
+        }
+        tr.innerHTML = `
+          <td><code>${meshResourceText}</code></td>
+          <td><code>${meshPathText}</code></td>
+          <td>${fmt(m.runtimeVertexCount || 0)}</td>
+          <td>${fmt(m.runtimeIndexCount || 0)}</td>
+          <td>${fmt(m.runtimeGroupCount || 0)}</td>
+          <td>${fmt(m.meshFileSizeBytes || 0)}</td>
+          <td>${fmt(nvx2 ? nvx2.numGroups : 0)}</td>
+          <td>${fmt(nvx2 ? nvx2.numVertices : 0)}</td>
+          <td>${fmt(nvx2 ? nvx2.expectedIndexCount : 0)}</td>
+          <td>${nvx2WarnText}</td>`;
+        meshesBody.appendChild(tr);
+      }
+
+      const instances = map.instances || [];
+      for (const inst of instances.slice(0, 200)) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${fmt(inst.index)}</td>
+          <td>${inst.templateName || inst.templateIndex || ""}</td>
+          <td>${fmt(inst.groupIndex)}</td>
+          <td>${fmt(inst.eventMappingIndex)}</td>
+          <td>${fmtVec(inst.position, 3)}</td>
+          <td>${fmtVec(inst.rotation, 4)}</td>
+          <td>${fmtVec(inst.scale, 3)}</td>`;
+        instancesBody.appendChild(tr);
+      }
+    }
+
+    importBtn.addEventListener("click", async () => {
+      setError("");
+      try {
+        const state = await importSnapshot(pathInput.value.trim());
+        render(state);
+      } catch (err) {
+        setError(err.message || String(err));
+      }
+    });
+
+    refreshBtn.addEventListener("click", async () => {
+      setError("");
+      try {
+        const state = await loadCurrent();
+        render(state);
+      } catch (err) {
+        setError(err.message || String(err));
+      }
+    });
+
+    (async () => {
+      pathInput.value = await getDefaultPath();
+      try {
+        const state = await loadCurrent();
+        render(state);
+      } catch {
+        // No current snapshot yet.
+      }
+    })();
+  </script>
+</body>
+</html>

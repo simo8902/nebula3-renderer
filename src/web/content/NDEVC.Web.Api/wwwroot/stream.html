@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NDEVC Runtime Stream</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --line: #d8dde3;
+      --text: #1f2833;
+      --muted: #647383;
+      --accent: #0b63ce;
+      --bad-bg: #ffe9e9;
+      --bad-text: #8a1f1f;
+      --ok: #1f7a35;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Tahoma, sans-serif;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 20px auto;
+      padding: 0 16px 24px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    h1 { margin: 0 0 10px; font-size: 22px; }
+    h2 { margin: 0 0 10px; font-size: 17px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 14px;
+      color: #fff;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    .status-ok { color: var(--ok); font-weight: 600; }
+    .status-bad { color: var(--bad-text); font-weight: 600; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      padding: 6px 8px;
+      vertical-align: top;
+    }
+    th { background: #f8f9fb; }
+    code {
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    tr.missing td {
+      background: var(--bad-bg);
+      color: var(--bad-text);
+    }
+    tr.missing code {
+      background: #ffd6d6;
+      color: var(--bad-text);
+    }
+    #events {
+      margin: 0;
+      padding: 0 0 0 18px;
+      max-height: 260px;
+      overflow: auto;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+    }
+    .nav a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Runtime Model Stream</h1>
+      <div class="muted">Live model list driven by POST events and SSE stream.</div>
+      <div class="toolbar">
+        <button id="reconnectBtn" type="button">Reconnect Stream</button>
+        <button id="clearLogBtn" type="button">Clear Log</button>
+        <span id="statusText" class="status-bad">Disconnected</span>
+        <span class="muted">Last Event ID:</span>
+        <code id="lastEventId">0</code>
+      </div>
+      <div class="nav" style="margin-top:8px;">
+        <a href="/runtime.html">Open runtime snapshot view</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Loaded Models</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Mesh Resource</th>
+            <th>Model Path</th>
+            <th>Seen Count</th>
+            <th>Last Seen UTC</th>
+          </tr>
+        </thead>
+        <tbody id="modelsBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Event Log</h2>
+      <ol id="events"></ol>
+    </div>
+  </div>
+
+  <script>
+    const statusText = document.getElementById("statusText");
+    const lastEventIdEl = document.getElementById("lastEventId");
+    const modelsBody = document.getElementById("modelsBody");
+    const eventsEl = document.getElementById("events");
+    const reconnectBtn = document.getElementById("reconnectBtn");
+    const clearLogBtn = document.getElementById("clearLogBtn");
+
+    let source = null;
+    let lastEventId = 0;
+    const models = new Map();
+
+    function modelKey(item) {
+      if (item.meshResourceId) return `res:${item.meshResourceId}`;
+      if (item.modelPath) return `path:${item.modelPath}`;
+      return "";
+    }
+
+    function updateStatus(connected) {
+      statusText.textContent = connected ? "Connected" : "Disconnected";
+      statusText.className = connected ? "status-ok" : "status-bad";
+    }
+
+    function appendEventLine(evt) {
+      const li = document.createElement("li");
+      li.textContent = `[${evt.eventId}] ${evt.type} | res='${evt.meshResourceId || "MISSING_RESOURCE_ID"}' | path='${evt.modelPath || "MISSING_PATH"}'`;
+      eventsEl.prepend(li);
+      while (eventsEl.children.length > 300) {
+        eventsEl.removeChild(eventsEl.lastChild);
+      }
+    }
+
+    function renderModels() {
+      modelsBody.innerHTML = "";
+      const sorted = [...models.values()].sort((a, b) => {
+        const ra = a.meshResourceId || "";
+        const rb = b.meshResourceId || "";
+        if (ra !== rb) return ra.localeCompare(rb);
+        return (a.modelPath || "").localeCompare(b.modelPath || "");
+      });
+
+      for (const item of sorted) {
+        const missing = !item.meshResourceId || !item.modelPath;
+        const tr = document.createElement("tr");
+        if (missing) tr.classList.add("missing");
+        tr.innerHTML = `
+          <td><code>${item.meshResourceId || "MISSING_RESOURCE_ID"}</code></td>
+          <td><code>${item.modelPath || "MISSING_PATH"}</code></td>
+          <td>${item.seenCount || 0}</td>
+          <td>${item.lastSeenUtc || ""}</td>`;
+        modelsBody.appendChild(tr);
+      }
+    }
+
+    function applyEvent(evt) {
+      if (!evt || !evt.type) return;
+      const key = modelKey(evt);
+
+      if (evt.type === "reset") {
+        models.clear();
+      } else if (evt.type === "model_unloaded") {
+        if (key) models.delete(key);
+      } else {
+        const state = evt.model || {
+          meshResourceId: evt.meshResourceId || "",
+          modelPath: evt.modelPath || "",
+          seenCount: 1,
+          lastSeenUtc: evt.timestampUtc || ""
+        };
+        const resolvedKey = modelKey(state);
+        if (resolvedKey) models.set(resolvedKey, state);
+      }
+
+      if (evt.eventId && evt.eventId > lastEventId) {
+        lastEventId = evt.eventId;
+      }
+      lastEventIdEl.textContent = String(lastEventId);
+      appendEventLine(evt);
+      renderModels();
+    }
+
+    async function loadSnapshot() {
+      const res = await fetch("/api/runtime/models");
+      if (!res.ok) return;
+      const data = await res.json();
+      models.clear();
+      for (const item of data.models || []) {
+        const key = modelKey(item);
+        if (key) models.set(key, item);
+      }
+      lastEventId = data.lastEventId || 0;
+      lastEventIdEl.textContent = String(lastEventId);
+      renderModels();
+    }
+
+    function connect() {
+      if (source) {
+        source.close();
+        source = null;
+      }
+      updateStatus(false);
+
+      source = new EventSource(`/api/runtime/stream?afterEventId=${encodeURIComponent(lastEventId)}`);
+      source.onopen = () => updateStatus(true);
+      source.onerror = () => updateStatus(false);
+      source.onmessage = (e) => {
+        try {
+          const evt = JSON.parse(e.data);
+          applyEvent(evt);
+        } catch {
+          // ignore malformed event
+        }
+      };
+    }
+
+    reconnectBtn.addEventListener("click", () => connect());
+    clearLogBtn.addEventListener("click", () => { eventsEl.innerHTML = ""; });
+
+    (async () => {
+      await loadSnapshot();
+      connect();
+    })();
+  </script>
+</body>
+</html>

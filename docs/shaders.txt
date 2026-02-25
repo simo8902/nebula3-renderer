@@ -1,0 +1,14 @@
+lightmapped || lightmapped2 || lightmapped_alpha -> shd:lightmapped
+shd:lightmapped2_skinned
+shd:lightmapped_environment
+shd:skybox
+shd:multilayer
+shd:volumefog
+shd:uvanimated
+if(particle2 || particle2_additive || particle2_unlit) shd:particle
+if(simple_alpha) simple_alpha
+if(environment_skinned || environment || environment_alpha) shd:environment
+if(gui3d) gui3d
+everything else marked shd:static
+
+qwiiz variants no need

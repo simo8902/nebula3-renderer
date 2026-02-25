@@ -1,0 +1,12 @@
+C:\Users\Simeon\Documents\NDEVC\Rendering.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\Rendering.obj
+C:\Users\Simeon\Documents\NDEVC\Shader.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\Shader.obj
+C:\Users\Simeon\Documents\NDEVC\ShaderManager.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\ShaderManager.obj
+C:\Users\Simeon\Documents\NDEVC\FrameGraph.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\FrameGraph.obj
+C:\Users\Simeon\Documents\NDEVC\Mesh.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\Mesh.obj
+C:\Users\Simeon\Documents\NDEVC\optional.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\optional.obj
+C:\Users\Simeon\Documents\NDEVC\Parser.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\Parser.obj
+C:\Users\Simeon\Documents\NDEVC\Model\Model.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\Model.obj
+C:\Users\Simeon\Documents\NDEVC\Servers\TextureServer.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\TextureServer.obj
+C:\Users\Simeon\Documents\NDEVC\DrawBucketSystem.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\DrawBucketSystem.obj
+C:\Users\Simeon\Documents\NDEVC\MegaBuffer.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\MegaBuffer.obj
+C:\Users\Simeon\Documents\NDEVC\Map\MapLoader.cpp;C:\Users\Simeon\Documents\NDEVC\toolkit\mesh-viewer\build\ndevc_core.dir\Release\MapLoader.obj

@@ -1,0 +1,27 @@
+SMAD - set max distance -> val.float
+SMID - set min distance -> val.float
+STXT - semantic, resource path -> val.string (ShaderTexture)
+    - semantic name(sample DiffMap0)
+    - resource path(sample tex:t000_general/deco_barrel_crate_02_color)
+
+'TRFN' = TransformNode
+'SPND' = ShapeNode
+'CHRN' = CharacterNode
+'CHSN' = CharacterSkinNode
+'PSND' = ParticleSystemNode
+
+byte swapped unknown:
+'HCRH' = bool, single bool flag that appears after bounding box data
+'HSAC' or 'CASH' = comes between StateNode shader params and SHDR tag, followed by bool
+
+
+
+
+
+
+
+
+
+
+
+

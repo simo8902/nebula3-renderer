@@ -1,0 +1,39 @@
+﻿@NDEVC_Web_Api_Host = http://localhost:5000
+
+GET {{NDEVC_Web_Api_Host}}/api/health
+Accept: application/json
+
+###
+
+GET {{NDEVC_Web_Api_Host}}/api/nvx2/components
+Accept: application/json
+
+###
+
+GET {{NDEVC_Web_Api_Host}}/api/nvx2/info?path=src/toolkit/model-viewer/build/Release/m006_imperial_lava/fx_lava_fire_splashes_01_pe2_0.nvx2
+Accept: application/json
+
+###
+
+POST {{NDEVC_Web_Api_Host}}/api/nvx2/info
+Content-Type: application/json
+
+{
+  "path": "src/toolkit/model-viewer/build/Release/m006_imperial_lava/fx_lava_fire_splashes_01_pe2_0.nvx2"
+}
+
+###
+
+GET {{NDEVC_Web_Api_Host}}/api/runtime/models
+Accept: application/json
+
+###
+
+POST {{NDEVC_Web_Api_Host}}/api/runtime/events
+Content-Type: application/json
+
+{
+  "type": "model_loaded",
+  "meshResourceId": "m006_imperial_lava/fx_lava_fire_splashes_01_pe2_0",
+  "modelPath": "C:/assets/meshes/fx_lava_fire_splashes_01_pe2_0.nvx2"
+}
