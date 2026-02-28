@@ -245,6 +245,8 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	bool InitializeImGui();
 	void ShutdownImGui();
 	void RenderImGui();
+	void RenderEditorShell();
+	void BuildEditorDockLayout(unsigned int dockspaceId);
 	void RenderLookAtPanel();
 	struct DisabledDrawKey {
 		void* instance = nullptr;
@@ -352,6 +354,17 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	DrawCmd cachedObj;
 	int cachedIndex = -1;
 	bool imguiInitialized = false;
+	bool editorModeEnabled_ = false;
+	bool editorDockInitialized_ = false;
+	float editorToolbarHeight_ = 44.0f;
+	float sceneViewportX_ = 0.0f;
+	float sceneViewportY_ = 0.0f;
+	float sceneViewportW_ = 0.0f;
+	float sceneViewportH_ = 0.0f;
+	bool sceneViewportValid_ = false;
+	bool sceneViewportHovered_ = false;
+	bool sceneViewportFocused_ = false;
+	bool editorViewportInputRouting_ = true;
 	bool clickPickEnabled = true;
 	bool pickIncludeTransparent = false;
 	bool pickIncludeDecals = false;
@@ -360,6 +373,20 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	std::unordered_set<DisabledDrawKey, DisabledDrawKeyHash> disabledDrawSet;
 	std::vector<DisabledDrawKey> disabledDrawOrder;
 	int disabledSelectionIndex = -1;
+
+	inline bool IsSceneViewportPointerInside(const double x, const double y) const {
+		if (!sceneViewportValid_) return false;
+		return x >= static_cast<double>(sceneViewportX_) &&
+			   y >= static_cast<double>(sceneViewportY_) &&
+			   x <= static_cast<double>(sceneViewportX_ + sceneViewportW_) &&
+			   y <= static_cast<double>(sceneViewportY_ + sceneViewportH_);
+	}
+
+	inline bool IsSceneViewportInputActive() const {
+		if (!editorModeEnabled_ || !editorViewportInputRouting_) return false;
+		if (!sceneViewportValid_) return false;
+		return sceneViewportHovered_ || sceneViewportFocused_;
+	}
 
 	inline void bindTexture(uint32_t slot, GLuint texture) {
 		glActiveTexture(GL_TEXTURE0 + slot);
@@ -411,7 +438,10 @@ public:
 
 	void Initialize() override;
 	void Shutdown() override;
+	void PollEvents() override;
 	void RenderFrame() override;
+	void RenderSingleFrame() override;
+	bool ShouldClose() const override;
 	void Resize(int width, int height) override;
 
 	void AppendModel(const std::string& path, const glm::vec3& pos, const glm::quat& rot, const glm::vec3& scale) override;

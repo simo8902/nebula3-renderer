@@ -432,9 +432,18 @@ void DeferredRenderer::initGLFW() {
             if (w <= 0 || h <= 0) return;
             this->Resize(w, h);
         });
-        window_->SetScrollCallback([this](double, double y) {
-            if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) return;
-            this->camera_.processMouseScroll(static_cast<float>(y));
+        window_->SetScrollCallback([this](double, double scrollY) {
+            if (editorModeEnabled_ && editorViewportInputRouting_) {
+                double cursorX = 0.0;
+                double cursorY = 0.0;
+                if (window_) {
+                    window_->GetCursorPos(cursorX, cursorY);
+                }
+                if (!IsSceneViewportPointerInside(cursorX, cursorY)) return;
+            } else if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
+                return;
+            }
+            this->camera_.processMouseScroll(static_cast<float>(scrollY));
         });
         glfwSetCursorPosCallback(glfwWin, [](GLFWwindow* w, double x, double y) {
             static double lastX = x;
@@ -443,7 +452,15 @@ void DeferredRenderer::initGLFW() {
 
             auto* self = static_cast<DeferredRenderer*>(glfwGetWindowUserPointer(w));
             if (!self) return;
-            if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
+
+            if (self->editorModeEnabled_ && self->editorViewportInputRouting_) {
+                if (!self->IsSceneViewportPointerInside(x, y)) {
+                    lastX = x;
+                    lastY = y;
+                    first = true;
+                    return;
+                }
+            } else if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
                 // Reset camera-look delta state while UI is consuming mouse input.
                 lastX = x;
                 lastY = y;
@@ -1390,9 +1407,28 @@ void DeferredRenderer::Shutdown() {
 }
 
 void DeferredRenderer::RenderFrame() {
-    while (!window_->ShouldClose()) {
-        renderSingleFrame();
+    while (!ShouldClose()) {
+        PollEvents();
+        RenderSingleFrame();
     }
+}
+
+void DeferredRenderer::PollEvents() {
+    if (window_) {
+        window_->PollEvents();
+    }
+    if (inputSystem_) {
+        inputSystem_->Update();
+    }
+}
+
+void DeferredRenderer::RenderSingleFrame() {
+    if (!window_ || window_->ShouldClose()) return;
+    renderSingleFrame();
+}
+
+bool DeferredRenderer::ShouldClose() const {
+    return !window_ || window_->ShouldClose();
 }
 
 void DeferredRenderer::Resize(int newWidth, int newHeight) {

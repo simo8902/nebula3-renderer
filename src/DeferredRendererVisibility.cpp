@@ -89,7 +89,7 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
     if (solidChanged) {
         // The static matrix cache must be rebuilt to reflect the new disabled state
         // of solidDraws (only static-flagged objects go into that cache).
-        DrawBatchSystem::instance().reset(true);
+        DrawBatchSystem::instance().invalidateStaticCache();
     }
     lastVisibleCells_ = visibleCells_;
 }

@@ -31,7 +31,10 @@ public:
 
     virtual void Initialize() = 0;
     virtual void Shutdown() = 0;
+    virtual void PollEvents() = 0;
     virtual void RenderFrame() = 0;
+    virtual void RenderSingleFrame() = 0;
+    virtual bool ShouldClose() const = 0;
     virtual void Resize(int width, int height) = 0;
 
     virtual void AppendModel(const std::string& path, const glm::vec3& pos, const glm::quat& rot, const glm::vec3& scale) = 0;

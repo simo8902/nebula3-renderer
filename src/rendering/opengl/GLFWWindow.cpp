@@ -28,7 +28,7 @@ GLFWWindow::GLFWWindow(const std::string& title, int width, int height)
     g_windowMap[handle_] = this;
 
     glfwMakeContextCurrent(handle_);
-    glfwSwapInterval(0); // vsync off — avoids hard 30 FPS cap when a frame misses the vsync window
+    glfwSwapInterval(0);
 }
 
 GLFWWindow::~GLFWWindow() {

@@ -1258,15 +1258,17 @@ geometryGraph->compile();
             if (optRenderLOG) std::cout << "[LIGHTING] Disabled by kDisableLightingPass\n";
             return;
         }
-        if (deferredShaderUsesPackedGBuffer_) {
-            return;
-        }
         if (optRenderLOG) std::cout << "[LIGHTING] Begin lighting pass\n";
         clearError("Lighting::PassStart");
         GLuint gPosVS = geometryGraph->getTexture("gPositionVS");
-        GLuint gNormalDepth = geometryGraph->getTexture("gNormalDepthPacked");
+        GLuint gNormalDepth = deferredShaderUsesPackedGBuffer_
+            ? geometryGraph->getTexture("gNormalDepthCompat")
+            : geometryGraph->getTexture("gNormalDepthPacked");
         GLuint gPosWS = geometryGraph->getTexture("gPositionWS");
         if (optRenderLOG) std::cout << "[LIGHTING] G-buffer textures: PosVS=" << gPosVS << " Normal=" << gNormalDepth << " PosWS=" << gPosWS << "\n";
+        if (gPosVS == 0 || gNormalDepth == 0 || gPosWS == 0) {
+            return;
+        }
 
         auto shader = shaderManager->GetShader("lighting");
         if (!shader) {
@@ -1370,16 +1372,18 @@ geometryGraph->compile();
             if (optRenderLOG) std::cout << "[POINTLIGHTS] Disabled by kDisablePointLightPass\n";
             return;
         }
-        if (deferredShaderUsesPackedGBuffer_) {
-            return;
-        }
         if (pointLights.empty()) {
             if (optRenderLOG) std::cout << "[POINTLIGHTS] No lights, skipping\n";
             return;
         }
 
-        GLuint gNormalDepth = geometryGraph->getTexture("gNormalDepthPacked");
+        GLuint gNormalDepth = deferredShaderUsesPackedGBuffer_
+            ? geometryGraph->getTexture("gNormalDepthCompat")
+            : geometryGraph->getTexture("gNormalDepthPacked");
         GLuint gPosWS = geometryGraph->getTexture("gPositionWS");
+        if (gNormalDepth == 0 || gPosWS == 0) {
+            return;
+        }
 
         auto shader = shaderManager->GetShader("pointLight");
         if (!shader) return;
@@ -1449,12 +1453,14 @@ compositionPass.depthWrite = false;
 compositionPass.cullFace = false;
 compositionPass.execute = [this]() {
     if (optRenderLOG) std::cout << "[COMPOSITION] Begin composition pass\n";
-    const bool forceCompatibilityUnlit = deferredShaderUsesPackedGBuffer_;
+    const bool forceCompatibilityUnlit = deferredShaderUsesPackedGBuffer_ && !deferredPackedCompatReady_;
     const bool disableLightingForPass = kDisableLighting || forceCompatibilityUnlit;
     const bool disableFogForPass = kDisableFog || forceCompatibilityUnlit;
     GLuint gAlbedo = geometryGraph->getTexture("gAlbedoSpec");
     GLuint gPosVS = geometryGraph->getTexture("gPositionVS");
-    GLuint gNormalDepth = geometryGraph->getTexture(forceCompatibilityUnlit ? "gNormalDepthEncoded" : "gNormalDepthPacked");
+    GLuint gNormalDepth = deferredShaderUsesPackedGBuffer_
+        ? geometryGraph->getTexture("gNormalDepthCompat")
+        : geometryGraph->getTexture("gNormalDepthPacked");
     GLuint gEmissive = geometryGraph->getTexture("gEmissive");
     GLuint lightBuf = lightingGraph->getTexture("lightBuffer");
     GLuint sceneCol = lightingGraph->getTexture("sceneColor");
@@ -1477,7 +1483,7 @@ compositionPass.execute = [this]() {
         return;
     }
 
-    if (forceCompatibilityUnlit) {
+    if (forceCompatibilityUnlit || gNormalDepth == 0 || gPosVS == 0 || lightBuf == 0) {
         auto blit = shaderManager->GetShader("blit");
         if (!blit) {
             std::cerr << "[COMPOSITION] ERROR: blit shader not found for packed compatibility\n";
@@ -1602,7 +1608,7 @@ compositionPass.execute = [this]() {
                 glDepthMask(GL_FALSE);
                 glDisable(GL_STENCIL_TEST);
                 glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
                 glBlendEquation(GL_FUNC_ADD);
                 glDisable(GL_CULL_FACE);
 
@@ -1701,7 +1707,7 @@ compositionPass.execute = [this]() {
                 glDepthMask(GL_FALSE);
                 glDisable(GL_STENCIL_TEST);
                 glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
                 glBlendEquation(GL_FUNC_ADD);
 
                 waterShader->Use();
@@ -1801,7 +1807,7 @@ compositionPass.execute = [this]() {
                     }
                 }
 
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
                 glBlendEquation(GL_FUNC_ADD);
                 glDisable(GL_CULL_FACE);
                 glEnable(GL_DEPTH_TEST);
@@ -1859,8 +1865,8 @@ compositionPass.execute = [this]() {
 
                     const bool additive = dc.cachedIsAdditive;
 
-                    if (additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                    else glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    if (additive) glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+                    else glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 
                     if (additive) {
                         // Swash ribbons are frequently single-sided in authoring; force two-sided in additive pass.
@@ -1974,7 +1980,7 @@ compositionPass.execute = [this]() {
                     glBindSampler(1, 0);
                 }
                 glDisable(GL_CULL_FACE);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
                 checkGLError("After postalphaunlit");
             }
         }
@@ -1987,7 +1993,7 @@ compositionPass.execute = [this]() {
         glDepthFunc(GL_LEQUAL);
         glDisable(GL_STENCIL_TEST);
         glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
         glDisable(GL_CULL_FACE);
 
         if (!kDisableParticlePass && !ParticlesDisabled()) {
@@ -2040,9 +2046,9 @@ compositionPass.execute = [this]() {
                             int colorMode = 2;
                             if (pentry.node->GetBlendMode() == Particles::ParticleBlendMode::Additive) {
                                 colorMode = 1;
-                                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
                             } else {
-                                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
                             }
 
                             const int numAnimPhases = pentry.node->GetNumAnimPhases();
@@ -2070,6 +2076,15 @@ compositionPass.execute = [this]() {
         glBindSampler(0, 0);
         glBindSampler(1, 0);
         glActiveTexture(GL_TEXTURE0);
+
+        if (sceneFBO != 0) {
+            glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
+            glDisable(GL_BLEND);
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        }
 
         // Restore a predictable baseline so following passes don't inherit
         // particle/water overrides.
@@ -2155,7 +2170,6 @@ void DeferredRenderer::renderSingleFrame()
         }
 
         if (width <= 0 || height <= 0) {
-            window_->PollEvents();
             return;
         }
 
@@ -2200,22 +2214,32 @@ void DeferredRenderer::renderSingleFrame()
             if (state) device_->ApplyRenderState(state.get());
         }
 
-        auto blitShader = shaderManager->GetShader("blit");
-        if (blitShader) {
-            blitShader->Use();
-            blitShader->SetInt("tex", 0);
-            GLuint finalTex = lightingGraph->getTexture("sceneColor");
-            if (optRenderLOG) std::cout << "[MAIN] Final blit - texture=" << finalTex << " screenVAO=" << screenVAO << "\n";
-            bindTexture(0, finalTex);
-            glBindVertexArray(screenVAO);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
-            glBindVertexArray(0);
-            if (gEnableGLErrorChecking) {
-                GLenum err = glGetError();
-                if (err != GL_NO_ERROR) std::cerr << "[MAIN] Blit error: 0x" << std::hex << err << std::dec << "\n";
-            }
+        if (editorModeEnabled_) {
+            glDisable(GL_DEPTH_TEST);
+            glDepthMask(GL_FALSE);
+            glDisable(GL_BLEND);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+            glDepthMask(GL_TRUE);
         } else {
-            std::cerr << "[MAIN] ERROR: Blit shader not found!\n";
+            auto blitShader = shaderManager->GetShader("blit");
+            if (blitShader) {
+                blitShader->Use();
+                blitShader->SetInt("tex", 0);
+                GLuint finalTex = lightingGraph->getTexture("sceneColor");
+                if (optRenderLOG) std::cout << "[MAIN] Final blit - texture=" << finalTex << " screenVAO=" << screenVAO << "\n";
+                bindTexture(0, finalTex);
+                glBindVertexArray(screenVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                glBindVertexArray(0);
+                if (gEnableGLErrorChecking) {
+                    GLenum err = glGetError();
+                    if (err != GL_NO_ERROR) std::cerr << "[MAIN] Blit error: 0x" << std::hex << err << std::dec << "\n";
+                }
+            } else {
+                std::cerr << "[MAIN] ERROR: Blit shader not found!\n";
+            }
         }
 
         if (false) {
@@ -2722,7 +2746,9 @@ void DeferredRenderer::renderSingleFrame()
         if (ImGui::GetCurrentContext()) {
             uiWantsKeyboard = ImGui::GetIO().WantCaptureKeyboard;
         }
-        if (!uiWantsKeyboard) {
+        const bool allowViewportKeyboardInput =
+            (editorModeEnabled_ && editorViewportInputRouting_) ? IsSceneViewportInputActive() : !uiWantsKeyboard;
+        if (allowViewportKeyboardInput) {
             // Top-down pan: WASD moves in world XZ regardless of camera pitch.
             GLFWwindow* win = (GLFWwindow*)window_->GetNativeHandle();
             const float speed = 200.0f * (float)deltaTime;
@@ -2744,8 +2770,8 @@ void DeferredRenderer::renderSingleFrame()
         {
             static double lastEventDebugKeyTime = 0.0;
             const double now = glfwGetTime();
-            auto pressed = [this, uiWantsKeyboard](int key) {
-                return !uiWantsKeyboard && inputSystem_->IsKeyPressed(key);
+            auto pressed = [this, allowViewportKeyboardInput](int key) {
+                return allowViewportKeyboardInput && inputSystem_->IsKeyPressed(key);
             };
             auto debounce = [&](bool cond) {
                 return cond && (now - lastEventDebugKeyTime) > 0.2;
@@ -2787,7 +2813,7 @@ void DeferredRenderer::renderSingleFrame()
         }
 
         static bool eKeyWasPressed = false;
-        bool eKeyPressed = !uiWantsKeyboard && inputSystem_->IsKeyPressed(GLFW_KEY_E);
+        bool eKeyPressed = allowViewportKeyboardInput && inputSystem_->IsKeyPressed(GLFW_KEY_E);
         if (eKeyPressed && !eKeyWasPressed) {
             std::cout << "\n[E] Reloading map from camera position...\n";
             ReloadMapWithCurrentMode();
@@ -2795,7 +2821,7 @@ void DeferredRenderer::renderSingleFrame()
         eKeyWasPressed = eKeyPressed;
 
         static bool plusKeyWasPressed = false;
-        bool plusKeyPressed = !uiWantsKeyboard && (inputSystem_->IsKeyPressed(GLFW_KEY_EQUAL) ||
+        bool plusKeyPressed = allowViewportKeyboardInput && (inputSystem_->IsKeyPressed(GLFW_KEY_EQUAL) ||
                               inputSystem_->IsKeyPressed(GLFW_KEY_KP_ADD));
         if (plusKeyPressed && !plusKeyWasPressed) {
             maxInstancesPerFrame += 500;
@@ -2805,7 +2831,7 @@ void DeferredRenderer::renderSingleFrame()
         plusKeyWasPressed = plusKeyPressed;
 
         static bool minusKeyWasPressed = false;
-        bool minusKeyPressed = !uiWantsKeyboard && (inputSystem_->IsKeyPressed(GLFW_KEY_MINUS) ||
+        bool minusKeyPressed = allowViewportKeyboardInput && (inputSystem_->IsKeyPressed(GLFW_KEY_MINUS) ||
                                inputSystem_->IsKeyPressed(GLFW_KEY_KP_SUBTRACT));
         if (minusKeyPressed && !minusKeyWasPressed) {
             maxInstancesPerFrame = std::max(100, maxInstancesPerFrame - 500);
@@ -2815,7 +2841,7 @@ void DeferredRenderer::renderSingleFrame()
         minusKeyWasPressed = minusKeyPressed;
 
         static bool f9WasPressed = false;
-        bool f9Pressed = !uiWantsKeyboard && inputSystem_->IsKeyPressed(GLFW_KEY_F9);
+        bool f9Pressed = allowViewportKeyboardInput && inputSystem_->IsKeyPressed(GLFW_KEY_F9);
         if (f9Pressed && !f9WasPressed) {
             debugShadowView = !debugShadowView;
             std::cout << "\n[F9] Shadow debug view " << (debugShadowView ? "ON" : "OFF") << "\n";
@@ -2823,7 +2849,7 @@ void DeferredRenderer::renderSingleFrame()
         f9WasPressed = f9Pressed;
 
         static bool f10WasPressed = false;
-        bool f10Pressed = !uiWantsKeyboard && inputSystem_->IsKeyPressed(GLFW_KEY_F10);
+        bool f10Pressed = allowViewportKeyboardInput && inputSystem_->IsKeyPressed(GLFW_KEY_F10);
         if (f10Pressed && !f10WasPressed) {
             debugShadowCascade = (debugShadowCascade + 1) % NUM_CASCADES;
             std::cout << "\n[F10] Shadow debug cascade " << debugShadowCascade << "\n";
@@ -2831,7 +2857,7 @@ void DeferredRenderer::renderSingleFrame()
         f10WasPressed = f10Pressed;
 
         static bool f11WasPressed = false;
-        bool f11Pressed = !uiWantsKeyboard && inputSystem_->IsKeyPressed(GLFW_KEY_F11);
+        bool f11Pressed = allowViewportKeyboardInput && inputSystem_->IsKeyPressed(GLFW_KEY_F11);
         f11WasPressed = f11Pressed;
 
         RenderImGui();
@@ -2842,7 +2868,16 @@ void DeferredRenderer::renderSingleFrame()
         }
         static bool lmbWasPressed = false;
         const bool lmbPressed = glfwGetMouseButton((GLFWwindow*)window_->GetNativeHandle(), GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        if (lmbPressed && !lmbWasPressed && !uiWantsMouse) {
+        bool allowViewportMousePick = false;
+        if (editorModeEnabled_ && editorViewportInputRouting_) {
+            double cursorX = 0.0;
+            double cursorY = 0.0;
+            window_->GetCursorPos(cursorX, cursorY);
+            allowViewportMousePick = IsSceneViewportPointerInside(cursorX, cursorY);
+        } else {
+            allowViewportMousePick = !uiWantsMouse;
+        }
+        if (lmbPressed && !lmbWasPressed && allowViewportMousePick) {
             UpdateLookAtSelection(true);
         }
         lmbWasPressed = lmbPressed;
@@ -2859,7 +2894,6 @@ void DeferredRenderer::renderSingleFrame()
         lastFrameDrawCalls_ = frameDrawCalls_;
 
         window_->SwapBuffers();
-        window_->PollEvents();
 }
 
 // ---------------------------------------------------------------------------

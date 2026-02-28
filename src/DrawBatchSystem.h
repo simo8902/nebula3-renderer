@@ -107,6 +107,7 @@ public:
     void flush(GLuint samplerRepeat, int numTexturesToBind = 4);
     void flushDecals(GLuint samplerRepeat, GLuint samplerClamp);
     void reset(bool invalidateStaticCache = false);
+    void invalidateStaticCache();
 
     const std::deque<DrawBatch*>& activeBatches() const { return active_; }
 

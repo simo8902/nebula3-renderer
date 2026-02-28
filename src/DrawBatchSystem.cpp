@@ -215,6 +215,30 @@ void DrawBatchSystem::reset(bool invalidateStaticCache) {
     }
 }
 
+void DrawBatchSystem::invalidateStaticCache() {
+    staticMatrixCount = 0;
+    staticModelMatrices.clear();
+    staticBatchCommands.clear();
+    staticIndirectCommandsPacked_.clear();
+    staticIndirectOffsets_.clear();
+    staticMatricesUploadedBySlot_.fill(false);
+    staticIndirectUploadedBySlot_.fill(false);
+    modelMatrixUploadCursor_ = 0;
+    indirectUploadCursor_ = 0;
+    initialMatrixUploadLogged = false;
+
+    for (auto& [k, batch] : batches_) {
+        batch.commands.clear();
+        batch.perObjectData.clear();
+        batch.decalParams.clear();
+        batch.staticCommandCount = 0;
+    }
+    active_.clear();
+    modelMatrices.clear();
+    perObjectDataBuffer.clear();
+    decalParamsBuffer.clear();
+}
+
 void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
                            const Camera::Frustum& frustum) {
     const bool buildingStaticBatches = staticModelMatrices.empty();

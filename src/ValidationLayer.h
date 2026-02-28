@@ -73,13 +73,14 @@ public:
 
         // Check for denormalized numbers (very close to zero but not zero)
         // These can indicate misalignment
+        /*
         if (value != 0.0f && std::fabs(value) < std::numeric_limits<float>::min()) {
             if (verbose) {
                 std::string msg = indent + "\x1b[34mℹERR detected [" + name + "] Denormalized float detected: "
                           + std::to_string(value) + "\x1b[0m\n";
                 std::cout << msg;
             }
-        }
+        }*/
 
         if (verbose) {
             std::cout << indent << "✓ [" << name << "] = " << value << " (OK)\n";

@@ -115,16 +115,36 @@ void DeferredRenderer::UpdateLookAtSelection(bool force) {
     double cursorY = 0.0;
     window_->GetCursorPos(cursorX, cursorY);
 
-    int winW = 0;
-    int winH = 0;
-    glfwGetWindowSize(glfwWin, &winW, &winH);
-    if (winW <= 0 || winH <= 0) {
-        window_->GetFramebufferSize(winW, winH);
-    }
-    if (winW <= 0 || winH <= 0) return;
+    double viewportX = 0.0;
+    double viewportY = 0.0;
+    int viewportW = 0;
+    int viewportH = 0;
 
-    const float ndcX = static_cast<float>((2.0 * cursorX) / static_cast<double>(winW) - 1.0);
-    const float ndcY = static_cast<float>(1.0 - (2.0 * cursorY) / static_cast<double>(winH));
+    if (editorModeEnabled_ && sceneViewportValid_) {
+        viewportX = static_cast<double>(sceneViewportX_);
+        viewportY = static_cast<double>(sceneViewportY_);
+        viewportW = static_cast<int>(sceneViewportW_);
+        viewportH = static_cast<int>(sceneViewportH_);
+
+        if (cursorX < viewportX || cursorY < viewportY ||
+            cursorX > (viewportX + viewportW) || cursorY > (viewportY + viewportH)) {
+            return;
+        }
+    } else {
+        glfwGetWindowSize(glfwWin, &viewportW, &viewportH);
+        if (viewportW <= 0 || viewportH <= 0) {
+            window_->GetFramebufferSize(viewportW, viewportH);
+        }
+        viewportX = 0.0;
+        viewportY = 0.0;
+    }
+
+    if (viewportW <= 0 || viewportH <= 0) return;
+
+    const double localX = cursorX - viewportX;
+    const double localY = cursorY - viewportY;
+    const float ndcX = static_cast<float>((2.0 * localX) / static_cast<double>(viewportW) - 1.0);
+    const float ndcY = static_cast<float>(1.0 - (2.0 * localY) / static_cast<double>(viewportH));
     const glm::mat4 invViewProj = glm::inverse(camera_.getProjectionMatrix() * camera_.getViewMatrix());
 
     glm::vec4 nearH = invViewProj * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
@@ -204,4 +224,3 @@ void DeferredRenderer::UpdateLookAtSelection(bool force) {
 
     pickLastUpdateMs = (glfwGetTime() - beginTime) * 1000.0;
 }
-
