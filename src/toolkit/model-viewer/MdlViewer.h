@@ -9,9 +9,9 @@
 #include <string>
 #include <memory>
 #include <filesystem>
-#include "Parser.h"
-#include "Model/Model.h"
-#include "Camera.h"
+#include "Assets/Parser.h"
+#include "Assets/Model/Model.h"
+#include "Rendering/Camera.h"
 #include "glm.hpp"
 
 class MdlViewer {

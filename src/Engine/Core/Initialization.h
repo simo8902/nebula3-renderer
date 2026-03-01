@@ -1,17 +1,6 @@
-#ifndef NDEVC_INITIALIZATION_H
-#define NDEVC_INITIALIZATION_H
+#ifndef NDEVC_ENGINE_CORE_INITIALIZATION_SHIM_H
+#define NDEVC_ENGINE_CORE_INITIALIZATION_SHIM_H
 
-#include "Core.h"
-
-class Initialization {
-public:
-    Initialization();
-    ~Initialization();
-
-    void RunMainLoop() const;
-
-private:
-    NDEVC::Engine::Core& core;
-};
+#include "Core/Initialization.h"
 
 #endif

@@ -1,8 +1,15 @@
 // Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
-#include "OpenGLTexture.h"
+#include "Rendering/OpenGL/OpenGLTexture.h"
 #include <stdexcept>
+
+#ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F1
+#endif
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#endif
 
 namespace NDEVC::Graphics::OpenGL {
 
@@ -95,12 +102,12 @@ void OpenGLTexture::ConvertFormat(Format format, GLenum& internalFormat, GLenum&
             type = GL_FLOAT_32_UNSIGNED_INT_24_8_REV;
             break;
         case Format::BC1:
-          //  internalFormat = GL_COMPRESSED_RGB_S3TC_DXT1_EXT;
+            internalFormat = GL_COMPRESSED_RGB_S3TC_DXT1_EXT;
             baseFormat = GL_RGB;
             type = GL_UNSIGNED_BYTE;
             break;
         case Format::BC3:
-           // internalFormat = GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+            internalFormat = GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
             baseFormat = GL_RGBA;
             type = GL_UNSIGNED_BYTE;
             break;

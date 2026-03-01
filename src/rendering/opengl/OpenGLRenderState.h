@@ -3,7 +3,7 @@
 
 #ifndef NDEVC_GL_RENDER_STATE_H
 #define NDEVC_GL_RENDER_STATE_H
-#include "../abstract/IRenderState.h"
+#include "Rendering/Interfaces/IRenderState.h"
 
 namespace NDEVC::Graphics::OpenGL {
 

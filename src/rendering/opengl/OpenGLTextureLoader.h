@@ -4,7 +4,7 @@
 #ifndef NDEVC_GL_TEXTURE_LOADER_H
 #define NDEVC_GL_TEXTURE_LOADER_H
 
-#include "../abstract/ITextureLoader.h"
+#include "Rendering/Interfaces/ITextureLoader.h"
 
 namespace NDEVC::Graphics::OpenGL {
 

@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
-#include "OpenGLTextureLoader.h"
-#include "OpenGLTexture.h"
+#include "Rendering/OpenGL/OpenGLTextureLoader.h"
+#include "Rendering/OpenGL/OpenGLTexture.h"
 #if defined(NDEVC_HAS_DIRECTXTEX) && NDEVC_HAS_DIRECTXTEX
 #include "DirectXTex/DirectXTex.h"
 #endif

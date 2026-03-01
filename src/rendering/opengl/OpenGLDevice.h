@@ -6,7 +6,7 @@
 
 #include <glad/glad.h>
 #include <memory>
-#include "../abstract/IGraphicsDevice.h"
+#include "Rendering/Interfaces/IGraphicsDevice.h"
 
 namespace NDEVC::Graphics::OpenGL {
 

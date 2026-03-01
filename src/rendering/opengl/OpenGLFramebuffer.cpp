@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
-#include "OpenGLFramebuffer.h"
+#include "Rendering/OpenGL/OpenGLFramebuffer.h"
 #include <stdexcept>
 #include <iostream>
 
@@ -42,7 +42,25 @@ void OpenGLFramebuffer::CreateFramebuffer() {
     }
 
     if (!drawBuffers.empty()) {
-        glDrawBuffers(drawBuffers.size(), drawBuffers.data());
+        GLint maxDrawBuffers = 0;
+        glGetIntegerv(GL_MAX_DRAW_BUFFERS, &maxDrawBuffers);
+
+        GLsizei drawCount = static_cast<GLsizei>(drawBuffers.size());
+        if (maxDrawBuffers > 0 && drawCount > maxDrawBuffers) {
+            static bool warnedDrawBufferClamp = false;
+            if (!warnedDrawBufferClamp) {
+                std::cerr << "[OpenGLFramebuffer] GL_MAX_DRAW_BUFFERS=" << maxDrawBuffers
+                          << "; clamping framebuffer draw buffers from " << drawCount
+                          << " to " << maxDrawBuffers << ".\n";
+                warnedDrawBufferClamp = true;
+            }
+            drawCount = maxDrawBuffers;
+        }
+        if (drawCount <= 0) {
+            drawCount = 1;
+        }
+
+        glDrawBuffers(drawCount, drawBuffers.data());
     } else if (desc_.depthStencilAttachment.texture) {
         glDrawBuffer(GL_NONE);
         glReadBuffer(GL_NONE);

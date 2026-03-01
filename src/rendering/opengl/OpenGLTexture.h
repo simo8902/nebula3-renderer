@@ -5,7 +5,7 @@
 #define NDEVC_GL_TEXTURE_H
 
 #include <glad/glad.h>
-#include "../abstract/ITexture.h"
+#include "Rendering/Interfaces/ITexture.h"
 namespace NDEVC::Graphics::OpenGL {
 
 class OpenGLTexture : public ITexture {

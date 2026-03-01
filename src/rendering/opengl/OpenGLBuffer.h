@@ -5,7 +5,7 @@
 #define NDEVC_GL_BUFFER_H
 
 #include <glad/glad.h>
-#include "../abstract/IBuffer.h"
+#include "Rendering/Interfaces/IBuffer.h"
 
 namespace NDEVC::Graphics::OpenGL {
 

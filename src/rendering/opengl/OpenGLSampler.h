@@ -5,7 +5,7 @@
 #define NDEVC_GL_SAMPLER_H
 
 #include <glad/glad.h>
-#include "../abstract/ISampler.h"
+#include "Rendering/Interfaces/ISampler.h"
 
 namespace NDEVC::Graphics::OpenGL {
 

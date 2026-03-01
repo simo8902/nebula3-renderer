@@ -81,18 +81,18 @@ if(NOT TARGET ndevc_core)
     endif()
 
     add_library(ndevc_core STATIC
-        ${NDEVC_SRC_ROOT}/Rendering.cpp
-        ${NDEVC_SRC_ROOT}/Shader.cpp
-        ${NDEVC_SRC_ROOT}/ShaderManager.cpp
-        ${NDEVC_SRC_ROOT}/FrameGraph.cpp
-        ${NDEVC_SRC_ROOT}/Mesh.cpp
-        ${NDEVC_SRC_ROOT}/optional.cpp
-        ${NDEVC_SRC_ROOT}/Parser.cpp
-        ${NDEVC_SRC_ROOT}/Model/Model.cpp
-        ${NDEVC_SRC_ROOT}/Servers/TextureServer.cpp
-        ${NDEVC_SRC_ROOT}/DrawBatchSystem.cpp
-        ${NDEVC_SRC_ROOT}/MegaBuffer.cpp
-        ${NDEVC_SRC_ROOT}/Map/MapLoader.cpp
+        ${NDEVC_SRC_ROOT}/Rendering/Rendering.cpp
+        ${NDEVC_SRC_ROOT}/Rendering/Shader.cpp
+        ${NDEVC_SRC_ROOT}/Rendering/ShaderManager.cpp
+        ${NDEVC_SRC_ROOT}/Rendering/FrameGraph.cpp
+        ${NDEVC_SRC_ROOT}/Rendering/Mesh.cpp
+        ${NDEVC_SRC_ROOT}/Core/GlobalState.cpp
+        ${NDEVC_SRC_ROOT}/Assets/Parser.cpp
+        ${NDEVC_SRC_ROOT}/Assets/Model/Model.cpp
+        ${NDEVC_SRC_ROOT}/Assets/Servers/TextureServer.cpp
+        ${NDEVC_SRC_ROOT}/Rendering/DrawBatchSystem.cpp
+        ${NDEVC_SRC_ROOT}/Rendering/MegaBuffer.cpp
+        ${NDEVC_SRC_ROOT}/Assets/Map/MapLoader.cpp
     )
 
     set_property(TARGET ndevc_core PROPERTY CXX_STANDARD 20)

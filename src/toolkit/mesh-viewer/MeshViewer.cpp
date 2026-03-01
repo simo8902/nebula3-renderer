@@ -2,12 +2,12 @@
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
 #include "MeshViewer.h"
-#include "Mesh.h"
-#include "Shader.h"
-#include "Camera.h"
-#include "NDEVcStructure.h"
-#include "ValidationLayer.h"
-#include "optional.h"
+#include "Rendering/Mesh.h"
+#include "Rendering/Shader.h"
+#include "Rendering/Camera.h"
+#include "Assets/NDEVcStructure.h"
+#include "Rendering/ValidationLayer.h"
+#include "Core/GlobalState.h"
 #include "glm.hpp"
 #include "gtc/matrix_transform.hpp"
 #include "imgui.h"

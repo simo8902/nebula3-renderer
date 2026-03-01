@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
-#include "OpenGLDevice.h"
-#include "OpenGLTexture.h"
-#include "OpenGLFramebuffer.h"
-#include "OpenGLRenderState.h"
-#include "OpenGLBuffer.h"
-#include "OpenGLSampler.h"
+#include "Rendering/OpenGL/OpenGLDevice.h"
+#include "Rendering/OpenGL/OpenGLTexture.h"
+#include "Rendering/OpenGL/OpenGLFramebuffer.h"
+#include "Rendering/OpenGL/OpenGLRenderState.h"
+#include "Rendering/OpenGL/OpenGLBuffer.h"
+#include "Rendering/OpenGL/OpenGLSampler.h"
 
 namespace NDEVC::Graphics::OpenGL {
 

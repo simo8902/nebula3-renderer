@@ -5,7 +5,7 @@
 #define NDEVC_GL_FRAMEBUFFER_H
 
 #include <glad/glad.h>
-#include "../abstract/IFramebuffer.h"
+#include "Rendering/Interfaces/IFramebuffer.h"
 
 namespace NDEVC::Graphics::OpenGL {
 

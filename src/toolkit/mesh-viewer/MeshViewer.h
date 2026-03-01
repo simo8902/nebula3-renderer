@@ -8,7 +8,7 @@
 #include <GLFW/glfw3.h>
 #include <string>
 #include <vector>
-#include "Mesh.h"
+#include "Rendering/Mesh.h"
 #include "glm.hpp"
 
 class MeshViewer {
