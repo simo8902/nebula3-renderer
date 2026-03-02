@@ -11,11 +11,15 @@
 #include "gtc/quaternion.hpp"
 #include "gtc/matrix_transform.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <limits>
+#include <unordered_set>
 
 namespace {
 glm::mat4 BuildLocalTransform(const Node* node) {
@@ -24,6 +28,26 @@ glm::mat4 BuildLocalTransform(const Node* node) {
     const glm::quat rot(node->rotation.w, node->rotation.x, node->rotation.y, node->rotation.z);
     const glm::vec3 scl(node->scale.x, node->scale.y, node->scale.z);
     return glm::translate(glm::mat4(1.0f), pos) * glm::mat4_cast(rot) * glm::scale(glm::mat4(1.0f), scl);
+}
+
+bool MatrixIsFinite(const glm::mat4& matrix) {
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            if (!std::isfinite(matrix[c][r])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool MatricesNearlyEqual(const glm::mat4& a, const glm::mat4& b) {
+    return std::memcmp(&a, &b, sizeof(glm::mat4)) == 0;
+}
+
+bool TryComputeInverse(const glm::mat4& matrix, glm::mat4& outInverse) {
+    outInverse = glm::inverse(matrix);
+    return MatrixIsFinite(outInverse);
 }
 
 std::string ToLower(std::string value) {
@@ -164,6 +188,68 @@ const std::string* FindStringParamNoCase(const std::unordered_map<std::string, s
 bool StringIsTruthy(const std::string& value) {
     const std::string lowered = ToLower(value);
     return lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on";
+}
+
+bool StringIsFalsey(const std::string& value) {
+    const std::string lowered = ToLower(value);
+    return lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off";
+}
+
+bool TryReadNodeBoolParam(const Node* node, const char* key, bool& outValue) {
+    if (!node || !key || !*key) return false;
+
+    if (const int32_t* value = FindIntParamNoCase(node->shader_params_int, key)) {
+        outValue = (*value != 0);
+        return true;
+    }
+    if (const float* value = FindFloatParamNoCase(node->shader_params_float, key)) {
+        outValue = (*value > 0.5f);
+        return true;
+    }
+    if (const std::string* value = FindStringParamNoCase(node->string_attrs, key)) {
+        if (StringIsTruthy(*value)) {
+            outValue = true;
+            return true;
+        }
+        if (StringIsFalsey(*value)) {
+            outValue = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class NodeMobilityHint {
+    None,
+    Static,
+    Dynamic
+};
+
+NodeMobilityHint ResolveNodeMobilityHint(const Node* node) {
+    if (!node) {
+        return NodeMobilityHint::None;
+    }
+
+    bool value = false;
+    const char* dynamicKeys[] = {
+        "IsDynamic", "Dynamic", "Movable", "IsMovable", "NonStatic"
+    };
+    for (const char* key : dynamicKeys) {
+        if (TryReadNodeBoolParam(node, key, value) && value) {
+            return NodeMobilityHint::Dynamic;
+        }
+    }
+
+    const char* staticKeys[] = {
+        "IsStatic", "Static", "StaticNode", "NodeStatic", "RenderStatic"
+    };
+    for (const char* key : staticKeys) {
+        if (TryReadNodeBoolParam(node, key, value)) {
+            return value ? NodeMobilityHint::Static : NodeMobilityHint::Dynamic;
+        }
+    }
+
+    return NodeMobilityHint::None;
 }
 
 bool ResolveDecalReceiveSolid(const Node* node) {
@@ -324,6 +410,11 @@ private:
     GLuint handle_ = 0;
     NDEVC::Graphics::TextureType type_ = NDEVC::Graphics::TextureType::Texture2D;
 };
+
+double NowSeconds() {
+    using Clock = std::chrono::steady_clock;
+    return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+}
 }
 
 void SceneManager::Initialize(NDEVC::Graphics::IGraphicsDevice* device,
@@ -365,17 +456,21 @@ void SceneManager::LoadMap(const MapData* map) {
     scenePostAlphaUnlitDraws_.clear();
     sceneWaterDraws_.clear();
     sceneParticleDraws_.clear();
+    instanceTransformCache_.clear();
+    movedInstanceOwners_.clear();
 
     if (!map) {
         ownedCurrentMap_.reset();
         currentMap = nullptr;
         currentMapSourcePath_.clear();
+        drawListsDirty_ = true;
         NC::LOGGING::Warning("[SCENE] LoadMap cleared current map (null input)");
         return;
     }
     ownedCurrentMap_ = std::make_unique<MapData>(*map);
     currentMap = ownedCurrentMap_.get();
-    LoadMapInstances(currentMap);
+    BuildStreamingIndex(currentMap);
+    UpdateIncrementalStreaming(true);
 
     {
         size_t totalDraws = 0;
@@ -477,6 +572,7 @@ void SceneManager::LoadMap(const MapData* map) {
         }
     }
 
+    drawListsDirty_ = true;
     NC::LOGGING::Log("[SCENE] LoadMap end instances=", instances.size(),
                      " solid=", sceneSolidDraws_.size(),
                      " alpha=", sceneAlphaTestDraws_.size(),
@@ -532,14 +628,52 @@ void SceneManager::Clear() {
     scenePostAlphaUnlitDraws_.clear();
     sceneWaterDraws_.clear();
     sceneParticleDraws_.clear();
+    instanceTransformCache_.clear();
+    movedInstanceOwners_.clear();
+    drawListsDirty_ = true;
     NC::LOGGING::Log("[SCENE] Clear end");
 }
 
 void SceneManager::Tick(double dt, const Camera& camera) {
     (void)dt;
-    (void)camera;
-    NC::LOGGING::Log("[SCENE] Tick dt=", dt, " instances=", instances.size());
+    streamCameraPos_ = camera.getPosition();
+    streamCameraValid_ = true;
     UpdateIncrementalStreaming(false);
+
+    movedInstanceOwners_.clear();
+    std::unordered_set<void*> liveOwners;
+    liveOwners.reserve(instances.size());
+
+    for (const auto& instance : instances) {
+        if (!instance) continue;
+        void* owner = static_cast<void*>(instance.get());
+        liveOwners.insert(owner);
+
+        const glm::mat4 currentTransform = instance->getTransform();
+        auto cacheIt = instanceTransformCache_.find(owner);
+        if (cacheIt == instanceTransformCache_.end()) {
+            instanceTransformCache_.emplace(owner, currentTransform);
+            movedInstanceOwners_.insert(owner);
+            continue;
+        }
+
+        if (!MatricesNearlyEqual(cacheIt->second, currentTransform)) {
+            cacheIt->second = currentTransform;
+            movedInstanceOwners_.insert(owner);
+        }
+    }
+
+    for (auto it = instanceTransformCache_.begin(); it != instanceTransformCache_.end();) {
+        if (liveOwners.find(it->first) == liveOwners.end()) {
+            it = instanceTransformCache_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (!movedInstanceOwners_.empty()) {
+        PropagateMovedInstanceTransformsToAllSceneDraws();
+    }
     // animation tick will go here
 }
 
@@ -557,6 +691,23 @@ void SceneManager::PrepareDrawLists(
     std::vector<DrawCmd>& waterDraws,
     std::vector<DrawCmd*>& animatedDraws) {
     (void)camera;
+
+    if (!drawListsDirty_) {
+        if (!movedInstanceOwners_.empty()) {
+            PropagateMovedInstanceTransforms(solidDraws);
+            PropagateMovedInstanceTransforms(alphaTestDraws);
+            PropagateMovedInstanceTransforms(decalDraws);
+            PropagateMovedInstanceTransforms(particleDraws);
+            PropagateMovedInstanceTransforms(environmentDraws);
+            PropagateMovedInstanceTransforms(environmentAlphaDraws);
+            PropagateMovedInstanceTransforms(simpleLayerDraws);
+            PropagateMovedInstanceTransforms(refractionDraws);
+            PropagateMovedInstanceTransforms(postAlphaUnlitDraws);
+            PropagateMovedInstanceTransforms(waterDraws);
+        }
+        return;
+    }
+    drawListsDirty_ = false;
 
     solidDraws = sceneSolidDraws_;
     alphaTestDraws = sceneAlphaTestDraws_;
@@ -579,6 +730,19 @@ void SceneManager::PrepareDrawLists(
     RefreshMegaOffsets(postAlphaUnlitDraws);
     RefreshMegaOffsets(waterDraws);
     RefreshMegaOffsets(particleDraws);
+
+    if (!movedInstanceOwners_.empty()) {
+        PropagateMovedInstanceTransforms(solidDraws);
+        PropagateMovedInstanceTransforms(alphaTestDraws);
+        PropagateMovedInstanceTransforms(decalDraws);
+        PropagateMovedInstanceTransforms(particleDraws);
+        PropagateMovedInstanceTransforms(environmentDraws);
+        PropagateMovedInstanceTransforms(environmentAlphaDraws);
+        PropagateMovedInstanceTransforms(simpleLayerDraws);
+        PropagateMovedInstanceTransforms(refractionDraws);
+        PropagateMovedInstanceTransforms(postAlphaUnlitDraws);
+        PropagateMovedInstanceTransforms(waterDraws);
+    }
 
     animatedDraws.clear();
     auto collectAnimated = [&animatedDraws](std::vector<DrawCmd>& draws) {
@@ -609,6 +773,74 @@ void SceneManager::PrepareDrawLists(
                      " postAlpha=", postAlphaUnlitDraws.size(),
                      " water=", waterDraws.size(),
                      " animated=", animatedDraws.size());
+}
+
+void SceneManager::PropagateMovedInstanceTransforms(std::vector<DrawCmd>& draws) {
+    if (draws.empty() || movedInstanceOwners_.empty()) {
+        return;
+    }
+
+    std::unordered_map<const Node*, glm::mat4> localToModelCache;
+    std::function<glm::mat4(const Node*)> modelSpaceTransform = [&](const Node* node) -> glm::mat4 {
+        if (!node) return glm::mat4(1.0f);
+        auto it = localToModelCache.find(node);
+        if (it != localToModelCache.end()) {
+            return it->second;
+        }
+        const glm::mat4 local = BuildLocalTransform(node);
+        const glm::mat4 parent = node->node_parent ? modelSpaceTransform(node->node_parent) : glm::mat4(1.0f);
+        const glm::mat4 result = parent * local;
+        localToModelCache.emplace(node, result);
+        return result;
+    };
+
+    for (DrawCmd& dc : draws) {
+        if (!dc.instance) continue;
+        if (movedInstanceOwners_.find(dc.instance) == movedInstanceOwners_.end()) continue;
+
+        const auto transformIt = instanceTransformCache_.find(dc.instance);
+        if (transformIt == instanceTransformCache_.end()) continue;
+        const glm::mat4& instanceTransform = transformIt->second;
+        if (MatricesNearlyEqual(dc.rootMatrix, instanceTransform)) continue;
+
+        glm::mat4 localTransform(1.0f);
+        bool hasLocalTransform = false;
+        if (dc.sourceNode) {
+            localTransform = modelSpaceTransform(dc.sourceNode);
+            hasLocalTransform = true;
+        } else {
+            glm::mat4 inverseRoot(1.0f);
+            if (TryComputeInverse(dc.rootMatrix, inverseRoot)) {
+                localTransform = inverseRoot * dc.worldMatrix;
+                hasLocalTransform = MatrixIsFinite(localTransform);
+            }
+        }
+
+        dc.rootMatrix = instanceTransform;
+        if (hasLocalTransform) {
+            dc.worldMatrix = instanceTransform * localTransform;
+        }
+        dc.cullBoundsValid = false;
+        dc.cullTransformHash = 0ull;
+        dc.frustumCulled = false;
+        if (dc.isStatic) {
+            // Avoid stale static-batch matrices after runtime transform changes.
+            dc.isStatic = false;
+        }
+    }
+}
+
+void SceneManager::PropagateMovedInstanceTransformsToAllSceneDraws() {
+    PropagateMovedInstanceTransforms(sceneSolidDraws_);
+    PropagateMovedInstanceTransforms(sceneAlphaTestDraws_);
+    PropagateMovedInstanceTransforms(sceneDecalDraws_);
+    PropagateMovedInstanceTransforms(sceneParticleDraws_);
+    PropagateMovedInstanceTransforms(sceneEnvironmentDraws_);
+    PropagateMovedInstanceTransforms(sceneEnvironmentAlphaDraws_);
+    PropagateMovedInstanceTransforms(sceneSimpleLayerDraws_);
+    PropagateMovedInstanceTransforms(sceneRefractionDraws_);
+    PropagateMovedInstanceTransforms(scenePostAlphaUnlitDraws_);
+    PropagateMovedInstanceTransforms(sceneWaterDraws_);
 }
 
 ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
@@ -686,6 +918,7 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
             }
             classifyDraw(std::move(dc));
         }
+    drawListsDirty_ = true;
     NC::LOGGING::Log("[SCENE] appendN3WTransform success path=", modelPath,
                      " draws=", newDraws.size(),
                      " totalInstances=", instances.size());
@@ -756,7 +989,6 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
         dc.group = node->primitive_group_idx;
         dc.instance = instance;
         dc.sourceNode = node;
-        dc.isStatic = true;
         dc.receivesDecals = ResolveDecalReceiveSolid(node);
 
         dc.shaderParamsTexture = node->shader_params_texture;
@@ -874,6 +1106,16 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
         dc.hasShaderVarAnimations = std::any_of(
             node->animSections.begin(), node->animSections.end(),
             [](const AnimSection& section) { return !section.shaderVarSemantic.empty(); });
+        const NodeMobilityHint mobilityHint = ResolveNodeMobilityHint(node);
+        if (mobilityHint == NodeMobilityHint::Dynamic) {
+            dc.isStatic = false;
+        } else if (dc.hasPotentialTransformAnimation || dc.hasShaderVarAnimations) {
+            dc.isStatic = false;
+        } else if (mobilityHint == NodeMobilityHint::Static) {
+            dc.isStatic = true;
+        } else {
+            dc.isStatic = true;
+        }
 
         out.push_back(std::move(dc));
     }
@@ -998,56 +1240,413 @@ void SceneManager::LoadMapInstances(const MapData* map) {
 }
 
 void SceneManager::ResetStreamingState() {
-    // TODO: move from DeferredRenderer
+    streamState_ = StreamWindowState{};
+    streamCameraValid_ = false;
 }
 
 void SceneManager::BuildStreamingIndex(const MapData* map) {
-    (void)map;
-    // TODO: move from DeferredRenderer
+    ResetStreamingState();
+    if (!map) {
+        return;
+    }
+
+    streamState_.map = map;
+    streamState_.gridW = map->info.map_size_x > 0 ? map->info.map_size_x : 32;
+    streamState_.gridH = map->info.map_size_z > 0 ? map->info.map_size_z : 32;
+    streamState_.cellSizeX = map->info.grid_size.x > 0.0f ? map->info.grid_size.x : 32.0f;
+    streamState_.cellSizeZ = map->info.grid_size.z > 0.0f ? map->info.grid_size.z : 32.0f;
+    streamState_.originXZ = glm::vec2(map->info.center.x - map->info.extents.x,
+                                      map->info.center.z - map->info.extents.z);
+    if (streamState_.gridW <= 0 || streamState_.gridH <= 0) {
+        streamState_.gridW = 32;
+        streamState_.gridH = 32;
+    }
+    if (streamState_.cellSizeX <= 0.0f) streamState_.cellSizeX = 32.0f;
+    if (streamState_.cellSizeZ <= 0.0f) streamState_.cellSizeZ = 32.0f;
+
+    streamState_.cellToInstances.clear();
+    streamState_.cellToInstances.resize(static_cast<size_t>(streamState_.gridW) * streamState_.gridH);
+    for (size_t mapIndex = 0; mapIndex < map->instances.size(); ++mapIndex) {
+        const Instance& inst = map->instances[mapIndex];
+        int cx = static_cast<int>(std::floor((inst.pos.x - streamState_.originXZ.x) / streamState_.cellSizeX));
+        int cz = static_cast<int>(std::floor((inst.pos.z - streamState_.originXZ.y) / streamState_.cellSizeZ));
+        cx = std::clamp(cx, 0, streamState_.gridW - 1);
+        cz = std::clamp(cz, 0, streamState_.gridH - 1);
+        const size_t cellIndex = static_cast<size_t>(cz * streamState_.gridW + cx);
+        streamState_.cellToInstances[cellIndex].push_back(mapIndex);
+    }
+    streamState_.lastTickTime = 0.0;
+    streamState_.initialized = true;
+    NC::LOGGING::Log("[SCENE][STREAM] BuildStreamingIndex cells=", streamState_.cellToInstances.size(),
+                     " mapInstances=", map->instances.size(),
+                     " grid=", streamState_.gridW, "x", streamState_.gridH);
 }
 
 int SceneManager::ComputeStreamingCellIndex(const glm::vec3& worldPos) const {
-    (void)worldPos;
-    // TODO: move from DeferredRenderer
-    return -1;
+    if (!streamState_.initialized || streamState_.gridW <= 0 || streamState_.gridH <= 0) {
+        return -1;
+    }
+    const float fx = (worldPos.x - streamState_.originXZ.x) / streamState_.cellSizeX;
+    const float fz = (worldPos.z - streamState_.originXZ.y) / streamState_.cellSizeZ;
+    if (!std::isfinite(fx) || !std::isfinite(fz)) {
+        return -1;
+    }
+    if (fx < 0.0f || fz < 0.0f ||
+        fx >= static_cast<float>(streamState_.gridW) ||
+        fz >= static_cast<float>(streamState_.gridH)) {
+        return -1;
+    }
+    const int cx = static_cast<int>(std::floor(fx));
+    const int cz = static_cast<int>(std::floor(fz));
+    return cz * streamState_.gridW + cx;
 }
 
 ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t mapIndex) {
-    (void)map;
-    (void)mapIndex;
-    // TODO: move from DeferredRenderer
-    return nullptr;
+    if (!map || mapIndex >= map->instances.size()) {
+        return nullptr;
+    }
+    auto loadedIt = streamState_.loadedOwnersByMapIndex.find(mapIndex);
+    if (loadedIt != streamState_.loadedOwnersByMapIndex.end()) {
+        void* owner = loadedIt->second;
+        for (const auto& instance : instances) {
+            if (instance && static_cast<void*>(instance.get()) == owner) {
+                return instance.get();
+            }
+        }
+        streamState_.loadedOwnersByMapIndex.erase(loadedIt);
+    }
+
+    const Instance& inst = map->instances[mapIndex];
+    if (inst.templ_index < 0 || static_cast<size_t>(inst.templ_index) >= map->templates.size()) {
+        return nullptr;
+    }
+    const Template& tmpl = map->templates[inst.templ_index];
+    if (tmpl.gfx_res_id >= map->string_table.size()) {
+        return nullptr;
+    }
+
+    const std::string& mapModelId = map->string_table[tmpl.gfx_res_id];
+    const std::string modelPath = ResolveModelPath(mapModelId);
+    if (modelPath.empty()) {
+        return nullptr;
+    }
+
+    Reporter rep;
+    rep.currentFile = modelPath;
+    Options opt;
+    opt.n3filepath = modelPath;
+    auto model = ModelServer::instance().loadModel(modelPath, rep, opt);
+    if (!model) {
+        return nullptr;
+    }
+
+    auto modelInstance = ModelServer::instance().createInstance(model);
+    if (!modelInstance) {
+        return nullptr;
+    }
+
+    const glm::vec3 pos(inst.pos.x, inst.pos.y, inst.pos.z);
+    const glm::quat rot(inst.rot.w, inst.rot.x, inst.rot.y, inst.rot.z);
+    const glm::vec3 scale = inst.use_scaling
+        ? glm::vec3(inst.scale.x, inst.scale.y, inst.scale.z)
+        : glm::vec3(1.0f);
+    modelInstance->setTransform(pos, rot, scale);
+
+    ModelInstance* rawInstance = modelInstance.get();
+    void* owner = static_cast<void*>(rawInstance);
+    instances.push_back(modelInstance);
+    instanceSpawnTimes[owner] = 0.0;
+    instanceModelPathByOwner_[owner] = modelPath;
+    ++loadedModelRefCountByPath_[modelPath];
+
+    std::vector<DrawCmd> draws;
+    BuildDrawsWithTransform(*model, modelInstance->getTransform(), owner, draws);
+
+    auto classifyDraw = [this](DrawCmd&& dc) {
+        switch (DetermineDrawBucket(dc)) {
+        case DrawBucket::Decal:
+            sceneDecalDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::Water:
+            sceneWaterDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::Refraction:
+            sceneRefractionDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::PostAlphaUnlit:
+            scenePostAlphaUnlitDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::SimpleLayer:
+            sceneSimpleLayerDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::EnvironmentAlpha:
+            sceneEnvironmentAlphaDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::Environment:
+            sceneEnvironmentDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::AlphaTest:
+            sceneAlphaTestDraws_.push_back(std::move(dc));
+            break;
+        case DrawBucket::Solid:
+        default:
+            sceneSolidDraws_.push_back(std::move(dc));
+            break;
+        }
+    };
+
+    std::string meshResourceId;
+    for (auto& dc : draws) {
+        if (dc.sourceNode && !dc.sourceNode->mesh_ressource_id.empty()) {
+            instanceMeshResourceByOwner_[owner] = dc.sourceNode->mesh_ressource_id;
+            loadedMeshByModelPath_[modelPath] = dc.sourceNode->mesh_ressource_id;
+            if (meshResourceId.empty()) {
+                meshResourceId = dc.sourceNode->mesh_ressource_id;
+            }
+        }
+        classifyDraw(std::move(dc));
+    }
+
+    streamState_.loadedOwnersByMapIndex[mapIndex] = owner;
+    drawListsDirty_ = true;
+    NotifyWebModelLoaded(modelPath, meshResourceId);
+    return rawInstance;
 }
 
 void SceneManager::UnloadInstanceByOwner(void* owner) {
-    (void)owner;
-    // TODO: move from DeferredRenderer
+    if (!owner) {
+        return;
+    }
+
+    for (auto it = streamState_.loadedOwnersByMapIndex.begin();
+         it != streamState_.loadedOwnersByMapIndex.end();) {
+        if (it->second == owner) {
+            it = streamState_.loadedOwnersByMapIndex.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    auto eraseDrawsByOwner = [owner](std::vector<DrawCmd>& draws) {
+        const size_t before = draws.size();
+        draws.erase(std::remove_if(draws.begin(), draws.end(),
+            [owner](const DrawCmd& dc) { return dc.instance == owner; }),
+            draws.end());
+        return draws.size() != before;
+    };
+
+    bool removed = false;
+    removed |= eraseDrawsByOwner(sceneSolidDraws_);
+    removed |= eraseDrawsByOwner(sceneAlphaTestDraws_);
+    removed |= eraseDrawsByOwner(sceneDecalDraws_);
+    removed |= eraseDrawsByOwner(sceneEnvironmentDraws_);
+    removed |= eraseDrawsByOwner(sceneEnvironmentAlphaDraws_);
+    removed |= eraseDrawsByOwner(sceneSimpleLayerDraws_);
+    removed |= eraseDrawsByOwner(sceneRefractionDraws_);
+    removed |= eraseDrawsByOwner(scenePostAlphaUnlitDraws_);
+    removed |= eraseDrawsByOwner(sceneWaterDraws_);
+    removed |= eraseDrawsByOwner(sceneParticleDraws_);
+
+    const size_t particleBefore = particleNodes.size();
+    particleNodes.erase(std::remove_if(particleNodes.begin(), particleNodes.end(),
+        [owner](const ParticleAttach& entry) { return entry.instance == owner; }),
+        particleNodes.end());
+    removed |= particleNodes.size() != particleBefore;
+
+    const size_t animatorBefore = animatorInstances.size();
+    animatorInstances.erase(std::remove_if(animatorInstances.begin(), animatorInstances.end(),
+        [owner](const std::unique_ptr<AnimatorNodeInstance>& anim) {
+            return anim && anim->GetOwner() == owner;
+        }), animatorInstances.end());
+    removed |= animatorInstances.size() != animatorBefore;
+
+    const size_t instancesBefore = instances.size();
+    instances.erase(std::remove_if(instances.begin(), instances.end(),
+        [owner](const std::shared_ptr<ModelInstance>& instance) {
+            return instance && static_cast<void*>(instance.get()) == owner;
+        }), instances.end());
+    removed |= instances.size() != instancesBefore;
+
+    std::string modelPath;
+    auto modelPathIt = instanceModelPathByOwner_.find(owner);
+    if (modelPathIt != instanceModelPathByOwner_.end()) {
+        modelPath = modelPathIt->second;
+        instanceModelPathByOwner_.erase(modelPathIt);
+    }
+
+    instanceSpawnTimes.erase(owner);
+    instanceMeshResourceByOwner_.erase(owner);
+    instanceTransformCache_.erase(owner);
+    movedInstanceOwners_.erase(owner);
+
+    if (!modelPath.empty()) {
+        auto refIt = loadedModelRefCountByPath_.find(modelPath);
+        if (refIt != loadedModelRefCountByPath_.end()) {
+            if (refIt->second > 1) {
+                --refIt->second;
+            } else {
+                loadedModelRefCountByPath_.erase(refIt);
+                std::string meshResourceId;
+                auto meshIt = loadedMeshByModelPath_.find(modelPath);
+                if (meshIt != loadedMeshByModelPath_.end()) {
+                    meshResourceId = meshIt->second;
+                    loadedMeshByModelPath_.erase(meshIt);
+                }
+                NotifyWebModelUnloaded(modelPath, meshResourceId);
+            }
+        }
+    }
+
+    if (removed) {
+        drawListsDirty_ = true;
+    }
 }
 
 void SceneManager::RebuildNodeMapFromInstances() {
-    // TODO: move from DeferredRenderer
+    nodeMap.clear();
+    for (const auto& instance : instances) {
+        if (!instance) continue;
+        const auto model = instance->getModel();
+        if (!model) continue;
+        for (Node* node : model->getNodes()) {
+            if (!node || node->node_name.empty()) continue;
+            nodeMap[node->node_name] = node;
+        }
+    }
 }
 
 void SceneManager::ApplySceneRebuildAfterStreamingChanges(bool meshLayoutChanged) {
-    (void)meshLayoutChanged;
-    // TODO: move from DeferredRenderer
+    if (meshLayoutChanged) {
+        MeshServer::instance().buildMegaBuffer();
+    }
+    RebuildNodeMapFromInstances();
+    drawListsDirty_ = true;
 }
 
 void SceneManager::UpdateIncrementalStreaming(bool forceFullSync) {
-    (void)forceFullSync;
-    // TODO: move from DeferredRenderer
+    if (!currentMap) {
+        ResetStreamingState();
+        return;
+    }
+
+    if (!streamState_.initialized || streamState_.map != currentMap) {
+        BuildStreamingIndex(currentMap);
+    }
+    if (!streamState_.initialized || streamState_.map == nullptr) {
+        return;
+    }
+
+    const double nowSec = NowSeconds();
+    if (!forceFullSync &&
+        streamState_.lastTickTime > 0.0 &&
+        (nowSec - streamState_.lastTickTime) < streamTickIntervalSec_) {
+        return;
+    }
+    streamState_.lastTickTime = nowSec;
+
+    std::vector<size_t> targetMapIndices;
+    if (forceFullSync || !enableIncrementalStreaming_ || !streamCameraValid_) {
+        targetMapIndices.reserve(currentMap->instances.size());
+        for (size_t i = 0; i < currentMap->instances.size(); ++i) {
+            targetMapIndices.push_back(i);
+        }
+    } else {
+        const int centerCell = ComputeStreamingCellIndex(streamCameraPos_);
+        if (centerCell < 0) {
+            for (size_t i = 0; i < currentMap->instances.size(); ++i) {
+                targetMapIndices.push_back(i);
+            }
+        } else {
+            constexpr int kCellRadius = 3;
+            const int centerX = centerCell % streamState_.gridW;
+            const int centerZ = centerCell / streamState_.gridW;
+            const int minX = std::max(0, centerX - kCellRadius);
+            const int maxX = std::min(streamState_.gridW - 1, centerX + kCellRadius);
+            const int minZ = std::max(0, centerZ - kCellRadius);
+            const int maxZ = std::min(streamState_.gridH - 1, centerZ + kCellRadius);
+            for (int z = minZ; z <= maxZ; ++z) {
+                for (int x = minX; x <= maxX; ++x) {
+                    const size_t cellIndex = static_cast<size_t>(z * streamState_.gridW + x);
+                    if (cellIndex >= streamState_.cellToInstances.size()) continue;
+                    const auto& instancesInCell = streamState_.cellToInstances[cellIndex];
+                    targetMapIndices.insert(targetMapIndices.end(),
+                                            instancesInCell.begin(),
+                                            instancesInCell.end());
+                }
+            }
+        }
+    }
+
+    std::unordered_set<size_t> targetSet;
+    targetSet.reserve(targetMapIndices.size() * 2u + 1u);
+    for (size_t mapIndex : targetMapIndices) {
+        if (mapIndex < currentMap->instances.size()) {
+            targetSet.insert(mapIndex);
+        }
+    }
+
+    std::vector<size_t> toLoad;
+    toLoad.reserve(targetSet.size());
+    for (size_t mapIndex : targetSet) {
+        if (streamState_.loadedOwnersByMapIndex.find(mapIndex) == streamState_.loadedOwnersByMapIndex.end()) {
+            toLoad.push_back(mapIndex);
+        }
+    }
+    std::sort(toLoad.begin(), toLoad.end());
+
+    std::vector<void*> toUnloadOwners;
+    toUnloadOwners.reserve(streamState_.loadedOwnersByMapIndex.size());
+    for (const auto& [mapIndex, owner] : streamState_.loadedOwnersByMapIndex) {
+        if (targetSet.find(mapIndex) == targetSet.end()) {
+            toUnloadOwners.push_back(owner);
+        }
+    }
+
+    int loadBudget = streamLoadBudgetPerTick_;
+    int unloadBudget = streamUnloadBudgetPerTick_;
+    if (forceFullSync) {
+        loadBudget = std::numeric_limits<int>::max();
+        unloadBudget = std::numeric_limits<int>::max();
+    }
+    loadBudget = std::max(loadBudget, 0);
+    unloadBudget = std::max(unloadBudget, 0);
+
+    int loadedCount = 0;
+    int unloadedCount = 0;
+    bool meshLayoutChanged = false;
+
+    for (size_t mapIndex : toLoad) {
+        if (loadedCount >= loadBudget) break;
+        if (LoadMapInstanceByIndex(currentMap, mapIndex) != nullptr) {
+            ++loadedCount;
+            meshLayoutChanged = true;
+        }
+    }
+
+    for (void* owner : toUnloadOwners) {
+        if (unloadedCount >= unloadBudget) break;
+        if (!owner) continue;
+        UnloadInstanceByOwner(owner);
+        ++unloadedCount;
+        meshLayoutChanged = true;
+    }
+
+    if (loadedCount > 0 || unloadedCount > 0) {
+        ApplySceneRebuildAfterStreamingChanges(meshLayoutChanged);
+        NC::LOGGING::Log("[SCENE][STREAM] Update loaded=", loadedCount,
+                         " unloaded=", unloadedCount,
+                         " loadedNow=", streamState_.loadedOwnersByMapIndex.size(),
+                         " target=", targetSet.size(),
+                         " force=", forceFullSync ? 1 : 0);
+    }
 }
 
 void SceneManager::NotifyWebModelLoaded(const std::string& modelPath,
     const std::string& meshResourceId) {
-    (void)modelPath;
-    (void)meshResourceId;
-    // TODO: move from DeferredRenderer
+    NC::LOGGING::Log("[SCENE][WEB] model loaded path=", modelPath, " mesh=", meshResourceId);
 }
 
 void SceneManager::NotifyWebModelUnloaded(const std::string& modelPath,
     const std::string& meshResourceId) {
-    (void)modelPath;
-    (void)meshResourceId;
-    // TODO: move from DeferredRenderer
+    NC::LOGGING::Log("[SCENE][WEB] model unloaded path=", modelPath, " mesh=", meshResourceId);
 }

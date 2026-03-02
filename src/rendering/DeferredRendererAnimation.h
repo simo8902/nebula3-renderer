@@ -24,7 +24,7 @@ bool LooksLikeAnimationResourcePath(const std::string& value);
 void BeginFrameAnimationCaches();
 bool HasAnimatedPoseForNode(const std::string& nodeName, const void* owner = nullptr);
 
-std::unordered_map<std::string, float> SampleShaderVarAnimations(const Node* node, float time);
+void SampleShaderVarAnimations(const Node* node, float time, std::unordered_map<std::string, float>& outResult);
 std::unordered_map<std::string, float> SampleShaderVarAnimationsForTarget(const std::string& targetNodeName, float time, const void* owner = nullptr);
 
 glm::mat4 ComposeAnimatedHierarchyLocal(const Node* leaf, const glm::mat4& fallbackLocal, const void* owner = nullptr);

@@ -63,16 +63,16 @@ struct EngineSystems::Impl {
         lastFrameTime = now;
         fixedUpdateAccumulator += frameDeltaTime;
         ++frameIndex;
-        NC::LOGGING::Log("[ENGINE] BeginFrame idx=", frameIndex,
-                         " dt=", frameDeltaTime,
-                         " accumulator=", fixedUpdateAccumulator);
+        // NC::LOGGING::Log("[ENGINE] BeginFrame idx=", frameIndex,
+        //                  " dt=", frameDeltaTime,
+        //                  " accumulator=", fixedUpdateAccumulator);
     }
 
     void PumpInput() {
         if (renderer) {
             renderer->PollEvents();
         }
-        NC::LOGGING::Log("[ENGINE] PumpInput systems=", inputSystems.size());
+        // NC::LOGGING::Log("[ENGINE] PumpInput systems=", inputSystems.size());
         for (const auto& system : inputSystems) {
             if (system) {
                 system();
@@ -87,7 +87,7 @@ struct EngineSystems::Impl {
     }
 
     void FixedUpdate(double dt) {
-        NC::LOGGING::Log("[ENGINE] FixedUpdate begin dt=", dt, " systems=", fixedUpdateSystems.size());
+        // NC::LOGGING::Log("[ENGINE] FixedUpdate begin dt=", dt, " systems=", fixedUpdateSystems.size());
         for (const auto& system : fixedUpdateSystems) {
             if (system) {
                 system(dt);
@@ -97,11 +97,11 @@ struct EngineSystems::Impl {
             runtimeState = RuntimeState::Stopping;
             NC::LOGGING::Warning("[ENGINE] FixedUpdate requested stop");
         }
-        NC::LOGGING::Log("[ENGINE] FixedUpdate end dt=", dt);
+        // NC::LOGGING::Log("[ENGINE] FixedUpdate end dt=", dt);
     }
 
     void FrameUpdate(double dt) {
-        NC::LOGGING::Log("[ENGINE] FrameUpdate begin dt=", dt, " systems=", frameUpdateSystems.size());
+        // NC::LOGGING::Log("[ENGINE] FrameUpdate begin dt=", dt, " systems=", frameUpdateSystems.size());
         for (const auto& system : frameUpdateSystems) {
             if (system) {
                 system(dt);
@@ -111,7 +111,7 @@ struct EngineSystems::Impl {
             runtimeState = RuntimeState::Stopping;
             NC::LOGGING::Warning("[ENGINE] FrameUpdate requested stop");
         }
-        NC::LOGGING::Log("[ENGINE] FrameUpdate end dt=", dt);
+        // NC::LOGGING::Log("[ENGINE] FrameUpdate end dt=", dt);
     }
 
     void Update() {
@@ -134,17 +134,15 @@ struct EngineSystems::Impl {
             fixedUpdateAccumulator = config.fixedUpdateStepSeconds;
         }
 
-        NC::LOGGING::Log("[ENGINE] Update fixedSteps=", fixedStepCount,
-                         " accumulator=", fixedUpdateAccumulator,
-                         " frameDt=", frameDeltaTime);
+        // NC::LOGGING::Log("[ENGINE] Update fixedSteps=", fixedStepCount,
+        //                  " accumulator=", fixedUpdateAccumulator,
+        //                  " frameDt=", frameDeltaTime);
         FrameUpdate(frameDeltaTime);
     }
 
     void Render() {
         if (runtimeState == RuntimeState::Running && renderer) {
-            NC::LOGGING::Log("[ENGINE] Render begin idx=", frameIndex);
             renderer->RenderSingleFrame();
-            NC::LOGGING::Log("[ENGINE] Render end idx=", frameIndex);
         }
     }
 

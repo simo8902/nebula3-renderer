@@ -42,6 +42,7 @@ OpenGLShaderManager::OpenGLShaderManager() {
     };
 
     CreateShader("NDEVCdeferred", SOURCE_DIR "/shaders/NDEVCdeferred.vert", SOURCE_DIR "/shaders/NDEVCdeferred.frag");
+    CreateShader("standard", SOURCE_DIR "/shaders/standard.vert", SOURCE_DIR "/shaders/standard.frag");
     CreateShader("particle", SOURCE_DIR "/shaders/particle.vert", SOURCE_DIR "/shaders/particle.frag");
     CreateShader("environment", SOURCE_DIR "/shaders/environment.vert", SOURCE_DIR "/shaders/environment.frag");
     CreateShader("environmentAlpha", SOURCE_DIR "/shaders/environment.vert", SOURCE_DIR "/shaders/environment_alpha.frag");
@@ -332,7 +333,6 @@ std::shared_ptr<IShader> OpenGLShaderManager::GetShader(const std::string& name)
         NC::LOGGING::Warning("[GL_SHADER_MGR] GetShader miss name=", name);
         return nullptr;
     }
-    NC::LOGGING::Log("[GL_SHADER_MGR] GetShader hit name=", name);
     return it->second;
 }
 

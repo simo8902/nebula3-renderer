@@ -22,7 +22,6 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
-#include <unordered_set>
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include "Rendering/DrawBatchSystem.h"
@@ -50,44 +49,61 @@ void DeferredRenderer::BuildVisibilityGrids() {
     waterVisGrid_.Build(waterDraws, info);
     postAlphaVisGrid_.Build(postAlphaUnlitDraws, info);
     simpleLayerVisGrid_.Build(simpleLayerDraws, info);
+    refractionVisGrid_.Build(refractionDraws, info);
+    decalVisGrid_.Build(decalDraws, info);
+    visibilityStage_.Reset();
     lastVisibleCells_.clear(); // force UpdateVisibility to run on first frame after build
 }
 
 
 void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum) {
-    if (!solidVisGrid_.IsBuilt()) return;
-
     if (!enableVisibilityGrid_) {
-        auto revealAll = [](std::vector<DrawCmd>& draws) {
-            bool changed = false;
-            for (auto& dc : draws) {
-                if (dc.disabled) {
-                    dc.disabled = false;
-                    changed = true;
+        // Only run revealAll once when transitioning from enabled → disabled
+        if (!visGridRevealedAll_) {
+            visibilityStage_.Reset();
+            auto revealAll = [](std::vector<DrawCmd>& draws) {
+                bool changed = false;
+                for (auto& dc : draws) {
+                    const bool shouldBeDisabled = dc.userDisabled;
+                    if (dc.disabled != shouldBeDisabled) {
+                        dc.disabled = shouldBeDisabled;
+                        changed = true;
+                    }
+                    dc.frustumCulled = false;
                 }
-                dc.frustumCulled = false;
-            }
-            return changed;
-        };
+                return changed;
+            };
 
-        bool solidChanged = revealAll(solidDraws);
-        revealAll(alphaTestDraws);
-        revealAll(environmentDraws);
-        revealAll(environmentAlphaDraws);
-        revealAll(simpleLayerDraws);
-        revealAll(waterDraws);
-        revealAll(refractionDraws);
-        revealAll(postAlphaUnlitDraws);
-        revealAll(decalDraws);
-        revealAll(particleDraws);
+            revealAll(solidDraws);
+            revealAll(alphaTestDraws);
+            revealAll(environmentDraws);
+            revealAll(environmentAlphaDraws);
+            revealAll(simpleLayerDraws);
+            revealAll(waterDraws);
+            revealAll(refractionDraws);
+            revealAll(postAlphaUnlitDraws);
+            revealAll(decalDraws);
+            revealAll(particleDraws);
 
-        visibleCells_.clear();
-        lastVisibleCells_.clear();
-        if (solidChanged) {
-            DrawBatchSystem::instance().invalidateStaticCache();
+            visibleCells_.clear();
+            lastVisibleCells_.clear();
+            visGridRevealedAll_ = true;
         }
         return;
     }
+
+    const VisibilityGrid* queryGrid = nullptr;
+    if (solidVisGrid_.IsBuilt()) queryGrid = &solidVisGrid_;
+    else if (alphaTestVisGrid_.IsBuilt()) queryGrid = &alphaTestVisGrid_;
+    else if (envVisGrid_.IsBuilt()) queryGrid = &envVisGrid_;
+    else if (envAlphaVisGrid_.IsBuilt()) queryGrid = &envAlphaVisGrid_;
+    else if (waterVisGrid_.IsBuilt()) queryGrid = &waterVisGrid_;
+    else if (postAlphaVisGrid_.IsBuilt()) queryGrid = &postAlphaVisGrid_;
+    else if (simpleLayerVisGrid_.IsBuilt()) queryGrid = &simpleLayerVisGrid_;
+    else if (refractionVisGrid_.IsBuilt()) queryGrid = &refractionVisGrid_;
+    else if (decalVisGrid_.IsBuilt()) queryGrid = &decalVisGrid_;
+    if (!queryGrid) return;
+    visGridRevealedAll_ = false;
 
     // Use the camera's ground look-at point (ray → Y=0 intersection) as the
     // visibility centre. The camera eye is behind and above the visible area;
@@ -108,24 +124,34 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
     }
 
     // Run the cell query every frame — it's cheap (few AABB frustum tests).
-    solidVisGrid_.QueryVisibleCells(visCenter, frustum, visibleRange_, visibleCells_);
+    queryGrid->QueryVisibleCells(visCenter, frustum, visibleRange_, visibleCells_);
 
-    // Only solidDraws feed the static matrix cache in DrawBatchSystem::cull().
-    // alphaTestDraws and environmentDraws go through cullGeneric() which has no static
-    // cache, so changing their disabled flags never requires a cache rebuild.
-    const bool solidChanged = solidVisGrid_.UpdateVisibility(solidDraws, visibleCells_);
-    alphaTestVisGrid_.UpdateVisibility(alphaTestDraws, visibleCells_);
-    envVisGrid_.UpdateVisibility(environmentDraws, visibleCells_);
-    envAlphaVisGrid_.UpdateVisibility(environmentAlphaDraws, visibleCells_);
-    waterVisGrid_.UpdateVisibility(waterDraws, visibleCells_);
-    postAlphaVisGrid_.UpdateVisibility(postAlphaUnlitDraws, visibleCells_);
-    simpleLayerVisGrid_.UpdateVisibility(simpleLayerDraws, visibleCells_);
+    // Nebula-style sequence:
+    // OnCullBefore(frame) -> Clear camera links -> Perform visibility query -> Resolve draw visibility.
+    visibilityStage_.OnCullBefore(++visibilityStageFrameIndex_);
+    visibilityStage_.UpdateCameraLinks(
+        visibleCells_,
+        {
+            VisibilityQueryInput{&solidVisGrid_, &solidDraws},
+            VisibilityQueryInput{&alphaTestVisGrid_, &alphaTestDraws},
+            VisibilityQueryInput{&envVisGrid_, &environmentDraws},
+            VisibilityQueryInput{&envAlphaVisGrid_, &environmentAlphaDraws},
+            VisibilityQueryInput{&waterVisGrid_, &waterDraws},
+            VisibilityQueryInput{&postAlphaVisGrid_, &postAlphaUnlitDraws},
+            VisibilityQueryInput{&simpleLayerVisGrid_, &simpleLayerDraws},
+            VisibilityQueryInput{&refractionVisGrid_, &refractionDraws},
+            VisibilityQueryInput{&decalVisGrid_, &decalDraws},
+        });
 
-    if (solidChanged) {
-        // Toggle instanceCount in the existing static indirect commands instead of
-        // rebuilding the entire cache — avoids frame stutter on cell boundary crossing.
-        DrawBatchSystem::instance().updateStaticVisibility(solidDraws);
-    }
+    visibilityStage_.ResolveDrawVisibility(solidDraws);
+    visibilityStage_.ResolveDrawVisibility(alphaTestDraws);
+    visibilityStage_.ResolveDrawVisibility(environmentDraws);
+    visibilityStage_.ResolveDrawVisibility(environmentAlphaDraws);
+    visibilityStage_.ResolveDrawVisibility(waterDraws);
+    visibilityStage_.ResolveDrawVisibility(postAlphaUnlitDraws);
+    visibilityStage_.ResolveDrawVisibility(simpleLayerDraws);
+    visibilityStage_.ResolveDrawVisibility(refractionDraws);
+    visibilityStage_.ResolveDrawVisibility(decalDraws);
     lastVisibleCells_ = visibleCells_;
 }
 

@@ -259,7 +259,6 @@ std::string OpenGLShader::ReadFile(const std::string& path) {
 
 void OpenGLShader::Use() const {
     glUseProgram(program_);
-    NC::LOGGING::Log("[SHADER] Use Program=", program_.id);
 }
 
 bool OpenGLShader::IsValid() const {

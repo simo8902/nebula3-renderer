@@ -4,6 +4,7 @@
 #include "Rendering/Visibility/VisibilityGrid.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 
@@ -31,6 +32,7 @@ void VisibilityGrid::Build(const std::vector<DrawCmd>& draws, const MapInfo& inf
 
     for (uint32_t i = 0; i < static_cast<uint32_t>(draws.size()); ++i) {
         const DrawCmd& dc = draws[i];
+        if (!dc.isStatic) continue;
 
         const glm::vec3 fallbackPos(dc.worldMatrix[3]);
         glm::vec3 worldMin = fallbackPos;
@@ -166,8 +168,6 @@ void VisibilityGrid::QueryVisibleCells(const glm::vec3& camPos,
         }
     }
 
-    std::sort(outCellIndices.begin(), outCellIndices.end());
-
     lastVisibleCellCount_ = static_cast<int>(outCellIndices.size());
 }
 
@@ -175,13 +175,13 @@ bool VisibilityGrid::UpdateVisibility(std::vector<DrawCmd>& draws,
                                       const std::vector<int>& visibleCellIndices) {
     if (draws.empty()) return false;
 
-    // Build a per-draw visibility bitset (true = should be enabled).
-    std::vector<bool> newVisible(draws.size(), false);
+    static thread_local std::vector<uint8_t> newVisible;
+    newVisible.assign(draws.size(), 0u);
     for (int ci : visibleCellIndices) {
         if (ci < 0 || ci >= static_cast<int>(cells_.size())) continue;
         for (uint32_t idx : cells_[ci].drawIndices) {
             if (idx < static_cast<uint32_t>(draws.size())) {
-                newVisible[idx] = true;
+                newVisible[idx] = 1u;
             }
         }
     }
@@ -189,7 +189,8 @@ bool VisibilityGrid::UpdateVisibility(std::vector<DrawCmd>& draws,
     bool changed = false;
     int visCount = 0;
     for (size_t i = 0; i < draws.size(); ++i) {
-        const bool shouldBeEnabled = newVisible[i];
+        const bool visibleByGrid = !draws[i].isStatic || (newVisible[i] != 0u);
+        const bool shouldBeEnabled = visibleByGrid && !draws[i].userDisabled;
         const bool currentlyEnabled = !draws[i].disabled;
         if (shouldBeEnabled != currentlyEnabled) {
             draws[i].disabled = !shouldBeEnabled;

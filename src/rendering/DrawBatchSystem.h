@@ -6,6 +6,7 @@
 
 #include "glm.hpp"
 #include <array>
+#include <cstdint>
 #include <vector>
 #include <unordered_map>
 
@@ -106,7 +107,14 @@ public:
 
     void cullDecals(const std::vector<DrawCmd>& draws);
 
-    void flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTexturesToBind = 4);
+    struct PackedDrawRange {
+        size_t staticOffset = 0;
+        size_t staticCount = 0;
+        size_t dynamicOffset = 0;
+        size_t dynamicCount = 0;
+    };
+
+    void flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTexturesToBind = 4, GLuint currentProgram = 0);
     void flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEVC::Graphics::ISampler* samplerClamp);
     void reset(bool invalidateStaticCache = false);
     void invalidateStaticCache();
@@ -128,6 +136,8 @@ private:
     std::vector<glm::mat4> modelMatrices;
     std::vector<float> perObjectDataBuffer;
     std::vector<glm::vec4> decalParamsBuffer;
+    std::vector<DrawCommand> dynamicPackedCommands_;
+    std::vector<PackedDrawRange> packedRanges_;
     NDEVC::GL::GLBufHandle decalParamsSSBO;
 
     std::unordered_map<BatchKey, DrawBatch, BatchKeyHash> batches_;
@@ -137,8 +147,15 @@ private:
     std::vector<glm::mat4> staticModelMatrices;
     std::unordered_map<BatchKey, std::vector<DrawCommand>, BatchKeyHash> staticBatchCommands;
     std::unordered_map<BatchKey, std::vector<size_t>, BatchKeyHash> staticBatchDrawIndices_;
+    std::unordered_map<BatchKey, std::vector<std::vector<size_t>>, BatchKeyHash> staticBatchInstanceDrawIndices_;
     std::array<bool, kUploadRingSize> staticMatricesUploadedBySlot_{};
     bool initialMatrixUploadLogged = false;
+    uint64_t staticCacheSignature_ = 0;
+    uint64_t staticCacheContentHash_ = 0;
+    size_t staticCacheSourceCount_ = 0;
+    size_t dynamicSolidIndexSourceCount_ = 0;
+    size_t dynamicSolidStaticSourceCount_ = 0;
+    std::vector<size_t> dynamicSolidDrawIndices_;
     uint32_t modelMatrixUploadCursor_ = 0;
     uint32_t transientModelMatrixUploadCursor_ = 0;
     uint32_t perObjectUploadCursor_ = 0;
@@ -148,8 +165,21 @@ private:
     std::array<bool, kUploadRingSize> staticIndirectUploadedBySlot_{};
     std::vector<DrawCommand> staticIndirectCommandsPacked_;
     std::unordered_map<BatchKey, size_t, BatchKeyHash> staticIndirectOffsets_;
-    // Parallel to staticIndirectCommandsPacked_: index into solidDraws for each command
+    // Parallel to staticIndirectCommandsPacked_: representative source draw index for each command.
     std::vector<size_t> staticCmdDrawIndices_;
+    // Parallel to staticIndirectCommandsPacked_: flattened per-command source draw indices.
+    std::vector<size_t> staticCmdInstanceOffsets_;
+    std::vector<uint32_t> staticCmdInstanceCounts_;
+    std::vector<size_t> staticCmdInstanceDrawIndices_;
+    std::vector<glm::vec4> staticDecalParamsPacked_;
+
+    struct DynamicGenericGroup {
+        uint32_t count = 0;
+        uint32_t firstIndex = 0;
+        float alphaCutoff = 0.5f;
+        std::vector<glm::mat4> matrices;
+    };
+    std::unordered_map<BatchKey, std::unordered_map<uint64_t, DynamicGenericGroup>, BatchKeyHash> dynamicGroupsCache_;
 
 public:
     // Update instanceCount in static indirect commands based on DrawCmd::disabled flags.

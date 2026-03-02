@@ -12,9 +12,12 @@ static constexpr bool kDisableAnimations = false;
 static constexpr bool kEnableWebAddon = false;
 static constexpr bool kEditorRouteInput = true;
 static constexpr bool kUseLegacyDeferredInit = false;
-static constexpr bool kDisableFrustumCulling = true;
-static constexpr bool kDisableFaceCulling = true;
-static constexpr bool kForceNonBatchedGeometry = true;
+static constexpr bool kDisableFrustumCulling = false;
+static constexpr bool kDisableFaceCulling = false;
+static constexpr bool kForceNonBatchedGeometry = false;
+static constexpr bool kDisableViewport = false;
+static constexpr bool kNoPresentWhenViewportDisabled = true;
+static constexpr bool kFullscreenExclusive = false;
 static constexpr const char* kAssetRootPath = "C:\\drasa_online\\work";
 static constexpr const char* kModelsRootPath = "C:\\drasa_online\\work\\models";
 static constexpr const char* kMeshesRootPath = "C:\\drasa_online\\work\\meshes";
@@ -32,12 +35,15 @@ static void ApplyRuntimeToggles() {
 	_putenv_s("NDEVC_DISABLE_FRUSTUM_CULLING", kDisableFrustumCulling ? "1" : "0");
 	_putenv_s("NDEVC_DISABLE_FACE_CULLING", kDisableFaceCulling ? "1" : "0");
 	_putenv_s("NDEVC_FORCE_NON_BATCHED_GEOMETRY", kForceNonBatchedGeometry ? "1" : "0");
+	_putenv_s("NDEVC_DISABLE_VIEWPORT", kDisableViewport ? "1" : "0");
+	_putenv_s("NDEVC_NO_PRESENT_WHEN_VIEWPORT_DISABLED", kNoPresentWhenViewportDisabled ? "1" : "0");
 	_putenv_s("NDEVC_STARTUP_MAP", kAssetRootPath);
 	_putenv_s("NDEVC_MODELS_ROOT", kModelsRootPath);
 	_putenv_s("NDEVC_MESHES_ROOT", kMeshesRootPath);
 	_putenv_s("NDEVC_MAPS_ROOT", kMapsRootPath);
 	_putenv_s("NDEVC_ANIMS_ROOT", kAnimsRootPath);
 	_putenv_s("NDEVC_TEXTURES_ROOT", kTexturesRootPath);
+	_putenv_s("NDEVC_FULLSCREEN_EXCLUSIVE", kFullscreenExclusive ? "1" : "0");
 	_putenv_s("NDEVC_EDITOR_MODE", "1");
 	_putenv_s("NDEVC_EDITOR_ROUTE_INPUT", kEditorRouteInput ? "1" : "0");
 #else
@@ -48,6 +54,8 @@ static void ApplyRuntimeToggles() {
 	setenv("NDEVC_DISABLE_FRUSTUM_CULLING", kDisableFrustumCulling ? "1" : "0", 1);
 	setenv("NDEVC_DISABLE_FACE_CULLING", kDisableFaceCulling ? "1" : "0", 1);
 	setenv("NDEVC_FORCE_NON_BATCHED_GEOMETRY", kForceNonBatchedGeometry ? "1" : "0", 1);
+	setenv("NDEVC_DISABLE_VIEWPORT", kDisableViewport ? "1" : "0", 1);
+	setenv("NDEVC_NO_PRESENT_WHEN_VIEWPORT_DISABLED", kNoPresentWhenViewportDisabled ? "1" : "0", 1);
 	setenv("NDEVC_STARTUP_MAP", kAssetRootPath, 1);
 	setenv("NDEVC_MODELS_ROOT", kModelsRootPath, 1);
 	setenv("NDEVC_MESHES_ROOT", kMeshesRootPath, 1);
@@ -76,13 +84,11 @@ static void ApplyRuntimeToggles() {
 int main()
 {
 	try {
-		NC::LOGGING::Log("[APP] main start");
 		EnableAnsiColors();
 		ApplyRuntimeToggles();
 
 		const Initialization init;
 		init.RunMainLoop();
-		NC::LOGGING::Log("[APP] main loop completed");
 
 	}catch (std::exception& e) {
 		NC::LOGGING::Error("[APP] Fatal: ", e.what());

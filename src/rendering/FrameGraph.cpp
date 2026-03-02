@@ -86,16 +86,70 @@ RenderPass& FrameGraph::addPass(const std::string& name) {
 void FrameGraph::compile() {
     createResources();
     buildFBOs();
+
+    // Pre-cache render states and FBO lookups per pass to avoid per-frame heap allocs
+    for (auto& pass : passes_) {
+        // Cache render state
+        RenderStateDesc stateDesc;
+        stateDesc.depth.depthTest = pass->depthTest;
+        stateDesc.depth.depthWrite = pass->depthWrite;
+        stateDesc.depth.depthFunc = CompareFunc::Less;
+        stateDesc.blend.blendEnable = pass->blend;
+        stateDesc.blend.srcColor = pass->blendSrc;
+        stateDesc.blend.dstColor = pass->blendDst;
+        stateDesc.blend.srcAlpha = pass->blendSrc;
+        stateDesc.blend.dstAlpha = pass->blendDst;
+        stateDesc.rasterizer.cullMode = pass->cullFace ? pass->cullMode : CullMode::None;
+        stateDesc.stencil.stencilEnable = pass->stencilTest;
+        stateDesc.stencil.writeMask = 0xFF;
+        pass->cachedRenderState = device_->CreateRenderState(stateDesc);
+
+        // Cache FBO key and pointer for non-external passes
+        if (!pass->externalFBO && !pass->writes.empty()) {
+            std::string key;
+            for (auto& w : pass->writes) key += w + ",";
+            pass->cachedFBOKey = std::move(key);
+
+            auto it = fbos_.find(pass->cachedFBOKey);
+            if (it != fbos_.end()) {
+                pass->cachedFBO = it->second;
+            } else {
+                FramebufferDesc fbDesc;
+                fbDesc.width = width_;
+                fbDesc.height = height_;
+                for (auto& write : pass->writes) {
+                    auto& rt = resources_[write];
+                    if (rt.isDepth) {
+                        fbDesc.depthStencilAttachment.texture = rt.texture;
+                        fbDesc.depthStencilAttachment.mipLevel = 0;
+                    } else {
+                        FramebufferAttachment attach;
+                        attach.texture = rt.texture;
+                        attach.mipLevel = 0;
+                        fbDesc.colorAttachments.push_back(attach);
+                    }
+                }
+                pass->cachedFBO = device_->CreateFramebuffer(fbDesc);
+                fbos_[pass->cachedFBOKey] = pass->cachedFBO;
+            }
+        }
+    }
 }
 
 void FrameGraph::execute() {
     for (auto& pass : passes_) {
+        if (pass->shouldSkip && pass->shouldSkip()) {
+            continue;
+        }
+
         if (pass->externalFBO) {
             if (pass->bindExternalFBO) {
                 pass->bindExternalFBO();
             }
             device_->SetViewport(Viewport{0.0f, 0.0f, (float)width_, (float)height_, 0.0f, 1.0f});
-            applyState(*pass);
+            if (pass->cachedRenderState) {
+                device_->ApplyRenderState(pass->cachedRenderState.get());
+            }
             if (pass->clearColorBuffer || pass->clearDepth || pass->clearStencil) {
                 if (pass->bindExternalFBO) {
                     device_->Clear(pass->clearColorBuffer, pass->clearDepth, pass->clearStencil,
@@ -110,38 +164,11 @@ void FrameGraph::execute() {
             continue;
         }
 
-        std::shared_ptr<IFramebuffer> fbo;
-        if (!pass->writes.empty()) {
-            std::string key;
-            for (auto& w : pass->writes) key += w + ",";
-            if (fbos_.count(key)) {
-                fbo = fbos_[key];
-            } else {
-                FramebufferDesc fbDesc;
-                fbDesc.width = width_;
-                fbDesc.height = height_;
-
-                for (auto& write : pass->writes) {
-                    auto& rt = resources_[write];
-                    if (rt.isDepth) {
-                        fbDesc.depthStencilAttachment.texture = rt.texture;
-                        fbDesc.depthStencilAttachment.mipLevel = 0;
-                    } else {
-                        FramebufferAttachment attach;
-                        attach.texture = rt.texture;
-                        attach.mipLevel = 0;
-                        fbDesc.colorAttachments.push_back(attach);
-                    }
-                }
-
-                fbo = device_->CreateFramebuffer(fbDesc);
-                fbos_[key] = fbo;
-            }
-        }
-
-        device_->BindFramebuffer(fbo.get());
+        device_->BindFramebuffer(pass->cachedFBO ? pass->cachedFBO.get() : nullptr);
         device_->SetViewport(Viewport{0.0f, 0.0f, (float)width_, (float)height_, 0.0f, 1.0f});
-        applyState(*pass);
+        if (pass->cachedRenderState) {
+            device_->ApplyRenderState(pass->cachedRenderState.get());
+        }
 
         if (pass->clearColorBuffer || pass->clearDepth || pass->clearStencil) {
             device_->Clear(pass->clearColorBuffer, pass->clearDepth, pass->clearStencil,

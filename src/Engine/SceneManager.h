@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 class SceneManager {
 public:
@@ -45,6 +46,9 @@ public:
         std::vector<DrawCmd>& postAlphaUnlitDraws,
         std::vector<DrawCmd>& waterDraws,
         std::vector<DrawCmd*>& animatedDraws);
+
+    // Returns true if scene draw lists changed since last PrepareDrawLists call.
+    bool IsDrawListsDirty() const { return drawListsDirty_; }
 
     // Read-only accessors used by DeferredRenderer internals
     const std::string& GetCurrentMapPath() const { return currentMapSourcePath_; }
@@ -89,7 +93,9 @@ private:
         bool initialized = false;
     };
     StreamWindowState streamState_;
-    bool enableIncrementalStreaming_ = true;
+    glm::vec3 streamCameraPos_{0.0f, 0.0f, 0.0f};
+    bool streamCameraValid_ = false;
+    bool enableIncrementalStreaming_ = false;
     int streamLoadBudgetPerTick_ = 96;
     int streamUnloadBudgetPerTick_ = 128;
     double streamTickIntervalSec_ = 0.05;
@@ -107,6 +113,9 @@ private:
     std::vector<DrawCmd> scenePostAlphaUnlitDraws_;
     std::vector<DrawCmd> sceneWaterDraws_;
     std::vector<DrawCmd> sceneParticleDraws_;
+    bool drawListsDirty_ = true;
+    std::unordered_map<void*, glm::mat4> instanceTransformCache_;
+    std::unordered_set<void*> movedInstanceOwners_;
 
     ModelInstance* appendN3WTransform(const std::string& path,
         const glm::vec3& pos, const glm::quat& rot, const glm::vec3& scale);
@@ -124,6 +133,8 @@ private:
     void RebuildNodeMapFromInstances();
     void ApplySceneRebuildAfterStreamingChanges(bool meshLayoutChanged);
     void UpdateIncrementalStreaming(bool forceFullSync = false);
+    void PropagateMovedInstanceTransforms(std::vector<DrawCmd>& draws);
+    void PropagateMovedInstanceTransformsToAllSceneDraws();
     void NotifyWebModelLoaded(const std::string& modelPath,
         const std::string& meshResourceId);
     void NotifyWebModelUnloaded(const std::string& modelPath,

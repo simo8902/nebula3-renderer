@@ -71,14 +71,19 @@ void DeferredRenderer::SetDrawDisabled(const DrawCmd& dc, bool disabled) {
     // Disabled flags changed — the static batch cache must be rebuilt so it
     // excludes any newly-disabled objects (or re-includes newly-enabled ones).
     lastVisibleCells_.clear(); // force UpdateVisibilityThisFrame to re-run fully next frame
-    DrawBatchSystem::instance().reset(true);
+    solidBatchSystem_.reset(true);
+    alphaTestBatchSystem_.reset(true);
+    environmentBatchSystem_.reset(true);
+    environmentAlphaBatchSystem_.reset(true);
+    decalBatchSystem_.reset(true);
 }
 
 
 void DeferredRenderer::ApplyDisabledDrawFlags() {
     auto apply = [this](std::vector<DrawCmd>& draws) {
         for (auto& dc : draws) {
-            dc.disabled = IsDrawDisabled(dc);
+            dc.userDisabled = IsDrawDisabled(dc);
+            dc.disabled = dc.userDisabled;
         }
     };
     apply(solidDraws);
@@ -99,7 +104,44 @@ void DeferredRenderer::ClearDisabledDraws() {
     disabledSelectionIndex = -1;
     ApplyDisabledDrawFlags();
     lastVisibleCells_.clear();
-    DrawBatchSystem::instance().reset(true);
+    solidBatchSystem_.reset(true);
+    alphaTestBatchSystem_.reset(true);
+    environmentBatchSystem_.reset(true);
+    environmentAlphaBatchSystem_.reset(true);
+    decalBatchSystem_.reset(true);
+}
+
+void DeferredRenderer::InvalidateSelection() {
+    selectedObject = nullptr;
+    selectedIndex = -1;
+    cachedObj = DrawCmd{};
+    cachedIndex = -1;
+}
+
+void DeferredRenderer::ValidateSelectionPointer() {
+    if (!selectedObject) return;
+
+    auto containsPointer = [&](const std::vector<DrawCmd>& draws) -> bool {
+        if (draws.empty()) return false;
+        const DrawCmd* begin = draws.data();
+        const DrawCmd* end = begin + draws.size();
+        return selectedObject >= begin && selectedObject < end;
+    };
+
+    const bool valid =
+        containsPointer(solidDraws) ||
+        containsPointer(alphaTestDraws) ||
+        containsPointer(simpleLayerDraws) ||
+        containsPointer(environmentDraws) ||
+        containsPointer(environmentAlphaDraws) ||
+        containsPointer(waterDraws) ||
+        containsPointer(refractionDraws) ||
+        containsPointer(postAlphaUnlitDraws) ||
+        containsPointer(decalDraws);
+
+    if (!valid) {
+        InvalidateSelection();
+    }
 }
 
 
@@ -157,8 +199,7 @@ void DeferredRenderer::UpdateLookAtSelection(bool force) {
     glm::vec3 rayDir = glm::vec3(farH - nearH);
     const float rayDirLen2 = glm::dot(rayDir, rayDir);
     if (!std::isfinite(rayDirLen2) || rayDirLen2 <= 1e-8f) {
-        selectedObject = nullptr;
-        selectedIndex = -1;
+        InvalidateSelection();
         pickCandidateCount = 0;
         pickLastUpdateMs = (glfwGetTime() - beginTime) * 1000.0;
         return;

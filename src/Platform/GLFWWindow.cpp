@@ -3,12 +3,23 @@
 
 #include "Platform/GLFWWindow.h"
 #include "GLFW/glfw3.h"
+#include <cstdlib>
 #include <iostream>
 #include <unordered_map>
 
 namespace NDEVC::Platform::GLFW {
 
 std::unordered_map<GLFWwindow*, GLFWWindow*> g_windowMap;
+
+static bool ReadEnvToggleWindow(const char* name) {
+    if (!name || !name[0]) return false;
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || value == nullptr) return false;
+    const bool enabled = value[0] != '\0' && value[0] != '0';
+    std::free(value);
+    return enabled;
+}
 
 GLFWWindow::GLFWWindow(const std::string& title, int width, int height)
     : handle_(nullptr) {
@@ -20,7 +31,25 @@ GLFWWindow::GLFWWindow(const std::string& title, int width, int height)
     glfwWindowHint(GLFW_DEPTH_BITS, 24);
     glfwWindowHint(GLFW_STENCIL_BITS, 8);
 
-    handle_ = glfwCreateWindow(width, height, title.c_str(), nullptr, nullptr);
+    GLFWmonitor* monitor = nullptr;
+    if (ReadEnvToggleWindow("NDEVC_FULLSCREEN_EXCLUSIVE")) {
+        monitor = glfwGetPrimaryMonitor();
+        if (monitor) {
+            const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+            if (mode) {
+                glfwWindowHint(GLFW_RED_BITS, mode->redBits);
+                glfwWindowHint(GLFW_GREEN_BITS, mode->greenBits);
+                glfwWindowHint(GLFW_BLUE_BITS, mode->blueBits);
+                glfwWindowHint(GLFW_REFRESH_RATE, mode->refreshRate);
+                width = mode->width;
+                height = mode->height;
+                std::cout << "[WINDOW] Exclusive fullscreen " << width << "x" << height
+                          << " @ " << mode->refreshRate << "Hz\n";
+            }
+        }
+    }
+
+    handle_ = glfwCreateWindow(width, height, title.c_str(), monitor, nullptr);
     if (!handle_) {
         throw std::runtime_error("GLFW window creation failed");
     }

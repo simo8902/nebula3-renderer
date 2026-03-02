@@ -40,6 +40,7 @@ public:
     std::vector<std::string> reads;
     std::vector<std::string> writes;
     std::function<void()> execute;
+    std::function<bool()> shouldSkip;
 
     bool depthTest{true};
     bool depthWrite{true};
@@ -55,6 +56,11 @@ public:
     bool clearStencil{false};
     bool externalFBO{false};
     std::function<void()> bindExternalFBO;
+
+    // Cached at compile() time — avoids per-frame heap allocs and string ops
+    std::shared_ptr<IRenderState> cachedRenderState;
+    std::string cachedFBOKey;
+    std::shared_ptr<IFramebuffer> cachedFBO;
 };
 
 class FrameGraph {

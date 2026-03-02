@@ -519,10 +519,7 @@ void DeferredRenderer::RenderEditorShell() {
         ImGui::Checkbox("Include Transparent", &pickIncludeTransparent);
         ImGui::Checkbox("Include Decals",      &pickIncludeDecals);
         if (ImGui::Button("Clear Selection", ImVec2(-1.0f, 0.0f))) {
-            selectedObject = nullptr;
-            selectedIndex  = -1;
-            cachedObj      = DrawCmd{};
-            cachedIndex    = -1;
+            InvalidateSelection();
         }
     }
     ImGui::End();
@@ -1035,10 +1032,7 @@ void DeferredRenderer::RenderLookAtPanel() {
     ImGui::Checkbox("Include Transparent", &pickIncludeTransparent);
     ImGui::Checkbox("Include Decals", &pickIncludeDecals);
     if (ImGui::Button("Clear Selection")) {
-        selectedObject = nullptr;
-        selectedIndex = -1;
-        cachedObj = DrawCmd{};
-        cachedIndex = -1;
+        InvalidateSelection();
     }
 
     ImGui::Separator();
@@ -1263,6 +1257,7 @@ void DeferredRenderer::RenderLookAtPanel() {
 
 void DeferredRenderer::RenderImGui() {
     if (!imguiInitialized) return;
+    ValidateSelectionPointer();
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();

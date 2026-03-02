@@ -95,7 +95,7 @@ static constexpr UniformID U_GEMISSIVE_TEX = NDEVC::Graphics::IShader::MakeUnifo
 static constexpr UniformID U_USE_INSTANCED_POINT_LIGHTS = NDEVC::Graphics::IShader::MakeUniformID("UseInstancedPointLights");
 static constexpr bool kDisableShadows = false;
 static constexpr bool kDisableLighting = false;
-static constexpr bool kDisableShadowPass = false;
+static constexpr bool kDisableShadowPass = true;
 static constexpr bool kDisableGeometryPass = false;
 static constexpr bool kDisableLightingPass = false;
 static constexpr bool kDisablePointLightPass = false;
@@ -1102,9 +1102,16 @@ void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm:
         }
 
         if (shadowShaders) {
+            struct ShadowInstancedGroup {
+                uint32_t count = 0;
+                uint32_t firstIndex = 0;
+                std::vector<glm::mat4> matrices;
+            };
+
             // Build per-cascade matrix list and indirect commands
             std::vector<glm::mat4> shadowMatrices;
             std::vector<DrawCommand> shadowCommands;
+            std::unordered_map<uint64_t, ShadowInstancedGroup> shadowGroups;
             shadowMatrices.reserve(shadowCasters.size());
             shadowCommands.reserve(shadowCasters.size() * 2);
             int triangleCount = 0;
@@ -1115,41 +1122,40 @@ void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm:
                 if (caster.viewDepth - caster.radius > cascadeFar) continue;
                 if (!obj.mesh) continue;
 
-                const uint32_t baseInstance = static_cast<uint32_t>(shadowMatrices.size());
-                bool matrixAdded = false;
-                auto ensureMatrix = [&]() {
-                    if (!matrixAdded) {
-                        shadowMatrices.push_back(obj.worldMatrix);
-                        matrixAdded = true;
+                auto appendGroup = [&](const Nvx2Group& g) {
+                    if (g.indexCount() == 0) return;
+                    const uint32_t count = g.indexCount();
+                    const uint32_t firstIndex = obj.megaIndexOffset + g.firstIndex();
+                    const uint64_t geomKey = (static_cast<uint64_t>(count) << 32) | firstIndex;
+                    auto& group = shadowGroups[geomKey];
+                    if (group.count == 0) {
+                        group.count = count;
+                        group.firstIndex = firstIndex;
                     }
+                    group.matrices.push_back(obj.worldMatrix);
+                    triangleCount += g.indexCount() / 3;
                 };
 
                 if (obj.group >= 0 && obj.group < (int)obj.mesh->groups.size()) {
-                    const auto& g = obj.mesh->groups[obj.group];
-                    if (g.indexCount() == 0) continue;
-                    ensureMatrix();
-                    DrawCommand cmd{};
-                    cmd.count = g.indexCount();
-                    cmd.instanceCount = 1;
-                    cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
-                    cmd.baseVertex = 0;
-                    cmd.baseInstance = baseInstance;
-                    shadowCommands.push_back(cmd);
-                    triangleCount += g.indexCount() / 3;
+                    appendGroup(obj.mesh->groups[obj.group]);
                 } else {
                     for (const auto& g : obj.mesh->groups) {
-                        if (g.indexCount() == 0) continue;
-                        ensureMatrix();
-                        DrawCommand cmd{};
-                        cmd.count = g.indexCount();
-                        cmd.instanceCount = 1;
-                        cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
-                        cmd.baseVertex = 0;
-                        cmd.baseInstance = baseInstance;
-                        shadowCommands.push_back(cmd);
-                        triangleCount += g.indexCount() / 3;
+                        appendGroup(g);
                     }
                 }
+            }
+
+            for (auto& [key, group] : shadowGroups) {
+                (void)key;
+                if (group.matrices.empty()) continue;
+                DrawCommand cmd{};
+                cmd.count = group.count;
+                cmd.instanceCount = static_cast<uint32_t>(group.matrices.size());
+                cmd.firstIndex = group.firstIndex;
+                cmd.baseVertex = 0;
+                cmd.baseInstance = static_cast<uint32_t>(shadowMatrices.size());
+                shadowMatrices.insert(shadowMatrices.end(), group.matrices.begin(), group.matrices.end());
+                shadowCommands.push_back(cmd);
             }
 
             if (!shadowCommands.empty()) {
@@ -1288,6 +1294,7 @@ void DeferredRenderer::Initialize() {
     };
 
     shutdownComplete_ = false;
+    viewportDisabled_ = ReadEnvToggle("NDEVC_DISABLE_VIEWPORT");
     logInitStep("start");
     InstallNax3Provider();
     logInitStep("InstallNax3Provider");
@@ -1306,80 +1313,88 @@ void DeferredRenderer::Initialize() {
     scene_.Initialize(device_.get(), shaderManager.get());
     logInitStep("SceneManager::Initialize");
 
-    const std::string startupMapPath = ResolveStartupMapPath();
-    if (startupMapPath.empty()) {
-        NC::LOGGING::Warning("[DEFERRED][INIT] No startup map found. Required map=", StartupBaseMapName());
-    } else if (optRenderLOG) {
-        std::cout << "[Init] Startup map: " << startupMapPath << "\n";
-    }
-    NC::LOGGING::Log("[DEFERRED][INIT] StartupMapPath=", startupMapPath);
+    if (!viewportDisabled_) {
+        const std::string startupMapPath = ResolveStartupMapPath();
+        if (startupMapPath.empty()) {
+            NC::LOGGING::Warning("[DEFERRED][INIT] No startup map found. Required map=", StartupBaseMapName());
+        } else if (optRenderLOG) {
+            std::cout << "[Init] Startup map: " << startupMapPath << "\n";
+        }
+        NC::LOGGING::Log("[DEFERRED][INIT] StartupMapPath=", startupMapPath);
 
-    MapLoader loader;
-    std::unique_ptr<MapData> startupMapOwned;
-    MapData* startupMap = nullptr;
-    if (!startupMapPath.empty()) {
-        startupMapOwned = loader.load_map(startupMapPath);
-        startupMap = startupMapOwned.get();
-    }
-    logInitStep("MapLoader::load_map");
-    if (!startupMap) {
+        MapLoader loader;
+        std::unique_ptr<MapData> startupMapOwned;
+        MapData* startupMap = nullptr;
         if (!startupMapPath.empty()) {
-            NC::LOGGING::Error("[DEFERRED][INIT] map load FAILED: ", startupMapPath);
+            startupMapOwned = loader.load_map(startupMapPath);
+            startupMap = startupMapOwned.get();
         }
-    } else {
-        if (optRenderLOG) std::cout << "Map loaded: " << startupMap->instances.size() << " instances\n";
-        NC::LOGGING::Log("[DEFERRED][INIT] Map loaded instances=", startupMap->instances.size());
-        scene_.LoadMap(startupMap);
-        scene_.currentMapSourcePath_ = startupMapPath;
-        logInitStep("SceneManager::LoadMap");
-    }
-
-    MeshServer::instance().buildMegaBuffer();
-    logInitStep("buildMegaBuffer");
-
-    scene_.PrepareDrawLists(camera_,
-        solidDraws, alphaTestDraws, decalDraws, particleDraws,
-        environmentDraws, environmentAlphaDraws, simpleLayerDraws,
-        refractionDraws, postAlphaUnlitDraws, waterDraws, animatedDraws);
-    logInitStep("SceneManager::PrepareDrawLists");
-
-    auto setMegaOffsets = [](std::vector<DrawCmd>& draws) {
-        for (auto& dc : draws) {
-            if (!dc.mesh) continue;
-            dc.megaVertexOffset = dc.mesh->megaVertexOffset;
-            dc.megaIndexOffset = dc.mesh->megaIndexOffset;
+        logInitStep("MapLoader::load_map");
+        if (!startupMap) {
+            if (!startupMapPath.empty()) {
+                NC::LOGGING::Error("[DEFERRED][INIT] map load FAILED: ", startupMapPath);
+            }
+        } else {
+            if (optRenderLOG) std::cout << "Map loaded: " << startupMap->instances.size() << " instances\n";
+            NC::LOGGING::Log("[DEFERRED][INIT] Map loaded instances=", startupMap->instances.size());
+            scene_.LoadMap(startupMap);
+            scene_.currentMapSourcePath_ = startupMapPath;
+            logInitStep("SceneManager::LoadMap");
         }
-    };
 
-    setMegaOffsets(solidDraws);
-    setMegaOffsets(simpleLayerDraws);
-    setMegaOffsets(alphaTestDraws);
-    setMegaOffsets(decalDraws);
-    setMegaOffsets(waterDraws);
-    setMegaOffsets(refractionDraws);
-    setMegaOffsets(environmentDraws);
-    setMegaOffsets(environmentAlphaDraws);
-    setMegaOffsets(postAlphaUnlitDraws);
+        MeshServer::instance().buildMegaBuffer();
+        logInitStep("buildMegaBuffer");
 
-    DrawBatchSystem::instance().init(solidDraws);
-    logInitStep("DrawBatchSystem::init");
+        scene_.PrepareDrawLists(camera_,
+            solidDraws, alphaTestDraws, decalDraws, particleDraws,
+            environmentDraws, environmentAlphaDraws, simpleLayerDraws,
+            refractionDraws, postAlphaUnlitDraws, waterDraws, animatedDraws);
+        logInitStep("SceneManager::PrepareDrawLists");
+        ApplyDisabledDrawFlags();
+        logInitStep("ApplyDisabledDrawFlags");
 
-    BuildVisibilityGrids();
-    logInitStep("BuildVisibilityGrids");
+        auto setMegaOffsets = [](std::vector<DrawCmd>& draws) {
+            for (auto& dc : draws) {
+                if (!dc.mesh) continue;
+                dc.megaVertexOffset = dc.mesh->megaVertexOffset;
+                dc.megaIndexOffset = dc.mesh->megaIndexOffset;
+            }
+        };
 
-    // Center the top-down camera above the map.
-    if (startupMap) {
-        const MapInfo& info = startupMap->info;
-        const float halfDiag = glm::length(glm::vec2(info.extents.x, info.extents.z));
-        const float elevation = std::max(halfDiag * 1.2f, 200.0f);
-        camera_.setPosition(glm::vec3(info.center.x,
-                                      info.center.y + elevation,
-                                      info.center.z + elevation * 0.7f));
+        setMegaOffsets(solidDraws);
+        setMegaOffsets(simpleLayerDraws);
+        setMegaOffsets(alphaTestDraws);
+        setMegaOffsets(decalDraws);
+        setMegaOffsets(waterDraws);
+        setMegaOffsets(refractionDraws);
+        setMegaOffsets(environmentDraws);
+        setMegaOffsets(environmentAlphaDraws);
+        setMegaOffsets(postAlphaUnlitDraws);
+
+        solidBatchSystem_.init(solidDraws);
+        alphaTestBatchSystem_.init(alphaTestDraws);
+        environmentBatchSystem_.init(environmentDraws);
+        environmentAlphaBatchSystem_.init(environmentAlphaDraws);
+        decalBatchSystem_.init(decalDraws);
+        logInitStep("DrawBatchSystem::init");
+
+        BuildVisibilityGrids();
+        logInitStep("BuildVisibilityGrids");
+
+        // Center the top-down camera above the map.
+        if (startupMap) {
+            const MapInfo& info = startupMap->info;
+            const float halfDiag = glm::length(glm::vec2(info.extents.x, info.extents.z));
+            const float elevation = std::max(halfDiag * 1.2f, 200.0f);
+            camera_.setPosition(glm::vec3(info.center.x,
+                                          info.center.y + elevation,
+                                          info.center.z + elevation * 0.7f));
+        }
+
+        rebuildAnimatedDrawLists();
+        logInitStep("rebuildAnimatedDrawLists");
+        decalBatchDirty = true;
     }
-
-    rebuildAnimatedDrawLists();
-    logInitStep("rebuildAnimatedDrawLists");
-    decalBatchDirty = true;
     scenePrepared = true;
     useLegacyDeferredInit_ = ReadEnvToggle("NDEVC_USE_LEGACY_DEFERRED_INIT");
     NC::LOGGING::Log("[DEFERRED][INIT] LegacyDeferredInit=", (useLegacyDeferredInit_ ? 1 : 0));
@@ -1432,6 +1447,8 @@ void DeferredRenderer::Shutdown() {
     cachedIndex = -1;
     visibleCells_.clear();
     lastVisibleCells_.clear();
+    visibilityStage_.Reset();
+    visibilityStageFrameIndex_ = 0;
     scenePrepared = false;
 
     shadowGraph.reset();
@@ -1439,7 +1456,11 @@ void DeferredRenderer::Shutdown() {
     decalGraph.reset();
     lightingGraph.reset();
     particleGraph.reset();
-    DrawBatchSystem::instance().reset(true);
+    solidBatchSystem_.reset(true);
+    alphaTestBatchSystem_.reset(true);
+    environmentBatchSystem_.reset(true);
+    environmentAlphaBatchSystem_.reset(true);
+    decalBatchSystem_.reset(true);
 
     bool hasGLContext = false;
     if (window_) {
@@ -1450,12 +1471,20 @@ void DeferredRenderer::Shutdown() {
     }
 
     if (hasGLContext) {
-        DrawBatchSystem::instance().shutdownGL();
+        solidBatchSystem_.shutdownGL();
+        alphaTestBatchSystem_.shutdownGL();
+        environmentBatchSystem_.shutdownGL();
+        environmentAlphaBatchSystem_.shutdownGL();
+        decalBatchSystem_.shutdownGL();
         TextureServer::instance().clearCache(true);
         releaseOwnedGLResources();
     } else {
         const bool hasLeakedGLState =
-            DrawBatchSystem::instance().hasGLResources() ||
+            solidBatchSystem_.hasGLResources() ||
+            alphaTestBatchSystem_.hasGLResources() ||
+            environmentBatchSystem_.hasGLResources() ||
+            environmentAlphaBatchSystem_.hasGLResources() ||
+            decalBatchSystem_.hasGLResources() ||
             MegaBuffer::instance().hasGLResources() ||
             TextureServer::instance().hasCachedTextures() ||
             shadowMatrixSSBO_ || shadowIndirectBuffer_ || pointLightInstanceVBO ||
@@ -1529,7 +1558,6 @@ void DeferredRenderer::RenderFrame() {
 }
 
 void DeferredRenderer::PollEvents() {
-    NC::LOGGING::Log("[DEFERRED] PollEvents");
     if (window_) {
         window_->PollEvents();
     }
@@ -1543,9 +1571,7 @@ void DeferredRenderer::RenderSingleFrame() {
         NC::LOGGING::Warning("[DEFERRED] RenderSingleFrame skipped window=", (window_ ? 1 : 0));
         return;
     }
-    NC::LOGGING::Log("[DEFERRED] RenderSingleFrame begin");
     renderSingleFrame();
-    NC::LOGGING::Log("[DEFERRED] RenderSingleFrame end");
 }
 
 bool DeferredRenderer::ShouldClose() const {
@@ -1594,6 +1620,7 @@ SceneManager& DeferredRenderer::GetScene() {
 }
 
 DrawCmd* DeferredRenderer::GetSelectedObject() {
+    ValidateSelectionPointer();
     return selectedObject;
 }
 
@@ -1608,4 +1635,3 @@ Camera& DeferredRenderer::GetCamera() {
 const Camera& DeferredRenderer::GetCamera() const {
     return camera_;
 }
-

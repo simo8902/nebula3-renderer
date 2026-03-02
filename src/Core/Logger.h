@@ -17,7 +17,11 @@
 #include <utility>
 
 namespace NC::LOGGING {
+#ifdef NDEVC_DISABLE_LOGGING
+    static constexpr bool ENABLED = false;
+#else
     static constexpr bool ENABLED = true;
+#endif
 
     inline std::mutex& LogMutex() {
         static std::mutex m;
@@ -58,12 +62,10 @@ namespace NC::LOGGING {
                 const std::filesystem::path absPath = std::filesystem::absolute(logPath, ec);
                 file << "===== SESSION START " << TimestampNow() << " PATH=" << absPath.string() << " =====\n";
                 file.flush();
-                static bool redirected = false;
-                if (!redirected) {
-                    std::cout.rdbuf(file.rdbuf());
-                    std::cerr.rdbuf(file.rdbuf());
-                    redirected = true;
-                }
+                // NOTE: stdout/stderr redirect removed — it causes any stray
+                // cout/cerr anywhere (including libraries) to trigger disk I/O,
+                // killing frame rate.  All engine logging goes through Log/Warning/Error
+                // which write to the file directly.
             }
         }
         return file;
@@ -78,7 +80,6 @@ namespace NC::LOGGING {
         file << "[" << TimestampNow() << "] [T:" << std::this_thread::get_id() << "] [" << level << "] ";
         (file << ... << args);
         file << "\n";
-        file.flush();
     }
 
     template<typename... Args>

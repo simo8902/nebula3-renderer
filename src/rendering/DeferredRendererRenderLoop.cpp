@@ -18,10 +18,12 @@
 #include "Rendering/OpenGL/OpenGLShaderManager.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 
 #define GLM_ENABLE_EXPERIMENTAL
@@ -82,6 +84,24 @@ bool ForceNonBatchedGeometry() {
     return enabled;
 }
 
+bool NoPresentWhenViewportDisabled() {
+    static const bool enabled = ReadEnvToggle("NDEVC_NO_PRESENT_WHEN_VIEWPORT_DISABLED");
+    return enabled;
+}
+
+uint64_t HashMatrix4(const glm::mat4& matrix) {
+    uint64_t hash = 0x6f3d9b6f3d9b6f3dull;
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            uint32_t bits = 0;
+            const float value = matrix[c][r];
+            std::memcpy(&bits, &value, sizeof(bits));
+            hash ^= (static_cast<uint64_t>(bits) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+        }
+    }
+    return hash;
+}
+
 bool PassesFrustumCulling(const DrawCmd& dc,
                           const Camera::Frustum& frustum,
                           bool disableFrustumCulling,
@@ -89,32 +109,93 @@ bool PassesFrustumCulling(const DrawCmd& dc,
     if (disableFrustumCulling) return true;
     if (keepStaticVisible && dc.isStatic) return true;
 
-    const glm::vec3 localMin(dc.localBoxMin);
-    const glm::vec3 localMax(dc.localBoxMax);
-    const glm::vec3 localExtent = localMax - localMin;
-    const bool hasBounds =
-        std::isfinite(localMin.x) && std::isfinite(localMin.y) && std::isfinite(localMin.z) &&
-        std::isfinite(localMax.x) && std::isfinite(localMax.y) && std::isfinite(localMax.z) &&
-        (std::abs(localExtent.x) > 1e-5f || std::abs(localExtent.y) > 1e-5f || std::abs(localExtent.z) > 1e-5f);
-    if (!hasBounds) return true;
+    glm::vec3 worldCenter(0.0f);
+    float radius = 0.001f;
+    const uint64_t transformHash = HashMatrix4(dc.worldMatrix);
+    if (dc.cullBoundsValid && dc.cullTransformHash == transformHash) {
+        worldCenter = dc.cullWorldCenter;
+        radius = dc.cullWorldRadius;
+    } else {
+        const glm::vec3 localMin(dc.localBoxMin);
+        const glm::vec3 localMax(dc.localBoxMax);
+        const glm::vec3 localExtent = localMax - localMin;
+        const bool hasBounds =
+            std::isfinite(localMin.x) && std::isfinite(localMin.y) && std::isfinite(localMin.z) &&
+            std::isfinite(localMax.x) && std::isfinite(localMax.y) && std::isfinite(localMax.z) &&
+            (std::abs(localExtent.x) > 1e-5f || std::abs(localExtent.y) > 1e-5f || std::abs(localExtent.z) > 1e-5f);
+        if (!hasBounds) return true;
 
-    const glm::vec3 localCenter = (localMin + localMax) * 0.5f;
-    const glm::vec3 worldCenter = glm::vec3(dc.worldMatrix * glm::vec4(localCenter, 1.0f));
-    if (!std::isfinite(worldCenter.x) || !std::isfinite(worldCenter.y) || !std::isfinite(worldCenter.z)) return true;
+        const glm::vec3 localCenter = (localMin + localMax) * 0.5f;
+        worldCenter = glm::vec3(dc.worldMatrix * glm::vec4(localCenter, 1.0f));
+        if (!std::isfinite(worldCenter.x) || !std::isfinite(worldCenter.y) || !std::isfinite(worldCenter.z)) return true;
 
-    const float localRadius = glm::length(localExtent) * 0.5f;
-    const float sx = glm::length(glm::vec3(dc.worldMatrix[0]));
-    const float sy = glm::length(glm::vec3(dc.worldMatrix[1]));
-    const float sz = glm::length(glm::vec3(dc.worldMatrix[2]));
-    const float maxScale = std::max(sx, std::max(sy, sz));
-    if (!std::isfinite(localRadius) || !std::isfinite(maxScale)) return true;
-    const float radius = std::max(localRadius * maxScale, 0.001f);
+        const float localRadius = glm::length(localExtent) * 0.5f;
+        const float sx = glm::length(glm::vec3(dc.worldMatrix[0]));
+        const float sy = glm::length(glm::vec3(dc.worldMatrix[1]));
+        const float sz = glm::length(glm::vec3(dc.worldMatrix[2]));
+        const float maxScale = std::max(sx, std::max(sy, sz));
+        if (!std::isfinite(localRadius) || !std::isfinite(maxScale)) return true;
+        radius = std::max(localRadius * maxScale, 0.001f);
+
+        dc.cullWorldCenter = worldCenter;
+        dc.cullWorldRadius = radius;
+        dc.cullBoundsValid = true;
+        dc.cullTransformHash = transformHash;
+    }
 
     for (int i = 0; i < 6; ++i) {
         const float dist = glm::dot(frustum.planes[i].normal, worldCenter) + frustum.planes[i].d;
         if (dist < -radius * 1.2f) return false;
     }
     return true;
+}
+
+glm::vec3 GetDrawSortCenterWS(const DrawCmd& dc) {
+    if (dc.cullBoundsValid &&
+        std::isfinite(dc.cullWorldCenter.x) &&
+        std::isfinite(dc.cullWorldCenter.y) &&
+        std::isfinite(dc.cullWorldCenter.z)) {
+        return dc.cullWorldCenter;
+    }
+    const glm::vec3 center(dc.worldMatrix[3][0], dc.worldMatrix[3][1], dc.worldMatrix[3][2]);
+    if (std::isfinite(center.x) && std::isfinite(center.y) && std::isfinite(center.z)) {
+        return center;
+    }
+    return glm::vec3(0.0f);
+}
+
+float ComputeTransparentSortDepth(const DrawCmd& dc,
+                                  const glm::vec3& eyePos,
+                                  const glm::vec3& viewDir) {
+    const glm::vec3 worldCenter = GetDrawSortCenterWS(dc);
+    return glm::dot(worldCenter - eyePos, viewDir);
+}
+
+void SortTransparentDrawsBackToFront(std::vector<const DrawCmd*>& draws,
+                                     const glm::vec3& eyePos,
+                                     const glm::vec3& viewDirRaw) {
+    if (draws.size() < 2) return;
+
+    glm::vec3 viewDir = viewDirRaw;
+    const float dirLen2 = glm::dot(viewDir, viewDir);
+    if (!std::isfinite(dirLen2) || dirLen2 <= 1e-8f) {
+        viewDir = glm::vec3(0.0f, 0.0f, -1.0f);
+    } else {
+        viewDir = glm::normalize(viewDir);
+    }
+
+    std::stable_sort(draws.begin(), draws.end(), [&](const DrawCmd* a, const DrawCmd* b) {
+        if (!a || !b) return a < b;
+        const float depthA = ComputeTransparentSortDepth(*a, eyePos, viewDir);
+        const float depthB = ComputeTransparentSortDepth(*b, eyePos, viewDir);
+        if (std::fabs(depthA - depthB) > 1e-4f) {
+            return depthA > depthB;
+        }
+        if (a->nodeName != b->nodeName) return a->nodeName < b->nodeName;
+        if (a->shdr != b->shdr) return a->shdr < b->shdr;
+        if (a->group != b->group) return a->group < b->group;
+        return a < b;
+    });
 }
 
 const char* EventModeText(bool enabled) {
@@ -223,9 +304,9 @@ static constexpr UniformID U_GALBEDO_SPEC = NDEVC::Graphics::IShader::MakeUnifor
 static constexpr UniformID U_LIGHT_BUFFER_TEX = NDEVC::Graphics::IShader::MakeUniformID("lightBufferTex");
 static constexpr UniformID U_GEMISSIVE_TEX = NDEVC::Graphics::IShader::MakeUniformID("gEmissiveTex");
 static constexpr UniformID U_USE_INSTANCED_POINT_LIGHTS = NDEVC::Graphics::IShader::MakeUniformID("UseInstancedPointLights");
-static constexpr bool kDisableShadows = false;
+static const bool kDisableShadowPass = ReadEnvToggle("NDEVC_DISABLE_SHADOW_PASS");
+static const bool kDisableShadows = ReadEnvToggle("NDEVC_DISABLE_SHADOWS") || kDisableShadowPass;
 static constexpr bool kDisableLighting = false;
-static constexpr bool kDisableShadowPass = false;
 static constexpr bool kDisableGeometryPass = false;
 static constexpr bool kDisableLightingPass = false;
 static constexpr bool kDisablePointLightPass = false;
@@ -240,9 +321,10 @@ static constexpr bool kDisableParticlePass = false;
 static constexpr bool kDisableFog = false;
 static constexpr bool kDisableViewDependentSpecular = false;
 static constexpr bool kDisableViewDependentReflections = false;
-static constexpr bool kForceEnvironmentThroughStandardGeometryPath = false;
+static constexpr bool kForceEnvironmentThroughStandardGeometryPath = true;
 static constexpr bool kLogGroundDecalReceiveSolidDiffuse = false;
 static constexpr bool kParticleEmitterTransformsAreStatic = false;
+static const bool kDisableRefractionPass = ReadEnvToggle("NDEVC_DISABLE_REFRACTION_PASS");
 static const bool kLogShaderCompat = ReadEnvToggle("NDEVC_LOG_SHADER_COMPAT");
 static const bool kForceNonInstancedNormalMatrixPath =
     ReadEnvToggle("NDEVC_FORCE_NON_INSTANCED_NORMAL_MATRIX");
@@ -403,6 +485,7 @@ void main() {
 void DeferredRenderer::setupRenderPasses()
 {
     if (!scenePrepared) {
+        InvalidateSelection();
         if (!scene_.currentMap) {
             std::cerr << "map load FAILED (scene_.currentMap is null)\n";
         } else {
@@ -460,7 +543,13 @@ void DeferredRenderer::setupRenderPasses()
         setMegaOffsets(environmentAlphaDraws);
         setMegaOffsets(postAlphaUnlitDraws);
 
-        DrawBatchSystem::instance().init(solidDraws);
+        ApplyDisabledDrawFlags();
+
+        solidBatchSystem_.init(solidDraws);
+        alphaTestBatchSystem_.init(alphaTestDraws);
+        environmentBatchSystem_.init(environmentDraws);
+        environmentAlphaBatchSystem_.init(environmentAlphaDraws);
+        decalBatchSystem_.init(decalDraws);
 
         rebuildAnimatedDrawLists();
         scenePrepared = true;
@@ -500,6 +589,21 @@ void DeferredRenderer::setupRenderPasses()
     particleGraph = std::make_unique<FrameGraph>(device_.get(), width, height);
     decalGraph = std::make_unique<FrameGraph>(device_.get(), width, height);
 
+    auto hasDeferredGeometryInputs = [this]() -> bool {
+        return !solidDraws.empty() || !alphaTestDraws.empty() ||
+               !simpleLayerDraws.empty() ||
+               !environmentDraws.empty() || !environmentAlphaDraws.empty();
+    };
+    auto hasForwardPassInputs = [this]() -> bool {
+        return !environmentAlphaDraws.empty() || !refractionDraws.empty() ||
+               !waterDraws.empty() || !postAlphaUnlitDraws.empty() ||
+               !scene_.particleNodes.empty();
+    };
+    auto hasSceneColorProducerInputs =
+        [hasDeferredGeometryInputs, hasForwardPassInputs]() -> bool {
+            return hasDeferredGeometryInputs() || hasForwardPassInputs();
+        };
+
 auto& shadowPass = shadowGraph->addPass("ShadowCascades");
 shadowPass.depthTest = true;
 shadowPass.depthWrite = true;
@@ -507,6 +611,9 @@ shadowPass.cullFace = true;
 // Shadow pass clears per cascade inside renderCascadedShadows().
 shadowPass.clearDepth = false;
 shadowPass.externalFBO = true;
+shadowPass.shouldSkip = [this]() {
+    return solidDraws.empty() && simpleLayerDraws.empty();
+};
 shadowPass.execute = [this]() {
     if (kDisableShadowPass) {
         if (optRenderLOG) std::cout << "[SHADOW] Disabled by kDisableShadowPass\n";
@@ -534,6 +641,9 @@ shadowGraph->compile();
     geometryPass.clearColor = glm::vec4(0, 0, 0, 0);
     geometryPass.clearDepth = true;
     geometryPass.clearStencil = true;
+    geometryPass.shouldSkip = [hasSceneColorProducerInputs]() {
+        return !hasSceneColorProducerInputs();
+    };
     geometryPass.execute = [this]() {
         if (kDisableGeometryPass) {
             if (optRenderLOG) std::cout << "[GEOMETRY] Disabled by kDisableGeometryPass\n";
@@ -558,51 +668,48 @@ shadowGraph->compile();
     glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
     glStencilMask(0xFF);
 
-    auto shader = shaderManager->GetShader("NDEVCdeferred");
+    auto standardShader = shaderManager->GetShader("standard");
+    auto shader = standardShader ? standardShader : shaderManager->GetShader("NDEVCdeferred");
+    const char* geometryShaderName = standardShader ? "standard" : "NDEVCdeferred";
     if (!shader) {
-        std::cerr << "[GEOMETRY] ERROR: Shader not found\n";
+        std::cerr << "[GEOMETRY] ERROR: Shader 'standard'/'NDEVCdeferred' not found\n";
         return;
     }
     const GLuint deferredProgram = shader->GetNativeHandle()
         ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle())
         : 0;
-    if (optRenderLOG) std::cout << "[GEOMETRY] Shader ID: " << deferredProgram << "\n";
+    if (optRenderLOG) std::cout << "[GEOMETRY] Shader: " << geometryShaderName << " ID: " << deferredProgram << "\n";
 
     static GLuint sLastDeferredProgram = 0;
+    static GLint normalMatrixLoc = -1;
+    static GLint depthScaleLoc = -1;
     if (sLastDeferredProgram != deferredProgram) {
         sLastDeferredProgram = deferredProgram;
         deferredShaderCompatibilityLogged_ = false;
-    }
+        deferredShaderHasNormalMatrixUniform_ = false;
+        deferredShaderUsesPackedGBuffer_ = false;
+        normalMatrixLoc = -1;
+        depthScaleLoc = -1;
+        if (deferredProgram != 0) {
+            normalMatrixLoc = glGetUniformLocation(deferredProgram, "normalMatrix");
+            depthScaleLoc = glGetUniformLocation(deferredProgram, "depthScale");
+            deferredShaderHasNormalMatrixUniform_ = normalMatrixLoc >= 0;
 
-    deferredShaderHasNormalMatrixUniform_ = false;
-    deferredShaderUsesPackedGBuffer_ = false;
-    GLint normalMatrixLoc = -1;
-    GLint depthScaleLoc = -1;
-    if (deferredProgram != 0) {
-        normalMatrixLoc = glGetUniformLocation(deferredProgram, "normalMatrix");
-        depthScaleLoc = glGetUniformLocation(deferredProgram, "depthScale");
-        deferredShaderHasNormalMatrixUniform_ = normalMatrixLoc >= 0;
+            const GLint packedNormalOutLoc = glGetFragDataLocation(deferredProgram, "gNormalDepth");
+            const GLint standardNormalOutLoc = glGetFragDataLocation(deferredProgram, "gNormalDepthPacked");
+            const GLint positionVSOutLoc = glGetFragDataLocation(deferredProgram, "gPositionVS");
+            deferredShaderUsesPackedGBuffer_ =
+                (packedNormalOutLoc == 0 && standardNormalOutLoc < 0 && positionVSOutLoc < 0);
 
-        const GLint packedNormalOutLoc = glGetFragDataLocation(deferredProgram, "gNormalDepth");
-        const GLint standardNormalOutLoc = glGetFragDataLocation(deferredProgram, "gNormalDepthPacked");
-        const GLint positionVSOutLoc = glGetFragDataLocation(deferredProgram, "gPositionVS");
-        deferredShaderUsesPackedGBuffer_ =
-            (packedNormalOutLoc == 0 && standardNormalOutLoc < 0 && positionVSOutLoc < 0);
-
-        if (!deferredShaderCompatibilityLogged_) {
-            if (deferredShaderHasNormalMatrixUniform_) {
-                if (optRenderLOG || kLogShaderCompat) {
-                    if (kForceNonInstancedNormalMatrixPath) {
-                        std::cout << "[GEOMETRY] NDEVCdeferred uses 'normalMatrix'; switching deferred draws to non-instanced per-draw normalMatrix uploads.\n";
-                    } else {
-                        std::cout << "[GEOMETRY] NDEVCdeferred uses 'normalMatrix'; keeping instanced deferred draws with view-space fallback normalMatrix.\n";
-                    }
+            if (deferredShaderHasNormalMatrixUniform_ && (optRenderLOG || kLogShaderCompat)) {
+                if (kForceNonInstancedNormalMatrixPath) {
+                    std::cout << "[GEOMETRY] " << geometryShaderName << " uses 'normalMatrix'; switching deferred draws to non-instanced per-draw normalMatrix uploads.\n";
+                } else {
+                    std::cout << "[GEOMETRY] " << geometryShaderName << " uses 'normalMatrix'; keeping instanced deferred draws with view-space fallback normalMatrix.\n";
                 }
             }
-            if (deferredShaderUsesPackedGBuffer_) {
-                if (optRenderLOG || kLogShaderCompat) {
-                    std::cout << "[GEOMETRY] NDEVCdeferred writes packed legacy G-buffer outputs; enabling packed-to-standard G-buffer compatibility pass.\n";
-                }
+            if (deferredShaderUsesPackedGBuffer_ && (optRenderLOG || kLogShaderCompat)) {
+                std::cout << "[GEOMETRY] " << geometryShaderName << " writes packed legacy G-buffer outputs; enabling packed-to-standard G-buffer compatibility pass.\n";
             }
             deferredShaderCompatibilityLogged_ = true;
         }
@@ -674,8 +781,25 @@ shadowGraph->compile();
     shader->SetInt(U_SPEC_MAP0, 1);
     shader->SetInt(U_BUMP_MAP0, 2);
     shader->SetInt(U_EMSV_MAP0, 3);
+    shader->SetInt("diffMapSampler", 0);
+    shader->SetInt("specMapSampler", 1);
+    shader->SetInt("bumpMapSampler", 2);
+    shader->SetInt("emsvSampler", 3);
     shader->SetInt(U_TWO_SIDED, 0);
     shader->SetInt(U_IS_FLAT_NORMAL, 0);
+    shader->SetVec4("fogDistances", glm::vec4(180.0f, 520.0f, 0.0f, 0.0f));
+    shader->SetVec4("fogColor", glm::vec4(0.61f, 0.58f, 0.52f, 0.0f));
+    shader->SetVec4("heightFogColor", glm::vec4(0.61f, 0.58f, 0.52f, 100000.0f));
+    shader->SetVec4("pixelSize", glm::vec4(
+        1.0f / static_cast<float>(std::max(width, 1)),
+        1.0f / static_cast<float>(std::max(height, 1)),
+        0.0f,
+        0.0f));
+    shader->SetFloat("encodefactor", 1.0f);
+    shader->SetFloat("alphaBlendFactor", 1.0f);
+    shader->SetFloat("mayaAnimableAlpha", 1.0f);
+    shader->SetFloat("AlphaClipRef", 128.0f);
+    shader->SetVec4("customColor2", glm::vec4(0.0f));
     if (depthScaleLoc >= 0) {
         glUniform1f(depthScaleLoc, 1.0f);
     }
@@ -687,27 +811,20 @@ shadowGraph->compile();
     setGeometryDrawBufferLayout(deferredShaderUsesPackedGBuffer_);
 
     if (device_) {
-        NDEVC::Graphics::RenderStateDesc geomState;
-        geomState.stencil.stencilEnable = true;
-        geomState.stencil.stencilFunc = NDEVC::Graphics::CompareFunc::Always;
-        geomState.stencil.ref = 1;
-        geomState.stencil.readMask = 0xFF;
-        geomState.stencil.writeMask = 0xFF;
-        geomState.stencil.stencilFailOp = NDEVC::Graphics::StencilOp::Keep;
-        geomState.stencil.depthFailOp = NDEVC::Graphics::StencilOp::Keep;
-        geomState.stencil.depthPassOp = NDEVC::Graphics::StencilOp::Replace;
-        auto state = device_->CreateRenderState(geomState);
-        if (state) device_->ApplyRenderState(state.get());
+        if (cachedGeomState_) device_->ApplyRenderState(cachedGeomState_.get());
     } else {
         glStencilFunc(GL_ALWAYS, 1, 0xFF);
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
     }
 
     glm::mat4 viewProj = camera_.getProjectionMatrix() * camera_.getViewMatrix();
-    Camera::Frustum frustum = camera_.extractFrustum(viewProj);
+    const Camera::Frustum& frustum = frameFrustum_;
     const bool disableFrustumCulling = FrustumCullingDisabled();
     const bool disableFaceCulling = FaceCullingDisabled();
     UpdateVisibilityThisFrame(frustum);
+    alphaTestBatchSystem_.updateStaticVisibility(alphaTestDraws);
+    environmentBatchSystem_.updateStaticVisibility(environmentDraws);
+    environmentAlphaBatchSystem_.updateStaticVisibility(environmentAlphaDraws);
     auto isDrawVisible = [&](const DrawCmd& dc, const Camera::Frustum& fr, bool keepStaticVisible) -> bool {
         return PassesFrustumCulling(dc, fr, disableFrustumCulling, keepStaticVisible);
     };
@@ -730,6 +847,13 @@ shadowGraph->compile();
         shader->SetFloat(U_ALPHA_CUTOFF, dc.alphaCutoff);
         shader->SetInt(U_TWO_SIDED, dc.cachedTwoSided);
         shader->SetInt(U_IS_FLAT_NORMAL, dc.cachedIsFlatNormal);
+        shader->SetFloat("alphaBlendFactor", dc.cachedAlphaBlendFactor);
+        shader->SetFloat("AlphaClipRef", glm::clamp(dc.alphaCutoff * 256.0f, 0.0f, 255.0f));
+        auto customTintIt = dc.shaderParamsVec4.find("customColor2");
+        const glm::vec4 customTint = (customTintIt != dc.shaderParamsVec4.end())
+            ? customTintIt->second
+            : glm::vec4(0.0f);
+        shader->SetVec4("customColor2", customTint);
 
         const bool hasSpecMap = dc.cachedHasSpecMap;
         bindTexture(0, dc.tex[0] ? toTextureHandle(dc.tex[0]) : whiteTex);
@@ -776,11 +900,11 @@ shadowGraph->compile();
         frameDrawCalls_ += renderedSolid;
         if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Solid draws (non-instanced normalMatrix path): ", renderedSolid);
     } else {
-        DrawBatchSystem::instance().cull(solidDraws, frustum);
+        solidBatchSystem_.cull(solidDraws, frustum);
         if (optRenderLOG) std::cout << "[GEOMETRY] Solid draws: " << solidDraws.size() << "\n";
 
         this->clearError("Geometry::PreSolidFlush");
-        DrawBatchSystem::instance().flush(samplerRepeat_abstracted.get());
+        solidBatchSystem_.flush(samplerRepeat_abstracted.get(), 4, deferredProgram);
 
         this->clearError("Geometry::AfterSolidFlush");
 
@@ -813,7 +937,8 @@ shadowGraph->compile();
         }
 
         if (!dc.sourceNode) continue;
-        std::unordered_map<std::string, float> animParams = DeferredRendererAnimation::SampleShaderVarAnimations(dc.sourceNode, dcAnimTime);
+        static thread_local std::unordered_map<std::string, float> animParams;
+        DeferredRendererAnimation::SampleShaderVarAnimations(dc.sourceNode, dcAnimTime, animParams);
         if (animParams.empty()) continue;
 
         clearError("Lighting::PassStart");
@@ -855,16 +980,14 @@ shadowGraph->compile();
             shader->SetInt(U_ALPHA_TEST, 1);
             shader->SetInt(U_USE_INSTANCING, 1);
 
-            DrawBatchSystem::instance().reset();
-            frustum = camera_.extractFrustum(camera_.getProjectionMatrix() * camera_.getViewMatrix());
-            DrawBatchSystem::instance().cullGeneric(alphaTestDraws, frustum, 1, 5);
+            alphaTestBatchSystem_.cullGeneric(alphaTestDraws, frameFrustum_, 1, 5);
 
             MegaBuffer::instance().bind();
-            DrawBatchSystem::instance().flush(samplerRepeat_abstracted.get(), 5);
+            alphaTestBatchSystem_.flush(samplerRepeat_abstracted.get(), 5, deferredProgram);
 
-            int alphaTestDrawCount = alphaTestDraws.size();
-            frameDrawCalls_ += alphaTestDrawCount;
-            if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Alpha test draws (batched): ", alphaTestDrawCount);
+            const int alphaTestBatches = static_cast<int>(alphaTestBatchSystem_.activeBatches().size());
+            frameDrawCalls_ += alphaTestBatches;
+            if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Alpha test draws (batched): batches=", alphaTestBatches, " objs=", alphaTestDraws.size());
         }
     }
 
@@ -887,9 +1010,18 @@ shadowGraph->compile();
             glDepthMask(GL_TRUE);
 
             // Precompute inverse view rotation for view→world normal conversion
-            const glm::mat3 slInvViewRot = glm::mat3(glm::inverse(camera_.getViewMatrix()));
+            const glm::mat4 slView = camera_.getViewMatrix();
+            const glm::mat4 slProj = camera_.getProjectionMatrix();
+            const glm::mat3 slInvViewRot = glm::mat3(glm::inverse(slView));
+            const GLuint slProg = slGBufferShader->GetNativeHandle()
+                ? *reinterpret_cast<GLuint*>(slGBufferShader->GetNativeHandle()) : 0;
+            const GLuint slClipProg = slGBufferClipShader->GetNativeHandle()
+                ? *reinterpret_cast<GLuint*>(slGBufferClipShader->GetNativeHandle()) : 0;
+            const GLint slInvViewRotLoc = slProg ? glGetUniformLocation(slProg, "invViewRot") : -1;
+            const GLint slInvViewRotClipLoc = slClipProg ? glGetUniformLocation(slClipProg, "invViewRot") : -1;
 
             int renderedSimpleLayerGBuffer = 0;
+            decltype(slGBufferShader) lastSlShader = nullptr;
             MegaBuffer::instance().bind();
             for (const auto& dc : simpleLayerDraws) {
                 if (!dc.mesh || dc.disabled) continue;
@@ -903,22 +1035,16 @@ shadowGraph->compile();
                 }
 
                 auto shader = dc.alphaTest ? slGBufferClipShader : slGBufferShader;
-                shader->Use();
+                if (shader != lastSlShader) { shader->Use(); lastSlShader = shader; }
 
-                const glm::mat4 modelView = camera_.getViewMatrix() * dc.worldMatrix;
-                const glm::mat4 mvp = camera_.getProjectionMatrix() * modelView;
+                const glm::mat4 modelView = slView * dc.worldMatrix;
+                const glm::mat4 mvp = slProj * modelView;
                 const glm::mat4 imv = glm::inverse(modelView);
                 shader->SetMat4("mvp", glm::transpose(mvp));
                 shader->SetMat4("modelView", glm::transpose(modelView));
                 shader->SetMat4("imv", glm::transpose(imv));
-                {
-                    const GLuint prog = shader->GetNativeHandle()
-                        ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle()) : 0;
-                    if (prog) {
-                        GLint loc = glGetUniformLocation(prog, "invViewRot");
-                        if (loc >= 0) glUniformMatrix3fv(loc, 1, GL_FALSE, &slInvViewRot[0][0]);
-                    }
-                }
+                const GLint invViewRotLoc = dc.alphaTest ? slInvViewRotClipLoc : slInvViewRotLoc;
+                if (invViewRotLoc >= 0) glUniformMatrix3fv(invViewRotLoc, 1, GL_FALSE, &slInvViewRot[0][0]);
 
                 auto layerTilingIt = dc.shaderParamsFloat.find("layerTiling");
                 const float layerTiling = (layerTilingIt != dc.shaderParamsFloat.end())
@@ -989,22 +1115,7 @@ shadowGraph->compile();
 
         if (!environmentDraws.empty()) {
             if (device_) {
-                NDEVC::Graphics::RenderStateDesc envState;
-                envState.depth.depthTest = true;
-                envState.depth.depthWrite = true;
-                envState.depth.depthFunc = NDEVC::Graphics::CompareFunc::Less;
-                envState.blend.blendEnable = false;
-                envState.stencil.stencilEnable = true;
-                envState.stencil.stencilFunc = NDEVC::Graphics::CompareFunc::Always;
-                envState.stencil.ref = 1;
-                envState.stencil.readMask = 0xFF;
-                envState.stencil.writeMask = 0xFF;
-                envState.stencil.stencilFailOp = NDEVC::Graphics::StencilOp::Keep;
-                envState.stencil.depthFailOp = NDEVC::Graphics::StencilOp::Keep;
-                envState.stencil.depthPassOp = NDEVC::Graphics::StencilOp::Replace;
-                envState.rasterizer.cullMode = disableFaceCulling ? NDEVC::Graphics::CullMode::None
-                                                                  : NDEVC::Graphics::CullMode::Back;
-                device_->ApplyRenderState(device_->CreateRenderState(envState).get());
+                device_->ApplyRenderState((disableFaceCulling ? cachedEnvStateNoCull_ : cachedEnvState_).get());
             } else {
                 glEnable(GL_DEPTH_TEST);
                 glDepthFunc(GL_LESS);
@@ -1022,9 +1133,9 @@ shadowGraph->compile();
             }
 
             if (kForceEnvironmentThroughStandardGeometryPath) {
-                auto stdShader = shaderManager->GetShader("NDEVCdeferred");
+                auto stdShader = shader;
                 if (!stdShader) {
-                    std::cerr << "[GEOMETRY] Shader NDEVCdeferred not found for environment fallback\n";
+                    std::cerr << "[GEOMETRY] Shader " << geometryShaderName << " not found for environment fallback\n";
                 } else {
                     setGeometryDrawBufferLayout(deferredShaderUsesPackedGBuffer_);
                     stdShader->Use();
@@ -1053,12 +1164,11 @@ shadowGraph->compile();
                     }
                     if (useNonInstancedNormalMatrixPath) {
                         stdShader->SetInt(U_USE_INSTANCING, 0);
-                        Camera::Frustum envFrustum = camera_.extractFrustum(camera_.getProjectionMatrix() * camera_.getViewMatrix());
                         MegaBuffer::instance().bind();
                         int renderedEnv = 0;
                         for (const auto& dc : environmentDraws) {
                             if (!dc.mesh || dc.disabled) continue;
-                            if (!isDrawVisible(dc, envFrustum, true)) continue;
+                            if (!isDrawVisible(dc, frameFrustum_, true)) continue;
 
                             stdShader->SetMat4(U_MODEL, dc.worldMatrix);
                             if (normalMatrixLoc >= 0) {
@@ -1101,15 +1211,14 @@ shadowGraph->compile();
                         frameDrawCalls_ += renderedEnv;
                         if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Environment draws via deferred non-instanced normalMatrix path: ", renderedEnv);
                     } else {
-                        DrawBatchSystem::instance().reset();
-                        Camera::Frustum frustum = camera_.extractFrustum(camera_.getProjectionMatrix() * camera_.getViewMatrix());
-                        DrawBatchSystem::instance().cullGeneric(environmentDraws, frustum, 3, 4);
+                        environmentBatchSystem_.cullGeneric(environmentDraws, frameFrustum_, 3, 4);
 
                         MegaBuffer::instance().bind();
-                        DrawBatchSystem::instance().flush(samplerRepeat_abstracted.get(), 4);
+                        environmentBatchSystem_.flush(samplerRepeat_abstracted.get(), 4, deferredProgram);
 
-                        frameDrawCalls_ += static_cast<int>(environmentDraws.size());
-                        if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Environment draws via standard path: ", environmentDraws.size());
+                        const int environmentBatches = static_cast<int>(environmentBatchSystem_.activeBatches().size());
+                        frameDrawCalls_ += environmentBatches;
+                        if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Environment draws via standard path: batches=", environmentBatches, " objs=", environmentDraws.size());
                     }
                 }
             } else {
@@ -1123,6 +1232,7 @@ shadowGraph->compile();
                     envShader->SetMat4("view", camera_.getViewMatrix());
                     envShader->SetMat4("textureTransform0", glm::mat4(1.0f));
                     envShader->SetInt("UseSkinning", 0);
+                    envShader->SetInt("UseInstancing", 0);
                     envShader->SetVec3("eyePos", camera_.getPosition());
                     envShader->SetInt("DiffMap0", 0);
                     envShader->SetInt("SpecMap0", 1);
@@ -1130,12 +1240,11 @@ shadowGraph->compile();
                     envShader->SetInt("EmsvMap0", 3);
                     envShader->SetInt("CubeMap0", 4);
 
-                    Camera::Frustum frustum = camera_.extractFrustum(camera_.getProjectionMatrix() * camera_.getViewMatrix());
                     int renderedEnv = 0;
                     for (const auto& dc : environmentDraws) {
                         if (!dc.mesh) continue;
                         if (dc.disabled) continue;
-                        if (!isDrawVisible(dc, frustum, true)) continue;
+                        if (!isDrawVisible(dc, frameFrustum_, true)) continue;
 
                         envShader->SetMat4("model", dc.worldMatrix);
                         envShader->SetFloat("Intensity0", dc.cachedIntensity0);
@@ -1195,6 +1304,9 @@ shadowGraph->compile();
     packedCompatPass.depthTest = false;
     packedCompatPass.depthWrite = false;
     packedCompatPass.cullFace = false;
+    packedCompatPass.shouldSkip = [hasSceneColorProducerInputs]() {
+        return !hasSceneColorProducerInputs();
+    };
     packedCompatPass.execute = [this]() {
         if (!deferredShaderUsesPackedGBuffer_) {
             deferredPackedCompatReady_ = true;
@@ -1230,26 +1342,39 @@ shadowGraph->compile();
         glClearBufferfv(GL_COLOR, 1, kZeroColor);
 
         glUseProgram(compatProgram);
+
+        static GLuint cachedCompatProgram = 0;
+        static GLint locPackedNormalDepth = -1, locPositionWS = -1, locBaseNormalDepth = -1;
+        static GLint locView = -1, locInvView = -1, locInvProjection = -1, locInvViewRot = -1;
+        if (cachedCompatProgram != compatProgram) {
+            cachedCompatProgram = compatProgram;
+            locPackedNormalDepth = glGetUniformLocation(compatProgram, "gPackedNormalDepth");
+            locPositionWS        = glGetUniformLocation(compatProgram, "gPositionWS");
+            locBaseNormalDepth   = glGetUniformLocation(compatProgram, "gBaseNormalDepth");
+            locView              = glGetUniformLocation(compatProgram, "view");
+            locInvView           = glGetUniformLocation(compatProgram, "invView");
+            locInvProjection     = glGetUniformLocation(compatProgram, "invProjection");
+            locInvViewRot        = glGetUniformLocation(compatProgram, "invViewRot");
+            glUniform1i(locPackedNormalDepth, 0);
+            glUniform1i(locPositionWS,        1);
+            glUniform1i(locBaseNormalDepth,   2);
+        }
+
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, packedNormalDepth);
-        glUniform1i(glGetUniformLocation(compatProgram, "gPackedNormalDepth"), 0);
-
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, gPosWS);
-        glUniform1i(glGetUniformLocation(compatProgram, "gPositionWS"), 1);
-
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, baseNormalDepth);
-        glUniform1i(glGetUniformLocation(compatProgram, "gBaseNormalDepth"), 2);
 
         const glm::mat4 view = camera_.getViewMatrix();
         const glm::mat4 invView = glm::inverse(view);
         const glm::mat4 invProjection = glm::inverse(camera_.getProjectionMatrix());
-        const glm::mat3 invViewRot = glm::mat3(glm::inverse(view));
-        glUniformMatrix4fv(glGetUniformLocation(compatProgram, "view"), 1, GL_FALSE, &view[0][0]);
-        glUniformMatrix4fv(glGetUniformLocation(compatProgram, "invView"), 1, GL_FALSE, &invView[0][0]);
-        glUniformMatrix4fv(glGetUniformLocation(compatProgram, "invProjection"), 1, GL_FALSE, &invProjection[0][0]);
-        glUniformMatrix3fv(glGetUniformLocation(compatProgram, "invViewRot"), 1, GL_FALSE, &invViewRot[0][0]);
+        const glm::mat3 invViewRot = glm::mat3(invView);
+        glUniformMatrix4fv(locView,          1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(locInvView,       1, GL_FALSE, &invView[0][0]);
+        glUniformMatrix4fv(locInvProjection, 1, GL_FALSE, &invProjection[0][0]);
+        glUniformMatrix3fv(locInvViewRot,    1, GL_FALSE, &invViewRot[0][0]);
 
         glBindVertexArray(screenVAO);
         glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1281,6 +1406,9 @@ geometryGraph->compile();
             glBindFramebuffer(GL_FRAMEBUFFER, gDepthDecalFBO);
         }
     };
+    decalPass.shouldSkip = [this, hasDeferredGeometryInputs]() {
+        return decalDraws.empty() || !hasDeferredGeometryInputs();
+    };
     decalPass.execute = [this]() {
         if (kDisableDecalPass) {
             if (optRenderLOG) std::cout << "[DECALS] Disabled by kDisableDecalPass\n";
@@ -1311,22 +1439,29 @@ geometryGraph->compile();
             return;
         }
 
+        static GLuint decalFBOLastAlbedo = 0, decalFBOLastDepth = 0;
+        const bool decalFBONeedsSetup = (gDepthDecalFBO == 0) ||
+                                        (gAlbedoSpec != decalFBOLastAlbedo) ||
+                                        (gDepth != decalFBOLastDepth);
         if (gDepthDecalFBO == 0) {
             glGenFramebuffers(1, gDepthDecalFBO.put());
         }
         glBindFramebuffer(GL_FRAMEBUFFER, gDepthDecalFBO);
 
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gAlbedoSpec, 0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, gDepth, 0);
-        {
-            GLenum bufs[1] = { GL_COLOR_ATTACHMENT0 };
-            glDrawBuffers(1, bufs);
-        }
-
-        GLenum fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (fboStatus != GL_FRAMEBUFFER_COMPLETE) {
-            std::cerr << "[DECALS] ERROR: FBO incomplete 0x" << std::hex << fboStatus << std::dec << "\n";
-            return;
+        if (decalFBONeedsSetup) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gAlbedoSpec, 0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, gDepth, 0);
+            {
+                GLenum bufs[1] = { GL_COLOR_ATTACHMENT0 };
+                glDrawBuffers(1, bufs);
+            }
+            GLenum fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (fboStatus != GL_FRAMEBUFFER_COMPLETE) {
+                std::cerr << "[DECALS] ERROR: FBO incomplete 0x" << std::hex << fboStatus << std::dec << "\n";
+                return;
+            }
+            decalFBOLastAlbedo = gAlbedoSpec;
+            decalFBOLastDepth = gDepth;
         }
 
         glViewport(0, 0, width, height);
@@ -1374,12 +1509,13 @@ geometryGraph->compile();
             this->bindTexture(1, gNormalDepth);
             glBindSampler(1, 0);
 
-            DrawBatchSystem::instance().cullDecals(decalDraws);
+            decalBatchSystem_.cullDecals(decalDraws);
             MegaBuffer::instance().bind();
-            DrawBatchSystem::instance().flushDecals(samplerRepeat_abstracted.get(), samplerClamp_abstracted.get());
+            decalBatchSystem_.flushDecals(samplerRepeat_abstracted.get(), samplerClamp_abstracted.get());
 
-            frameDrawCalls_ += static_cast<int>(decalDraws.size());
-            if (optRenderLOG) NC::LOGGING::Log("[DECALS] Submitted: ", static_cast<int>(decalDraws.size()));
+            const int decalBatches = static_cast<int>(decalBatchSystem_.activeBatches().size());
+            frameDrawCalls_ += decalBatches;
+            if (optRenderLOG) NC::LOGGING::Log("[DECALS] Submitted: batches=", decalBatches, " objs=", static_cast<int>(decalDraws.size()));
 
             glBindVertexArray(0);
             glBindSampler(0, 0);
@@ -1411,6 +1547,9 @@ geometryGraph->compile();
     lightingPass.cullFace = false;
     lightingPass.clearColorBuffer = true;
     lightingPass.clearColor = glm::vec4(0, 0, 0, 0);
+    lightingPass.shouldSkip = [hasSceneColorProducerInputs]() {
+        return !hasSceneColorProducerInputs();
+    };
     lightingPass.execute = [this]() {
         if (kDisableLightingPass) {
             if (optRenderLOG) std::cout << "[LIGHTING] Disabled by kDisableLightingPass\n";
@@ -1446,14 +1585,7 @@ geometryGraph->compile();
         shader->PrecacheUniform(U_SHADOW_MAP_CASCADE3, "shadowMapCascade3");
         shader->PrecacheUniform(U_NUM_CASCADES, "numCascades");
         shader->Use();
-        glm::vec3 camPos = camera_.getPosition();
-        shader->SetVec3(U_CAMERA_POS, camPos);
-        glm::vec3 lightDir = kLightDirToSun;
-        shader->SetVec3(U_LIGHT_DIR_WS, lightDir);
-        glm::vec3 lightColor = glm::vec3(1.08f, 0.90f, 0.68f);
-        shader->SetVec3(U_LIGHT_COLOR, lightColor);
-        glm::vec3 ambientColor = glm::vec3(0.18f, 0.21f, 0.24f);
-        shader->SetVec3(U_AMBIENT_COLOR, ambientColor);
+        shader->SetVec3(U_CAMERA_POS, camera_.getPosition());
         constexpr UniformID kShadowCascadeUniforms[] = {
             U_SHADOW_MAP_CASCADE0,
             U_SHADOW_MAP_CASCADE1,
@@ -1475,12 +1607,22 @@ geometryGraph->compile();
         bindTexture(0, gPosVS);
         bindTexture(1, gNormalDepth);
         bindTexture(2, gPosWS);
-        shader->SetInt(U_GPOSITION, 0);
-        shader->SetInt(U_GNORMAL_DEPTH_PACKED, 1);
-        shader->SetInt(U_GPOSITION_WS, 2);
-        shader->SetInt(U_NUM_CASCADES, shadowCascadeCount);
-        shader->SetInt("DisableShadows", shadowsEnabled ? 0 : 1);
-        shader->SetInt("DisableViewDependentSpecular", kDisableViewDependentSpecular ? 1 : 0);
+
+        static GLuint cachedLightingProgram = 0;
+        const GLuint lightingProgram = shader->GetNativeHandle()
+            ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle()) : 0;
+        if (cachedLightingProgram != lightingProgram) {
+            cachedLightingProgram = lightingProgram;
+            shader->SetInt(U_GPOSITION, 0);
+            shader->SetInt(U_GNORMAL_DEPTH_PACKED, 1);
+            shader->SetInt(U_GPOSITION_WS, 2);
+            shader->SetInt(U_NUM_CASCADES, shadowCascadeCount);
+            shader->SetInt("DisableShadows", shadowsEnabled ? 0 : 1);
+            shader->SetInt("DisableViewDependentSpecular", kDisableViewDependentSpecular ? 1 : 0);
+            shader->SetVec3(U_LIGHT_DIR_WS, kLightDirToSun);
+            shader->SetVec3(U_LIGHT_COLOR, glm::vec3(1.08f, 0.90f, 0.68f));
+            shader->SetVec3(U_AMBIENT_COLOR, glm::vec3(0.18f, 0.21f, 0.24f));
+        }
         if (shadowsEnabled && shadowCascadeCount > 0) {
             for (int i = 0; i < shadowCascadeCount; ++i) {
                 bindTexture(3 + i, shadowMapCascades[i]);
@@ -1519,6 +1661,9 @@ geometryGraph->compile();
     pointLightPass.blend = true;
     pointLightPass.blendSrc = BlendFactor::One;
     pointLightPass.blendDst = BlendFactor::One;
+    pointLightPass.shouldSkip = [hasSceneColorProducerInputs]() {
+        return !hasSceneColorProducerInputs();
+    };
     pointLightPass.execute = [this]() {
         if (optRenderLOG) std::cout << "[POINTLIGHTS] Begin point light pass (" << pointLights.size() << " lights)\n";
         if (kDisablePointLightPass) {
@@ -1604,6 +1749,9 @@ compositionPass.writes = {"sceneColor"};
 compositionPass.depthTest = false;
 compositionPass.depthWrite = false;
 compositionPass.cullFace = false;
+compositionPass.shouldSkip = [hasSceneColorProducerInputs]() {
+    return !hasSceneColorProducerInputs();
+};
 compositionPass.execute = [this]() {
     if (optRenderLOG) std::cout << "[COMPOSITION] Begin composition pass\n";
     const bool forceCompatibilityUnlit = deferredShaderUsesPackedGBuffer_ && !deferredPackedCompatReady_;
@@ -1670,6 +1818,9 @@ compositionPass.execute = [this]() {
     bindTexture(3, gNormalDepth);
     shader->SetInt(U_GNORMAL_DEPTH_PACKED, 3);
     shader->SetInt("DisableLighting", disableLightingForPass ? 1 : 0);
+    shader->SetInt("DisableFog", kDisableFog ? 1 : 0);
+    shader->SetVec4("fogColor", glm::vec4(0.5f, 0.5f, 0.5f, 0.0f));
+    shader->SetVec4("fogDistances", glm::vec4(0.0f, 10000.0f, 0.0f, 1.0f));
 
     glBindVertexArray(screenVAO);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1697,6 +1848,9 @@ compositionPass.execute = [this]() {
             glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
         }
     };
+    forwardPass.shouldSkip = [hasForwardPassInputs]() {
+        return !hasForwardPassInputs();
+    };
     forwardPass.execute = [this]() {
         if (kDisableForwardPass) {
             if (optRenderLOG) std::cout << "[FORWARD] Disabled by kDisableForwardPass\n";
@@ -1723,6 +1877,8 @@ compositionPass.execute = [this]() {
             GLenum fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
             if (fboStatus != GL_FRAMEBUFFER_COMPLETE) {
                 std::cerr << "[FORWARD] ERROR: FBO incomplete 0x" << std::hex << fboStatus << std::dec << "\n";
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                return;
             }
         }
 
@@ -1733,14 +1889,130 @@ compositionPass.execute = [this]() {
         glm::mat4 viewProj = projMatrix * viewMatrix;
         glm::mat4 invView = glm::inverse(viewMatrix);
         glm::vec3 eyePos = camera_.getPosition();
+        glm::vec3 viewDir = camera_.getForward();
         glm::vec2 invViewport(1.0f / width, 1.0f / height);
-        Camera::Frustum frustum = camera_.extractFrustum(viewProj);
+        const Camera::Frustum& frustum = frameFrustum_;
         const bool disableFrustumCulling = FrustumCullingDisabled();
         const bool disableFaceCulling = FaceCullingDisabled();
         const float particleTime = static_cast<float>(glfwGetTime());
 
-        // ==================== SIMPLELAYER FORWARD PASS ====================
-        if (!simpleLayerDraws.empty()) {
+        static NDEVC::GL::GLBufHandle forwardInstanceMatrixSSBO;
+        static size_t forwardInstanceMatrixSSBOCapacity = 0;
+        static size_t forwardSsboOffsetAlignment = 0;
+
+        auto uploadForwardInstanceMatrices = [&](const std::vector<glm::mat4>& matrices) -> bool {
+            if (matrices.empty()) return false;
+            if (forwardSsboOffsetAlignment == 0) {
+                GLint align = 256;
+                glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &align);
+                if (align <= 0) align = 256;
+                forwardSsboOffsetAlignment = static_cast<size_t>(align);
+            }
+            if (!forwardInstanceMatrixSSBO) {
+                glGenBuffers(1, forwardInstanceMatrixSSBO.put());
+            }
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, forwardInstanceMatrixSSBO);
+            const size_t bytesRaw = matrices.size() * sizeof(glm::mat4);
+            const size_t bytes = (bytesRaw + forwardSsboOffsetAlignment - 1) & ~(forwardSsboOffsetAlignment - 1);
+            if (bytes > forwardInstanceMatrixSSBOCapacity) {
+                size_t newCapacity = sizeof(glm::mat4);
+                while (newCapacity < bytes) {
+                    newCapacity *= 2;
+                }
+                forwardInstanceMatrixSSBOCapacity = newCapacity;
+                glBufferData(GL_SHADER_STORAGE_BUFFER,
+                             static_cast<GLsizeiptr>(forwardInstanceMatrixSSBOCapacity),
+                             nullptr,
+                             GL_STREAM_DRAW);
+            }
+            if (forwardInstanceMatrixSSBOCapacity == 0) {
+                return false;
+            }
+
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                            static_cast<GLintptr>(0),
+                            static_cast<GLsizeiptr>(bytesRaw),
+                            matrices.data());
+            glBindBufferRange(GL_SHADER_STORAGE_BUFFER,
+                              1,
+                              forwardInstanceMatrixSSBO,
+                              static_cast<GLintptr>(0),
+                              static_cast<GLsizeiptr>(bytesRaw));
+            return true;
+        };
+
+        struct ForwardGeomCmd {
+            uint32_t count = 0;
+            uint32_t firstIndex = 0;
+            uint32_t baseInstance = 0;
+            uint32_t instanceCount = 0;
+        };
+
+        auto drawForwardInstancedOrdered = [&](const std::vector<const DrawCmd*>& draws) -> int {
+            if (draws.empty()) return 0;
+            static thread_local std::vector<glm::mat4> matrices;
+            static thread_local std::vector<ForwardGeomCmd> commands;
+            matrices.clear();
+            commands.clear();
+            matrices.reserve(draws.size());
+            commands.reserve(draws.size());
+
+            for (const DrawCmd* dcPtr : draws) {
+                if (!dcPtr) continue;
+                const DrawCmd& dc = *dcPtr;
+                if (!dc.mesh) continue;
+
+                uint32_t baseInstance = 0;
+                bool baseInstanceInitialized = false;
+                auto appendGroup = [&](const Nvx2Group& g) {
+                    const uint64_t first = static_cast<uint64_t>(g.firstIndex());
+                    const uint64_t count = static_cast<uint64_t>(g.indexCount());
+                    const uint64_t total = static_cast<uint64_t>(dc.mesh->idx.size());
+                    if (count == 0) return;
+                    if (first >= total || first + count > total) return;
+
+                    if (!baseInstanceInitialized) {
+                        baseInstance = static_cast<uint32_t>(matrices.size());
+                        matrices.push_back(dc.worldMatrix);
+                        baseInstanceInitialized = true;
+                    }
+
+                    ForwardGeomCmd cmd;
+                    cmd.count = g.indexCount();
+                    cmd.firstIndex = dc.megaIndexOffset + g.firstIndex();
+                    cmd.baseInstance = baseInstance;
+                    cmd.instanceCount = 1;
+                    commands.push_back(cmd);
+                };
+
+                if (dc.group >= 0 && dc.group < static_cast<int>(dc.mesh->groups.size())) {
+                    appendGroup(dc.mesh->groups[dc.group]);
+                } else {
+                    for (const auto& g : dc.mesh->groups) {
+                        appendGroup(g);
+                    }
+                }
+            }
+
+            if (commands.empty() || matrices.empty()) return 0;
+            if (!uploadForwardInstanceMatrices(matrices)) return 0;
+            MegaBuffer::instance().bind();
+            for (const auto& cmd : commands) {
+                glDrawElementsInstancedBaseInstance(
+                    GL_TRIANGLES,
+                    static_cast<GLsizei>(cmd.count),
+                    GL_UNSIGNED_INT,
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(cmd.firstIndex) * sizeof(uint32_t)),
+                    static_cast<GLsizei>(cmd.instanceCount),
+                    static_cast<GLuint>(cmd.baseInstance));
+            }
+            return static_cast<int>(commands.size());
+        };
+
+        // simpleLayer is authored for deferred/G-buffer and is rendered in geometryPass.
+        // Keep this forward path disabled to prevent duplicate draws and stale-depth artifacts.
+        constexpr bool kRenderSimpleLayerInForward = false;
+        if (kRenderSimpleLayerInForward && !simpleLayerDraws.empty()) {
             auto slShader = shaderManager->GetShader("simplelayer");
             if (!slShader) {
                 std::cerr << "[SIMPLELAYER] Shader not found\n";
@@ -1765,6 +2037,7 @@ compositionPass.execute = [this]() {
                 slShader->SetVec4("fogColor", glm::vec4(0.61f, 0.58f, 0.52f, 0.0f));
                 slShader->SetVec4("heightFogColor", glm::vec4(0.61f, 0.58f, 0.52f, 100000.0f));
                 slShader->SetFloat("encodefactor", 1.0f);
+                slShader->SetInt("UseInstancing", 0);
                 bindTexture(3, lightBuf);
                 bindSampler(3, gSamplerClamp);
 
@@ -1872,51 +2145,107 @@ compositionPass.execute = [this]() {
                 envShader->SetInt("EnvironmentMap", 4);
                 envShader->SetVec3("eyePos", camera_.getPosition());
                 envShader->SetInt("DisableViewDependentReflection", kDisableViewDependentReflections ? 1 : 0);
+                envShader->SetInt("UseInstancing", 1);
 
-                Camera::Frustum envFrustum = camera_.extractFrustum(viewProj);
-                MegaBuffer::instance().bind(); // bind once for all envAlpha draws
+                struct EnvAlphaVariantKey {
+                    GLuint diffTex = 0;
+                    GLuint specTex = 0;
+                    GLuint bumpTex = 0;
+                    GLuint emsvTex = 0;
+                    GLuint envCubeTex = 0;
+                    uint32_t reflectivityBits = 0;
+                    uint32_t alphaBlendBits = 0;
+                    int twoSided = 0;
+                    int isFlatNormal = 0;
+
+                    bool operator==(const EnvAlphaVariantKey& o) const {
+                        return diffTex == o.diffTex &&
+                               specTex == o.specTex &&
+                               bumpTex == o.bumpTex &&
+                               emsvTex == o.emsvTex &&
+                               envCubeTex == o.envCubeTex &&
+                               reflectivityBits == o.reflectivityBits &&
+                               alphaBlendBits == o.alphaBlendBits &&
+                               twoSided == o.twoSided &&
+                               isFlatNormal == o.isFlatNormal;
+                    }
+                };
+                auto toBits = [](float v) -> uint32_t {
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &v, sizeof(bits));
+                    return bits;
+                };
+                auto fromBits = [](uint32_t bits) -> float {
+                    float v = 0.0f;
+                    std::memcpy(&v, &bits, sizeof(v));
+                    return v;
+                };
+
+                std::vector<const DrawCmd*> sortedEnvAlpha;
+                sortedEnvAlpha.reserve(environmentAlphaDraws.size());
+                for (const auto& src : environmentAlphaDraws) {
+                    if (!src.mesh || src.disabled) continue;
+                    if (!PassesFrustumCulling(src, frameFrustum_, disableFrustumCulling, true)) continue;
+                    sortedEnvAlpha.push_back(&src);
+                }
+                SortTransparentDrawsBackToFront(sortedEnvAlpha, eyePos, viewDir);
+
                 int renderedEnvAlpha = 0;
-                for (const auto& dc : environmentAlphaDraws) {
-                    if (!dc.mesh) continue;
-                    if (dc.disabled) continue;
-                    if (!PassesFrustumCulling(dc, envFrustum, disableFrustumCulling, true)) continue;
-
-                    envShader->SetMat4("model", dc.worldMatrix);
-                    envShader->SetFloat("Reflectivity", dc.cachedIntensity0);
-                    envShader->SetInt("twoSided", dc.cachedTwoSided);
-                    envShader->SetInt("isFlatNormal", dc.cachedIsFlatNormal);
-                    envShader->SetFloat("alphaBlendFactor", dc.cachedAlphaBlendFactor);
-
-                    bindTexture(0, dc.tex[0] ? toTextureHandle(dc.tex[0]) : whiteTex);
-                    bindTexture(1, dc.tex[1] ? toTextureHandle(dc.tex[1]) : whiteTex);
-                    bindTexture(2, dc.tex[2] ? toTextureHandle(dc.tex[2]) : normalTex);
-                    bindTexture(3, dc.tex[3] ? toTextureHandle(dc.tex[3]) : blackTex);
-
+                int envAlphaBatches = 0;
+                std::vector<const DrawCmd*> batchDraws;
+                batchDraws.reserve(sortedEnvAlpha.size());
+                EnvAlphaVariantKey batchKey{};
+                bool hasBatch = false;
+                auto flushEnvAlphaBatch = [&]() {
+                    if (!hasBatch || batchDraws.empty()) return;
+                    envShader->SetFloat("Reflectivity", fromBits(batchKey.reflectivityBits));
+                    envShader->SetInt("twoSided", batchKey.twoSided);
+                    envShader->SetInt("isFlatNormal", batchKey.isFlatNormal);
+                    envShader->SetFloat("alphaBlendFactor", fromBits(batchKey.alphaBlendBits));
+                    bindTexture(0, batchKey.diffTex);
+                    bindTexture(1, batchKey.specTex);
+                    bindTexture(2, batchKey.bumpTex);
+                    bindTexture(3, batchKey.emsvTex);
                     glActiveTexture(GL_TEXTURE4);
-                    glBindTexture(GL_TEXTURE_CUBE_MAP, dc.tex[9] ? toTextureHandle(dc.tex[9]) : blackCubeTex);
-
+                    glBindTexture(GL_TEXTURE_CUBE_MAP, batchKey.envCubeTex);
                     bindSampler(0, gSamplerRepeat);
                     bindSampler(1, gSamplerRepeat);
                     bindSampler(2, gSamplerRepeat);
                     bindSampler(3, gSamplerRepeat);
                     bindSampler(4, 0);
 
-                    if (dc.group >= 0 && dc.group < (int)dc.mesh->groups.size()) {
-                        const auto& g = dc.mesh->groups[dc.group];
-                        glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                            (void*)(uintptr_t)((dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
-                    } else {
-                        for (const auto& g : dc.mesh->groups) {
-                            if (g.indexCount() == 0) continue;
-                            glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                                (void*)(uintptr_t)((dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
-                        }
-                    }
-                    renderedEnvAlpha++;
-                }
+                    envAlphaBatches += drawForwardInstancedOrdered(batchDraws);
+                    renderedEnvAlpha += static_cast<int>(batchDraws.size());
+                    batchDraws.clear();
+                };
 
-                frameDrawCalls_ += renderedEnvAlpha;
-                if (optRenderLOG) NC::LOGGING::Log("[ENV_ALPHA] Rendered: ", renderedEnvAlpha, "/", environmentAlphaDraws.size());
+                for (const DrawCmd* srcPtr : sortedEnvAlpha) {
+                    if (!srcPtr) continue;
+                    const DrawCmd& src = *srcPtr;
+                    EnvAlphaVariantKey key;
+                    key.diffTex = src.tex[0] ? toTextureHandle(src.tex[0]) : whiteTex;
+                    key.specTex = src.tex[1] ? toTextureHandle(src.tex[1]) : whiteTex;
+                    key.bumpTex = src.tex[2] ? toTextureHandle(src.tex[2]) : normalTex;
+                    key.emsvTex = src.tex[3] ? toTextureHandle(src.tex[3]) : blackTex;
+                    key.envCubeTex = src.tex[9] ? toTextureHandle(src.tex[9]) : blackCubeTex;
+                    key.reflectivityBits = toBits(src.cachedIntensity0);
+                    key.alphaBlendBits = toBits(src.cachedAlphaBlendFactor);
+                    key.twoSided = src.cachedTwoSided;
+                    key.isFlatNormal = src.cachedIsFlatNormal;
+
+                    if (!hasBatch) {
+                        batchKey = key;
+                        hasBatch = true;
+                    } else if (!(key == batchKey)) {
+                        flushEnvAlphaBatch();
+                        batchKey = key;
+                    }
+                    batchDraws.push_back(srcPtr);
+                }
+                flushEnvAlphaBatch();
+
+                frameDrawCalls_ += envAlphaBatches;
+                if (optRenderLOG) NC::LOGGING::Log("[ENV_ALPHA] Rendered: ", renderedEnvAlpha, "/", environmentAlphaDraws.size(), " batches=", envAlphaBatches);
 
                 for (int i = 0; i < 5; i++) bindSampler(i, 0);
                 glActiveTexture(GL_TEXTURE4);
@@ -1924,6 +2253,131 @@ compositionPass.execute = [this]() {
 
                 glDisable(GL_BLEND);
                 checkGLError("After environment alpha");
+            }
+        }
+
+        if (!kDisableRefractionPass && !refractionDraws.empty()) {
+            auto refractionShader = shaderManager->GetShader("refraction");
+            if (!refractionShader) {
+                std::cerr << "[REFRACTION] Shader not found\n";
+            } else {
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glEnable(GL_DEPTH_TEST);
+                glDepthFunc(GL_LEQUAL);
+                glDepthMask(GL_FALSE);
+                glDisable(GL_STENCIL_TEST);
+                glEnable(GL_BLEND);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                glBlendEquation(GL_FUNC_ADD);
+
+                refractionShader->Use();
+                refractionShader->SetMat4("projection", projMatrix);
+                refractionShader->SetMat4("view", viewMatrix);
+                refractionShader->SetMat4("textureTransform0", glm::mat4(1.0f));
+                refractionShader->SetInt("sceneTex", 0);
+                refractionShader->SetInt("DistortMap", 1);
+                refractionShader->SetFloat("time", particleTime);
+                refractionShader->SetVec2("invViewport", invViewport);
+                refractionShader->SetInt("UseInstancing", 1);
+
+                struct RefractionKey {
+                    GLuint distortTex = 0;
+                    uint32_t velocityXBits = 0;
+                    uint32_t velocityYBits = 0;
+                    uint32_t distortionScaleBits = 0;
+                    int cullMode = 0;
+
+                    bool operator==(const RefractionKey& o) const {
+                        return distortTex == o.distortTex &&
+                               velocityXBits == o.velocityXBits &&
+                               velocityYBits == o.velocityYBits &&
+                               distortionScaleBits == o.distortionScaleBits &&
+                               cullMode == o.cullMode;
+                    }
+                };
+                auto toBits = [](float v) -> uint32_t {
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &v, sizeof(bits));
+                    return bits;
+                };
+                auto fromBits = [](uint32_t bits) -> float {
+                    float v = 0.0f;
+                    std::memcpy(&v, &bits, sizeof(v));
+                    return v;
+                };
+
+                std::vector<const DrawCmd*> sortedRefraction;
+                sortedRefraction.reserve(refractionDraws.size());
+                for (const auto& src : refractionDraws) {
+                    if (!src.mesh || src.disabled) continue;
+                    if (!PassesFrustumCulling(src, frustum, disableFrustumCulling, true)) continue;
+                    sortedRefraction.push_back(&src);
+                }
+                SortTransparentDrawsBackToFront(sortedRefraction, eyePos, viewDir);
+
+                int renderedRefraction = 0;
+                int refractionBatches = 0;
+                std::vector<const DrawCmd*> batchDraws;
+                batchDraws.reserve(sortedRefraction.size());
+                RefractionKey batchKey{};
+                bool hasBatch = false;
+                auto flushRefractionBatch = [&]() {
+                    if (!hasBatch || batchDraws.empty()) return;
+                    if (disableFaceCulling || batchKey.cullMode <= 0) {
+                        glDisable(GL_CULL_FACE);
+                    } else {
+                        glEnable(GL_CULL_FACE);
+                        glCullFace(batchKey.cullMode == 1 ? GL_FRONT : GL_BACK);
+                    }
+
+                    refractionShader->SetVec2("velocity", glm::vec2(fromBits(batchKey.velocityXBits), fromBits(batchKey.velocityYBits)));
+                    refractionShader->SetFloat("distortionScale", fromBits(batchKey.distortionScaleBits));
+
+                    bindTexture(0, sceneColorTex);
+                    bindTexture(1, batchKey.distortTex);
+                    bindSampler(0, gSamplerClamp);
+                    bindSampler(1, gSamplerRepeat);
+
+                    refractionBatches += drawForwardInstancedOrdered(batchDraws);
+                    renderedRefraction += static_cast<int>(batchDraws.size());
+                    batchDraws.clear();
+                };
+
+                for (const DrawCmd* srcPtr : sortedRefraction) {
+                    if (!srcPtr) continue;
+                    const DrawCmd& src = *srcPtr;
+                    float distortionScale = src.cachedIntensity0;
+                    auto itScale = src.shaderParamsFloat.find("distortionScale");
+                    if (itScale != src.shaderParamsFloat.end()) {
+                        distortionScale = itScale->second;
+                    }
+
+                    RefractionKey key;
+                    key.distortTex = src.tex[0] ? toTextureHandle(src.tex[0]) : whiteTex;
+                    key.velocityXBits = toBits(src.cachedVelocity.x);
+                    key.velocityYBits = toBits(src.cachedVelocity.y);
+                    key.distortionScaleBits = toBits(distortionScale);
+                    key.cullMode = src.cullMode;
+
+                    if (!hasBatch) {
+                        batchKey = key;
+                        hasBatch = true;
+                    } else if (!(key == batchKey)) {
+                        flushRefractionBatch();
+                        batchKey = key;
+                    }
+                    batchDraws.push_back(srcPtr);
+                }
+                flushRefractionBatch();
+
+                frameDrawCalls_ += refractionBatches;
+                if (optRenderLOG) NC::LOGGING::Log("[REFRACTION] Rendered: ", renderedRefraction, "/", refractionDraws.size(), " batches=", refractionBatches);
+
+                bindSampler(0, 0);
+                bindSampler(1, 0);
+                glDisable(GL_CULL_FACE);
+                glDisable(GL_BLEND);
+                checkGLError("After refraction");
             }
         }
 
@@ -1952,69 +2406,135 @@ compositionPass.execute = [this]() {
                 waterShader->SetInt("CubeMap0", 3);
                 waterShader->SetVec3("eyePos", camera_.getPosition());
                 waterShader->SetInt("DisableViewDependentReflection", kDisableViewDependentReflections ? 1 : 0);
+                waterShader->SetInt("UseInstancing", 1);
 
-                for (int i = 0; i < 3; i++) {
-                    if (device_ && samplerRepeat_abstracted) {
-                        device_->BindSampler(samplerRepeat_abstracted.get(), i);
-                    } else {
-                        glBindSampler(i, gSamplerRepeat);
+                struct WaterVariantKey {
+                    GLuint diffTex = 0;
+                    GLuint bumpTex = 0;
+                    GLuint emsvTex = 0;
+                    GLuint cubeTex = 0;
+                    uint32_t intensityBits = 0;
+                    uint32_t emissiveBits = 0;
+                    uint32_t specularBits = 0;
+                    uint32_t bumpScaleBits = 0;
+                    uint32_t uvScaleBits = 0;
+                    uint32_t velocityXBits = 0;
+                    uint32_t velocityYBits = 0;
+                    int hasVelocity = 0;
+                    int cullMode = 0;
+
+                    bool operator==(const WaterVariantKey& o) const {
+                        return diffTex == o.diffTex &&
+                               bumpTex == o.bumpTex &&
+                               emsvTex == o.emsvTex &&
+                               cubeTex == o.cubeTex &&
+                               intensityBits == o.intensityBits &&
+                               emissiveBits == o.emissiveBits &&
+                               specularBits == o.specularBits &&
+                               bumpScaleBits == o.bumpScaleBits &&
+                               uvScaleBits == o.uvScaleBits &&
+                               velocityXBits == o.velocityXBits &&
+                               velocityYBits == o.velocityYBits &&
+                               hasVelocity == o.hasVelocity &&
+                               cullMode == o.cullMode;
                     }
+                };
+                auto toBits = [](float v) -> uint32_t {
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &v, sizeof(bits));
+                    return bits;
+                };
+                auto fromBits = [](uint32_t bits) -> float {
+                    float v = 0.0f;
+                    std::memcpy(&v, &bits, sizeof(v));
+                    return v;
+                };
+
+                std::vector<const DrawCmd*> sortedWater;
+                sortedWater.reserve(waterDraws.size());
+                for (const auto& src : waterDraws) {
+                    if (!src.mesh || src.disabled) continue;
+                    if (!PassesFrustumCulling(src, frustum, disableFrustumCulling, true)) continue;
+                    sortedWater.push_back(&src);
                 }
+                SortTransparentDrawsBackToFront(sortedWater, eyePos, viewDir);
 
-                MegaBuffer::instance().bind(); // bind once for all water draws
                 int renderedWater = 0;
-                for (auto& dc : waterDraws) {
-                    if (!dc.mesh) continue;
-                    if (dc.disabled) continue;
-
-                    const int cullMode = dc.cachedWaterCullMode;
-                    if (disableFaceCulling || cullMode <= 0) {
+                int waterBatches = 0;
+                std::vector<const DrawCmd*> batchDraws;
+                batchDraws.reserve(sortedWater.size());
+                WaterVariantKey batchKey{};
+                bool hasBatch = false;
+                auto flushWaterBatch = [&]() {
+                    if (!hasBatch || batchDraws.empty()) return;
+                    if (disableFaceCulling || batchKey.cullMode <= 0) {
                         glDisable(GL_CULL_FACE);
                     } else {
                         glEnable(GL_CULL_FACE);
-                        glCullFace(cullMode == 1 ? GL_FRONT : GL_BACK);
+                        glCullFace(batchKey.cullMode == 1 ? GL_FRONT : GL_BACK);
                     }
-                    if (!PassesFrustumCulling(dc, frustum, disableFrustumCulling, true)) continue;
 
                     glm::mat4 uvTransform = glm::mat4(1.0f);
-                    if (dc.cachedHasVelocity) {
-                        uvTransform = glm::translate(glm::mat4(1.0f),
-                            glm::vec3(dc.cachedVelocity * particleTime, 0.0f));
+                    if (batchKey.hasVelocity > 0) {
+                        const glm::vec2 velocity(fromBits(batchKey.velocityXBits), fromBits(batchKey.velocityYBits));
+                        uvTransform = glm::translate(glm::mat4(1.0f), glm::vec3(velocity * particleTime, 0.0f));
                     }
 
-                    float uvScale = dc.cachedScale;
-                    if (uvScale <= 0.0f) uvScale = 1.0f;
-
-                    waterShader->SetMat4("model", dc.worldMatrix);
                     waterShader->SetMat4("textureTransform0", uvTransform);
-                    waterShader->SetVec2("uvScale", glm::vec2(uvScale, uvScale));
-                    waterShader->SetFloat("Intensity0", dc.cachedIntensity0);
-                    waterShader->SetFloat("MatEmissiveIntensity", dc.cachedMatEmissiveIntensity);
-                    waterShader->SetFloat("MatSpecularIntensity", dc.cachedMatSpecularIntensity);
-                    waterShader->SetFloat("BumpScale", dc.cachedBumpScale);
-
-                    bindTexture(0, dc.tex[0] ? toTextureHandle(dc.tex[0]) : whiteTex);
-                    bindTexture(1, dc.tex[2] ? toTextureHandle(dc.tex[2]) : normalTex);
-                    bindTexture(2, dc.tex[3] ? toTextureHandle(dc.tex[3]) : blackTex);
+                    waterShader->SetVec2("uvScale", glm::vec2(fromBits(batchKey.uvScaleBits), fromBits(batchKey.uvScaleBits)));
+                    waterShader->SetFloat("Intensity0", fromBits(batchKey.intensityBits));
+                    waterShader->SetFloat("MatEmissiveIntensity", fromBits(batchKey.emissiveBits));
+                    waterShader->SetFloat("MatSpecularIntensity", fromBits(batchKey.specularBits));
+                    waterShader->SetFloat("BumpScale", fromBits(batchKey.bumpScaleBits));
+                    bindTexture(0, batchKey.diffTex);
+                    bindTexture(1, batchKey.bumpTex);
+                    bindTexture(2, batchKey.emsvTex);
                     glActiveTexture(GL_TEXTURE3);
-                    glBindTexture(GL_TEXTURE_CUBE_MAP, dc.tex[9] ? toTextureHandle(dc.tex[9]) : blackCubeTex);
+                    glBindTexture(GL_TEXTURE_CUBE_MAP, batchKey.cubeTex);
+                    bindSampler(0, gSamplerRepeat);
+                    bindSampler(1, gSamplerRepeat);
+                    bindSampler(2, gSamplerRepeat);
                     bindSampler(3, 0);
 
-                    if (dc.group >= 0 && dc.group < (int)dc.mesh->groups.size()) {
-                        const auto& g = dc.mesh->groups[dc.group];
-                        glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                            (void*)(uintptr_t)((dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
-                    } else {
-                        for (const auto& g : dc.mesh->groups) {
-                            if (g.indexCount() == 0) continue;
-                            glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                                (void*)(uintptr_t)((dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
-                        }
+                    waterBatches += drawForwardInstancedOrdered(batchDraws);
+                    renderedWater += static_cast<int>(batchDraws.size());
+                    batchDraws.clear();
+                };
+
+                for (const DrawCmd* srcPtr : sortedWater) {
+                    if (!srcPtr) continue;
+                    const DrawCmd& src = *srcPtr;
+                    float uvScale = src.cachedScale;
+                    if (uvScale <= 0.0f) uvScale = 1.0f;
+
+                    WaterVariantKey key;
+                    key.diffTex = src.tex[0] ? toTextureHandle(src.tex[0]) : whiteTex;
+                    key.bumpTex = src.tex[2] ? toTextureHandle(src.tex[2]) : normalTex;
+                    key.emsvTex = src.tex[3] ? toTextureHandle(src.tex[3]) : blackTex;
+                    key.cubeTex = src.tex[9] ? toTextureHandle(src.tex[9]) : blackCubeTex;
+                    key.intensityBits = toBits(src.cachedIntensity0);
+                    key.emissiveBits = toBits(src.cachedMatEmissiveIntensity);
+                    key.specularBits = toBits(src.cachedMatSpecularIntensity);
+                    key.bumpScaleBits = toBits(src.cachedBumpScale);
+                    key.uvScaleBits = toBits(uvScale);
+                    key.velocityXBits = toBits(src.cachedVelocity.x);
+                    key.velocityYBits = toBits(src.cachedVelocity.y);
+                    key.hasVelocity = src.cachedHasVelocity ? 1 : 0;
+                    key.cullMode = src.cachedWaterCullMode;
+
+                    if (!hasBatch) {
+                        batchKey = key;
+                        hasBatch = true;
+                    } else if (!(key == batchKey)) {
+                        flushWaterBatch();
+                        batchKey = key;
                     }
-                    renderedWater++;
+                    batchDraws.push_back(srcPtr);
                 }
-                frameDrawCalls_ += renderedWater;
-                if (optRenderLOG) NC::LOGGING::Log("[WATER] Rendered: ", renderedWater, "/", waterDraws.size());
+                flushWaterBatch();
+
+                frameDrawCalls_ += waterBatches;
+                if (optRenderLOG) NC::LOGGING::Log("[WATER] Rendered: ", renderedWater, "/", waterDraws.size(), " batches=", waterBatches);
 
                 glBindVertexArray(0);
                 for (int i = 0; i < 4; i++) {
@@ -2058,71 +2578,140 @@ compositionPass.execute = [this]() {
                 postShader->SetInt("DiffMap0", 0);
                 postShader->SetInt("EmsvMap0", 1);
                 postShader->SetFloat("diffContribution", 1.0f);
+                postShader->SetInt("UseInstancing", 1);
 
+                struct PostAlphaKey {
+                    GLuint diffTex = 0;
+                    GLuint emsvTex = 0;
+                    uint32_t matEmissiveBits = 0;
+                    uint32_t alphaBlendBits = 0;
+                    uint32_t diffContributionBits = 0;
+                    int additive = 0;
+                    int cullMode = 0;
 
-                MegaBuffer::instance().bind(); // bind once for all post-alpha draws
-                int renderedPost = 0;
-                bool loggedPostBinding = false;
+                    bool operator==(const PostAlphaKey& o) const {
+                        return diffTex == o.diffTex &&
+                               emsvTex == o.emsvTex &&
+                               matEmissiveBits == o.matEmissiveBits &&
+                               alphaBlendBits == o.alphaBlendBits &&
+                               diffContributionBits == o.diffContributionBits &&
+                               additive == o.additive &&
+                               cullMode == o.cullMode;
+                    }
+                };
+                auto toBits = [](float v) -> uint32_t {
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &v, sizeof(bits));
+                    return bits;
+                };
+                auto fromBits = [](uint32_t bits) -> float {
+                    float v = 0.0f;
+                    std::memcpy(&v, &bits, sizeof(v));
+                    return v;
+                };
+
+                std::vector<const DrawCmd*> sortedPostAlpha;
+                sortedPostAlpha.reserve(postAlphaUnlitDraws.size());
                 for (auto& dc : postAlphaUnlitDraws) {
-                    if (!dc.mesh) continue;
-                    if (dc.disabled) continue;
+                    if (!dc.mesh || dc.disabled) continue;
                     if (!PassesFrustumCulling(dc, frustum, disableFrustumCulling, true)) continue;
+                    sortedPostAlpha.push_back(&dc);
+                }
+                SortTransparentDrawsBackToFront(sortedPostAlpha, eyePos, viewDir);
 
-                    const bool additive = dc.cachedIsAdditive;
+                int renderedPost = 0;
+                int postBatches = 0;
+                int renderedPostFallback = 0;
+                bool loggedPostBinding = false;
+                std::vector<const DrawCmd*> batchDraws;
+                batchDraws.reserve(sortedPostAlpha.size());
+                PostAlphaKey batchKey{};
+                bool hasBatch = false;
+                auto flushPostBatch = [&]() {
+                    if (!hasBatch || batchDraws.empty()) return;
+                    if (batchKey.additive > 0) {
+                        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+                    } else {
+                        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                    }
 
-                    if (additive) glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
-                    else glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
-
-                    if (additive) {
-                        // Swash ribbons are frequently single-sided in authoring; force two-sided in additive pass.
+                    if (batchKey.additive > 0) {
                         glDisable(GL_CULL_FACE);
-                    } else if (disableFaceCulling || dc.cullMode <= 0) {
+                    } else if (disableFaceCulling || batchKey.cullMode <= 0) {
                         glDisable(GL_CULL_FACE);
                     } else {
                         glEnable(GL_CULL_FACE);
-                        // Nebula-style cull mode mapping: 1=back, 2=front.
-                        glCullFace(dc.cullMode == 2 ? GL_FRONT : GL_BACK);
+                        glCullFace(batchKey.cullMode == 1 ? GL_FRONT : GL_BACK);
                     }
 
+                    postShader->SetFloat("MatEmissiveIntensity", fromBits(batchKey.matEmissiveBits));
+                    postShader->SetFloat("alphaBlendFactor", fromBits(batchKey.alphaBlendBits));
+                    postShader->SetFloat("diffContribution", fromBits(batchKey.diffContributionBits));
+
+                    bindTexture(0, batchKey.diffTex);
+                    bindTexture(1, batchKey.emsvTex);
+                    if (device_ && samplerRepeat_abstracted) {
+                        device_->BindSampler(samplerRepeat_abstracted.get(), 0);
+                        device_->BindSampler(samplerRepeat_abstracted.get(), 1);
+                    } else {
+                        glBindSampler(0, gSamplerRepeat);
+                        glBindSampler(1, gSamplerRepeat);
+                    }
+
+                    postBatches += drawForwardInstancedOrdered(batchDraws);
+                    renderedPost += static_cast<int>(batchDraws.size());
+
+                    if (!loggedPostBinding && optRenderLOG) {
+                        std::cout << "    [PostAlphaBind] batched DiffMap0=" << batchKey.diffTex
+                                  << " EmsvMap0=" << batchKey.emsvTex
+                                  << " emissiveIntensity=" << fromBits(batchKey.matEmissiveBits)
+                                  << " alphaBlendFactor=" << fromBits(batchKey.alphaBlendBits)
+                                  << " cullMode=" << batchKey.cullMode
+                                  << " additive=" << batchKey.additive << "\n";
+                        loggedPostBinding = true;
+                    }
+                    batchDraws.clear();
+                };
+
+                for (const DrawCmd* dcPtr : sortedPostAlpha) {
+                    if (!dcPtr || !dcPtr->mesh) continue;
+                    const DrawCmd& dc = *dcPtr;
+                    const bool additive = dc.cachedIsAdditive;
                     float matEmissiveIntensity = dc.cachedMatEmissiveIntensity;
                     float alphaBlendFactor = dc.cachedAlphaBlendFactor;
 
-                    float dcAnimTime = particleTime;
-                    if (dc.instance) {
-                        auto itSpawn = scene_.instanceSpawnTimes.find(dc.instance);
-                        if (itSpawn != scene_.instanceSpawnTimes.end()) {
-                            dcAnimTime = std::max(0.0f, particleTime - static_cast<float>(itSpawn->second));
-                        }
-                    }
-
-                    auto animParams = DeferredRendererAnimation::SampleShaderVarAnimationsForTarget(dc.nodeName, dcAnimTime, dc.instance);
+                    std::vector<std::pair<std::string, float>> extraUniforms;
                     bool hasAnimatedMatEmissiveIntensity = false;
-                    for (const auto& [paramName, value] : animParams) {
-                        if (paramName == "MatEmissiveIntensity") {
-                            matEmissiveIntensity = value;
-                            hasAnimatedMatEmissiveIntensity = true;
-                        } else if (paramName == "alphaBlendFactor") {
-                            alphaBlendFactor = value;
-                        } else {
-                            postShader->SetFloat(paramName, value);
+                    if (dc.hasShaderVarAnimations) {
+                        float dcAnimTime = particleTime;
+                        if (dc.instance) {
+                            auto itSpawn = scene_.instanceSpawnTimes.find(dc.instance);
+                            if (itSpawn != scene_.instanceSpawnTimes.end()) {
+                                dcAnimTime = std::max(0.0f, particleTime - static_cast<float>(itSpawn->second));
+                            }
+                        }
+
+                        auto animParams = DeferredRendererAnimation::SampleShaderVarAnimationsForTarget(dc.nodeName, dcAnimTime, dc.instance);
+                        for (const auto& [paramName, value] : animParams) {
+                            if (paramName == "MatEmissiveIntensity") {
+                                matEmissiveIntensity = value;
+                                hasAnimatedMatEmissiveIntensity = true;
+                            } else if (paramName == "alphaBlendFactor") {
+                                alphaBlendFactor = value;
+                            } else {
+                                extraUniforms.emplace_back(paramName, value);
+                            }
                         }
                     }
-
-                    postShader->SetMat4("model", dc.worldMatrix);
-                    postShader->SetFloat("MatEmissiveIntensity", matEmissiveIntensity);
-                    postShader->SetFloat("alphaBlendFactor", alphaBlendFactor);
 
                     GLuint diffTex = dc.tex[0] ? toTextureHandle(dc.tex[0]) : whiteTex;
                     GLuint emsvTex = dc.tex[3] ? toTextureHandle(dc.tex[3]) : blackTex;
                     float diffContribution = 1.0f;
-
                     if (!dc.cachedHasCustomDiffMap && emsvTex && emsvTex != blackTex) {
                         diffTex = emsvTex;
                         diffContribution = 0.0f;
                     }
 
-                    // Some swash/static additive nodes ship with MatEmissiveIntensity=0 and rely on
-                    // animation. If no animated value is available, keep them visible.
                     if (additive &&
                         emsvTex && emsvTex != blackTex &&
                         !hasAnimatedMatEmissiveIntensity &&
@@ -2130,51 +2719,80 @@ compositionPass.execute = [this]() {
                         matEmissiveIntensity = 1.0f;
                     }
 
-                    postShader->SetFloat("MatEmissiveIntensity", matEmissiveIntensity);
-                    postShader->SetFloat("diffContribution", diffContribution);
+                    if (!extraUniforms.empty()) {
+                        flushPostBatch();
+                        postShader->SetInt("UseInstancing", 0);
 
-                    if (!loggedPostBinding) {
-                        const bool hasAnimatedPose = DeferredRendererAnimation::HasAnimatedPoseForNode(dc.nodeName, dc.instance);
-                        if (optRenderLOG) std::cout << "    [PostAlphaBind] node='" << dc.nodeName
-                                  << "' type='" << dc.modelNodeType
-                                  << "' DiffMap0=" << diffTex
-                                  << " EmsvMap0=" << emsvTex
-                                  << " emissiveIntensity=" << matEmissiveIntensity
-                                  << " alphaBlendFactor=" << alphaBlendFactor
-                                  << " cullMode=" << dc.cullMode
-                                  << " hasAnimatedPose=" << (hasAnimatedPose ? 1 : 0)
-                                  << " hasAnimatedEmsv=" << (hasAnimatedMatEmissiveIntensity ? 1 : 0) << "\n";
-                        loggedPostBinding = true;
-                    }
-
-                    bindTexture(0, diffTex);
-                    if (device_ && samplerRepeat_abstracted) {
-                        device_->BindSampler(samplerRepeat_abstracted.get(), 0);
-                    } else {
-                        glBindSampler(0, gSamplerRepeat);
-                    }
-                    bindTexture(1, emsvTex);
-                    if (device_ && samplerRepeat_abstracted) {
-                        device_->BindSampler(samplerRepeat_abstracted.get(), 1);
-                    } else {
-                        glBindSampler(1, gSamplerRepeat);
-                    }
-
-                    if (dc.group >= 0 && dc.group < (int)dc.mesh->groups.size()) {
-                        const auto& g = dc.mesh->groups[dc.group];
-                        glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                            (void*)(uintptr_t)((dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
-                    } else {
-                        for (const auto& g : dc.mesh->groups) {
-                            if (g.indexCount() == 0) continue;
-                            glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                                (void*)(uintptr_t)((dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
+                        if (additive) {
+                            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+                            glDisable(GL_CULL_FACE);
+                        } else if (disableFaceCulling || dc.cullMode <= 0) {
+                            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                            glDisable(GL_CULL_FACE);
+                        } else {
+                            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                            glEnable(GL_CULL_FACE);
+                            glCullFace(dc.cullMode == 1 ? GL_FRONT : GL_BACK);
                         }
+
+                        for (const auto& [paramName, value] : extraUniforms) {
+                            postShader->SetFloat(paramName, value);
+                        }
+
+                        postShader->SetMat4("model", dc.worldMatrix);
+                        postShader->SetFloat("MatEmissiveIntensity", matEmissiveIntensity);
+                        postShader->SetFloat("alphaBlendFactor", alphaBlendFactor);
+                        postShader->SetFloat("diffContribution", diffContribution);
+
+                        bindTexture(0, diffTex);
+                        bindTexture(1, emsvTex);
+                        if (device_ && samplerRepeat_abstracted) {
+                            device_->BindSampler(samplerRepeat_abstracted.get(), 0);
+                            device_->BindSampler(samplerRepeat_abstracted.get(), 1);
+                        } else {
+                            glBindSampler(0, gSamplerRepeat);
+                            glBindSampler(1, gSamplerRepeat);
+                        }
+
+                        if (dc.group >= 0 && dc.group < static_cast<int>(dc.mesh->groups.size())) {
+                            const auto& g = dc.mesh->groups[dc.group];
+                            glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
+                                reinterpret_cast<void*>(static_cast<uintptr_t>(dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
+                        } else {
+                            for (const auto& g : dc.mesh->groups) {
+                                if (g.indexCount() == 0) continue;
+                                glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
+                                    reinterpret_cast<void*>(static_cast<uintptr_t>(dc.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t)));
+                            }
+                        }
+                        renderedPostFallback++;
+                        postShader->SetInt("UseInstancing", 1);
+                        continue;
                     }
-                    renderedPost++;
+
+                    PostAlphaKey key;
+                    key.diffTex = diffTex;
+                    key.emsvTex = emsvTex;
+                    key.matEmissiveBits = toBits(matEmissiveIntensity);
+                    key.alphaBlendBits = toBits(alphaBlendFactor);
+                    key.diffContributionBits = toBits(diffContribution);
+                    key.additive = additive ? 1 : 0;
+                    key.cullMode = dc.cullMode;
+
+                    if (!hasBatch) {
+                        batchKey = key;
+                        hasBatch = true;
+                    } else if (!(key == batchKey)) {
+                        flushPostBatch();
+                        batchKey = key;
+                    }
+                    batchDraws.push_back(dcPtr);
                 }
-                frameDrawCalls_ += renderedPost;
-                if (optRenderLOG) NC::LOGGING::Log("[POST_ALPHA] Rendered: ", renderedPost, "/", postAlphaUnlitDraws.size());
+                flushPostBatch();
+
+                frameDrawCalls_ += postBatches + renderedPostFallback;
+                if (optRenderLOG) NC::LOGGING::Log("[POST_ALPHA] Rendered: ", renderedPost + renderedPostFallback, "/", postAlphaUnlitDraws.size(),
+                                                   " batches=", postBatches, " fallback=", renderedPostFallback);
 
                 glBindVertexArray(0);
                 if (device_) {
@@ -2314,6 +2932,42 @@ compositionPass.execute = [this]() {
 
     if (optRenderLOG) std::cout << "[INIT] Frame graphs compiled successfully\n";
 
+    if (device_) {
+        NDEVC::Graphics::RenderStateDesc blitStateDesc;
+        blitStateDesc.depth.depthTest = false;
+        blitStateDesc.blend.blendEnable = false;
+        cachedBlitState_ = device_->CreateRenderState(blitStateDesc);
+
+        NDEVC::Graphics::RenderStateDesc envStateDesc;
+        envStateDesc.depth.depthTest = true;
+        envStateDesc.depth.depthWrite = true;
+        envStateDesc.depth.depthFunc = NDEVC::Graphics::CompareFunc::Less;
+        envStateDesc.blend.blendEnable = false;
+        envStateDesc.stencil.stencilEnable = true;
+        envStateDesc.stencil.stencilFunc = NDEVC::Graphics::CompareFunc::Always;
+        envStateDesc.stencil.ref = 1;
+        envStateDesc.stencil.readMask = 0xFF;
+        envStateDesc.stencil.writeMask = 0xFF;
+        envStateDesc.stencil.stencilFailOp = NDEVC::Graphics::StencilOp::Keep;
+        envStateDesc.stencil.depthFailOp = NDEVC::Graphics::StencilOp::Keep;
+        envStateDesc.stencil.depthPassOp = NDEVC::Graphics::StencilOp::Replace;
+        envStateDesc.rasterizer.cullMode = NDEVC::Graphics::CullMode::Back;
+        cachedEnvState_ = device_->CreateRenderState(envStateDesc);
+        envStateDesc.rasterizer.cullMode = NDEVC::Graphics::CullMode::None;
+        cachedEnvStateNoCull_ = device_->CreateRenderState(envStateDesc);
+
+        NDEVC::Graphics::RenderStateDesc geomStateDesc;
+        geomStateDesc.stencil.stencilEnable = true;
+        geomStateDesc.stencil.stencilFunc = NDEVC::Graphics::CompareFunc::Always;
+        geomStateDesc.stencil.ref = 1;
+        geomStateDesc.stencil.readMask = 0xFF;
+        geomStateDesc.stencil.writeMask = 0xFF;
+        geomStateDesc.stencil.stencilFailOp = NDEVC::Graphics::StencilOp::Keep;
+        geomStateDesc.stencil.depthFailOp = NDEVC::Graphics::StencilOp::Keep;
+        geomStateDesc.stencil.depthPassOp = NDEVC::Graphics::StencilOp::Replace;
+        cachedGeomState_ = device_->CreateRenderState(geomStateDesc);
+    }
+
     std::cout << "[LOOP] Starting main render loop with " << gClips.size() << " animation clips\n";
     for (const auto& c : gClips) {
         std::cout << "  Clip: node='" << c.node << "' loop=" << c.loop << " active=" << c.active << "\n";
@@ -2356,21 +3010,83 @@ void DeferredRenderer::renderSingleFrame()
             camera_.setPosition(pos);
         }
 
+        if (viewportDisabled_) {
+            if (!NoPresentWhenViewportDisabled()) {
+                RenderImGui();
+                window_->SwapBuffers();
+            } else {
+                static double lastViewportDisabledPresentTime = 0.0;
+                constexpr double kViewportDisabledPresentIntervalSec = 1.0 / 120.0;
+                RenderImGui();
+                const bool shouldPresent =
+                    lastViewportDisabledPresentTime <= 0.0 ||
+                    (currentFrame - lastViewportDisabledPresentTime) >= kViewportDisabledPresentIntervalSec;
+                if (shouldPresent) {
+                    window_->SwapBuffers();
+                    lastViewportDisabledPresentTime = currentFrame;
+                }
+            }
+            lastFrameDrawCalls_ = 0;
+            return;
+        }
+
         scene_.Tick(deltaTime, camera_);
+        const bool drawListsWereDirty = scene_.IsDrawListsDirty();
         scene_.PrepareDrawLists(camera_,
             solidDraws, alphaTestDraws, decalDraws, particleDraws,
             environmentDraws, environmentAlphaDraws, simpleLayerDraws,
             refractionDraws, postAlphaUnlitDraws, waterDraws, animatedDraws);
 
-        solidShaderVarAnimatedIndices.clear();
-        for (size_t i = 0; i < solidDraws.size(); ++i) {
-            if (solidDraws[i].hasShaderVarAnimations)
-                solidShaderVarAnimatedIndices.push_back(i);
+        if (drawListsWereDirty) {
+            solidShaderVarAnimatedIndicesDirty_ = true;
+            InvalidateSelection();
+            MeshServer::instance().buildMegaBuffer();
+            auto setMegaOffsets = [](std::vector<DrawCmd>& draws) {
+                for (auto& dc : draws) {
+                    if (!dc.mesh) continue;
+                    dc.megaVertexOffset = dc.mesh->megaVertexOffset;
+                    dc.megaIndexOffset = dc.mesh->megaIndexOffset;
+                }
+            };
+            setMegaOffsets(solidDraws);
+            setMegaOffsets(simpleLayerDraws);
+            setMegaOffsets(alphaTestDraws);
+            setMegaOffsets(decalDraws);
+            setMegaOffsets(waterDraws);
+            setMegaOffsets(refractionDraws);
+            setMegaOffsets(environmentDraws);
+            setMegaOffsets(environmentAlphaDraws);
+            setMegaOffsets(postAlphaUnlitDraws);
+            setMegaOffsets(particleDraws);
+            ApplyDisabledDrawFlags();
+            visGridRevealedAll_ = false; // force visibility re-evaluation after scene change
+            BuildVisibilityGrids();
+            solidBatchSystem_.reset(true);
+            alphaTestBatchSystem_.reset(true);
+            environmentBatchSystem_.reset(true);
+            environmentAlphaBatchSystem_.reset(true);
+            decalBatchSystem_.reset(true);
         }
 
-        const Camera::Frustum frustum = camera_.extractFrustum(camera_.getProjectionMatrix() * camera_.getViewMatrix());
+        if (solidShaderVarAnimatedIndicesDirty_) {
+            solidShaderVarAnimatedIndices.clear();
+            for (size_t i = 0; i < solidDraws.size(); ++i) {
+                if (solidDraws[i].hasShaderVarAnimations)
+                    solidShaderVarAnimatedIndices.push_back(i);
+            }
+            solidShaderVarAnimatedIndicesDirty_ = false;
+        }
 
-        if (!AnimationsDisabled()) {
+        frameFrustum_ = camera_.extractFrustum(camera_.getProjectionMatrix() * camera_.getViewMatrix());
+        const Camera::Frustum& frustum = frameFrustum_;
+
+        const bool hasAnyDraws = !solidDraws.empty() || !alphaTestDraws.empty()
+            || !environmentDraws.empty() || !environmentAlphaDraws.empty()
+            || !simpleLayerDraws.empty() || !decalDraws.empty()
+            || !waterDraws.empty() || !refractionDraws.empty()
+            || !postAlphaUnlitDraws.empty() || !animatedDraws.empty();
+
+        if (!AnimationsDisabled() && hasAnyDraws) {
             DeferredRendererAnimation::TickAnimationFrame(deltaTime, animatedDraws, frustum);
 
             for (auto& animatorInstance : scene_.animatorInstances) {
@@ -2425,65 +3141,64 @@ void DeferredRenderer::renderSingleFrame()
         // UpdateVisibilityThisFrame() can run. It is correctly called only when the
         // debug-disabled set actually changes (SetDrawDisabled / ClearDisabledDraws).
 
-        // ImGui/backends can leave GL flags changed; normalize baseline for frame graphs.
-        glDisable(GL_SCISSOR_TEST);
-        glDisable(GL_BLEND);
-        glDisable(GL_STENCIL_TEST);
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LESS);
-        glDepthMask(GL_TRUE);
-        if (FaceCullingDisabled()) {
-            glDisable(GL_CULL_FACE);
-        } else {
-            glEnable(GL_CULL_FACE);
-            glCullFace(GL_BACK);
+        if (hasAnyDraws || !scene_.particleNodes.empty()) {
+            // ImGui/backends can leave GL flags changed; normalize baseline for frame graphs.
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_BLEND);
+            glDisable(GL_STENCIL_TEST);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LESS);
+            glDepthMask(GL_TRUE);
+            if (FaceCullingDisabled()) {
+                glDisable(GL_CULL_FACE);
+            } else {
+                glEnable(GL_CULL_FACE);
+                glCullFace(GL_BACK);
+            }
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         }
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
         if (!useLegacyDeferredInit_) {
-            shadowGraph->execute();
-            geometryGraph->execute();
-            decalGraph->execute();
-            lightingGraph->execute();
-            particleGraph->execute();
+            if (hasAnyDraws || !scene_.particleNodes.empty()) {
+                shadowGraph->execute();
+                geometryGraph->execute();
+                decalGraph->execute();
+                lightingGraph->execute();
+                particleGraph->execute();
 
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-            if (device_) {
-                device_->SetViewport({0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f});
+                if (device_) {
+                    device_->SetViewport({0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f});
+                    if (cachedBlitState_) device_->ApplyRenderState(cachedBlitState_.get());
+                }
 
-                NDEVC::Graphics::RenderStateDesc blitState;
-                blitState.depth.depthTest = false;
-                blitState.blend.blendEnable = false;
-                auto state = device_->CreateRenderState(blitState);
-                if (state) device_->ApplyRenderState(state.get());
-            }
-
-            if (editorModeEnabled_) {
-                glDisable(GL_DEPTH_TEST);
-                glDepthMask(GL_FALSE);
-                glDisable(GL_BLEND);
-                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-                glDepthMask(GL_TRUE);
-            } else {
-                auto blitShader = shaderManager->GetShader("blit");
-                if (blitShader) {
-                    blitShader->Use();
-                    blitShader->SetInt("tex", 0);
-                    GLuint finalTex = GetFrameGraphTexture(lightingGraph, "sceneColor");
-                    if (optRenderLOG) std::cout << "[MAIN] Final blit - texture=" << finalTex << " screenVAO=" << screenVAO << "\n";
-                    bindTexture(0, finalTex);
-                    glBindVertexArray(screenVAO);
-                    glDrawArrays(GL_TRIANGLES, 0, 3);
-                    glBindVertexArray(0);
-                    if (gEnableGLErrorChecking) {
-                        GLenum err = glGetError();
-                        if (err != GL_NO_ERROR) std::cerr << "[MAIN] Blit error: 0x" << std::hex << err << std::dec << "\n";
-                    }
+                if (editorModeEnabled_) {
+                    glDisable(GL_DEPTH_TEST);
+                    glDepthMask(GL_FALSE);
+                    glDisable(GL_BLEND);
+                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                    glDepthMask(GL_TRUE);
                 } else {
-                    std::cerr << "[MAIN] ERROR: Blit shader not found!\n";
+                    auto blitShader = shaderManager->GetShader("blit");
+                    if (blitShader) {
+                        blitShader->Use();
+                        blitShader->SetInt("tex", 0);
+                        GLuint finalTex = GetFrameGraphTexture(lightingGraph, "sceneColor");
+                        if (optRenderLOG) std::cout << "[MAIN] Final blit - texture=" << finalTex << " screenVAO=" << screenVAO << "\n";
+                        bindTexture(0, finalTex);
+                        glBindVertexArray(screenVAO);
+                        glDrawArrays(GL_TRIANGLES, 0, 3);
+                        glBindVertexArray(0);
+                        if (gEnableGLErrorChecking) {
+                            GLenum err = glGetError();
+                            if (err != GL_NO_ERROR) std::cerr << "[MAIN] Blit error: 0x" << std::hex << err << std::dec << "\n";
+                        }
+                    } else {
+                        std::cerr << "[MAIN] ERROR: Blit shader not found!\n";
+                    }
                 }
             }
         }
@@ -2554,9 +3269,11 @@ void DeferredRenderer::renderSingleFrame()
                 std::cout << "  GL State: DepthTest=ON DepthFunc=LESS Blend=OFF Stencil=ON Cull=BACK\n";
             }
 
-            auto shaderProgram = shaderManager->GetShader("NDEVCdeferred");
+            auto standardShaderProgram = shaderManager->GetShader("standard");
+            auto shaderProgram = standardShaderProgram ? standardShaderProgram : shaderManager->GetShader("NDEVCdeferred");
+            const char* geometryShaderName = standardShaderProgram ? "standard" : "NDEVCdeferred";
             if(!shaderProgram) {
-                std::cerr << "ERROR: Shader NDEVCdeferred not found!\n";
+                std::cerr << "ERROR: Shader standard/NDEVCdeferred not found!\n";
                 return;
             }
 
@@ -2582,7 +3299,7 @@ void DeferredRenderer::renderSingleFrame()
                 return;
             }
 
-            if (optRenderLOG)  std::cout << "    NDEVCdeferred shader found, using it...\n";
+            if (optRenderLOG)  std::cout << "    " << geometryShaderName << " shader found, using it...\n";
             shaderProgram->Use();
             checkGLError("After shader use");
 
@@ -2590,7 +3307,7 @@ void DeferredRenderer::renderSingleFrame()
             shaderProgram->SetMat4("view", viewMatrix);
             shaderProgram->SetFloat("MatEmissiveIntensity", 0.0f);
             shaderProgram->SetFloat("MatSpecularIntensity", 0.0f);
-            shaderProgram->SetFloat("MatSpecularPower", 0.0f);
+            shaderProgram->SetFloat("MatSpecularPower", 32.0f);
             shaderProgram->SetInt("UseSkinning", 0);
             shaderProgram->SetInt("UseInstancing", 1);
             shaderProgram->SetInt("alphaTest", 0);
@@ -2599,12 +3316,33 @@ void DeferredRenderer::renderSingleFrame()
             shaderProgram->SetInt("isFlatNormal", 0);
 
             glm::mat4 viewProj = camera_.getProjectionMatrix() * camera_.getViewMatrix();
-            Camera::Frustum frustum = camera_.extractFrustum(viewProj);
+            const Camera::Frustum& frustum = frameFrustum_;
+            UpdateVisibilityThisFrame(frustum);
+            alphaTestBatchSystem_.updateStaticVisibility(alphaTestDraws);
+            environmentBatchSystem_.updateStaticVisibility(environmentDraws);
+            environmentAlphaBatchSystem_.updateStaticVisibility(environmentAlphaDraws);
 
             shaderProgram->SetInt("DiffMap0", 0);
             shaderProgram->SetInt("SpecMap0", 1);
             shaderProgram->SetInt("BumpMap0", 2);
             shaderProgram->SetInt("EmsvMap0", 3);
+            shaderProgram->SetInt("diffMapSampler", 0);
+            shaderProgram->SetInt("specMapSampler", 1);
+            shaderProgram->SetInt("bumpMapSampler", 2);
+            shaderProgram->SetInt("emsvSampler", 3);
+            shaderProgram->SetVec4("fogDistances", glm::vec4(180.0f, 520.0f, 0.0f, 0.0f));
+            shaderProgram->SetVec4("fogColor", glm::vec4(0.61f, 0.58f, 0.52f, 0.0f));
+            shaderProgram->SetVec4("heightFogColor", glm::vec4(0.61f, 0.58f, 0.52f, 100000.0f));
+            shaderProgram->SetVec4("pixelSize", glm::vec4(
+                1.0f / static_cast<float>(std::max(width, 1)),
+                1.0f / static_cast<float>(std::max(height, 1)),
+                0.0f,
+                0.0f));
+            shaderProgram->SetFloat("encodefactor", 1.0f);
+            shaderProgram->SetFloat("alphaBlendFactor", 1.0f);
+            shaderProgram->SetFloat("mayaAnimableAlpha", 1.0f);
+            shaderProgram->SetFloat("AlphaClipRef", 128.0f);
+            shaderProgram->SetVec4("customColor2", glm::vec4(0.0f));
 
             glm::mat4 identityUV = glm::mat4(1.0f);
             shaderProgram->SetMat4("textureTransform0", identityUV);
@@ -2627,12 +3365,12 @@ void DeferredRenderer::renderSingleFrame()
             glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
             checkGLError("After stencil setup");
 
-            DrawBatchSystem::instance().cull(solidDraws, frustum);
+            solidBatchSystem_.cull(solidDraws, frustum);
             checkGLError("After bucket culling");
 
             bindTexture(4, whiteTex);
             bindSampler(4, gSamplerRepeat);
-            DrawBatchSystem::instance().flush(samplerRepeat_abstracted.get());
+            solidBatchSystem_.flush(samplerRepeat_abstracted.get(), 4, progID);
             bindTexture(4, 0);
             bindSampler(4, 0);
             checkGLError("After solid draws flush");
@@ -2991,8 +3729,6 @@ void DeferredRenderer::renderSingleFrame()
 
         glEnable(GL_DEPTH_TEST);
         }
-
-        scene_.UpdateIncrementalStreaming(false);
 
         {
             static double lastEventDebugKeyTime = 0.0;

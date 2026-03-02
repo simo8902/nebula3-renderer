@@ -206,17 +206,17 @@ bool HasAnimatedPoseForNode(const std::string& nodeName, const void* owner) {
     return HasAnimatedPoseForNodeInternal(nodeName, owner);
 }
 
-std::unordered_map<std::string, float> SampleShaderVarAnimations(const Node* node, float time) {
-    if (!kAnimationEnabled) return {};
-    std::unordered_map<std::string, float> result;
-    if (!node || node->animSections.empty()) return result;
+void SampleShaderVarAnimations(const Node* node, float time, std::unordered_map<std::string, float>& outResult) {
+    outResult.clear();
+    if (!kAnimationEnabled) return;
+    if (!node || node->animSections.empty()) return;
 
     for (const auto& section : node->animSections) {
         if (section.shaderVarSemantic.empty() || section.floatKeyArray.empty()) continue;
 
         const auto& keys = section.floatKeyArray;
         if (keys.size() == 1) {
-            result[section.shaderVarSemantic] = keys[0].value;
+            outResult[section.shaderVarSemantic] = keys[0].value;
             continue;
         }
 
@@ -245,10 +245,8 @@ std::unordered_map<std::string, float> SampleShaderVarAnimations(const Node* nod
         const float v0 = keys[idx0].value;
         const float v1 = keys[idx1].value;
         const float alpha = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0f;
-        result[section.shaderVarSemantic] = glm::mix(v0, v1, alpha);
+        outResult[section.shaderVarSemantic] = glm::mix(v0, v1, alpha);
     }
-
-    return result;
 }
 
 glm::mat4 ComposeAnimatedHierarchyLocal(const Node* leaf, const glm::mat4& fallbackLocal, const void* owner) {
@@ -346,26 +344,52 @@ void ApplyAnimatedDrawWorldTransforms(const std::vector<DrawCmd*>& animatedDraws
     for (DrawCmd* dc : animatedDraws) {
         if (!dc || !dc->instance) continue;
 
-        if (dc->cullBoundsValid) {
-            dc->frustumCulled = false;
-            const float radius = dc->cullWorldRadius;
-            for (int i = 0; i < 6; ++i) {
-                const float dist = glm::dot(frustum.planes[i].normal, dc->cullWorldCenter) + frustum.planes[i].d;
-                if (dist < -radius * 1.2f) {
-                    dc->frustumCulled = true;
-                    break;
-                }
-            }
-            if (dc->frustumCulled) continue;
-        }
-
         auto* modelInst = static_cast<ModelInstance*>(dc->instance);
         glm::mat4 localTransform = dc->rootMatrix;
         if (dc->sourceNode) {
             localTransform = ComposeAnimatedHierarchyLocal(dc->sourceNode, dc->rootMatrix, dc->instance);
         }
         dc->worldMatrix = modelInst->getTransform() * localTransform;
+        dc->frustumCulled = false;
         dc->cullBoundsValid = false;
+        dc->cullTransformHash = 0ull;
+
+        const glm::vec3 localMin(dc->localBoxMin);
+        const glm::vec3 localMax(dc->localBoxMax);
+        const glm::vec3 localExtent = localMax - localMin;
+        const bool hasBounds =
+            std::isfinite(localMin.x) && std::isfinite(localMin.y) && std::isfinite(localMin.z) &&
+            std::isfinite(localMax.x) && std::isfinite(localMax.y) && std::isfinite(localMax.z) &&
+            (std::abs(localExtent.x) > 1e-5f || std::abs(localExtent.y) > 1e-5f || std::abs(localExtent.z) > 1e-5f);
+        if (!hasBounds) {
+            continue;
+        }
+
+        const glm::vec3 localCenter = (localMin + localMax) * 0.5f;
+        const glm::vec3 worldCenter = glm::vec3(dc->worldMatrix * glm::vec4(localCenter, 1.0f));
+        if (!std::isfinite(worldCenter.x) || !std::isfinite(worldCenter.y) || !std::isfinite(worldCenter.z)) {
+            continue;
+        }
+
+        const float localRadius = glm::length(localExtent) * 0.5f;
+        const float sx = glm::length(glm::vec3(dc->worldMatrix[0]));
+        const float sy = glm::length(glm::vec3(dc->worldMatrix[1]));
+        const float sz = glm::length(glm::vec3(dc->worldMatrix[2]));
+        const float maxScale = std::max(sx, std::max(sy, sz));
+        if (!std::isfinite(localRadius) || !std::isfinite(maxScale)) {
+            continue;
+        }
+
+        dc->cullWorldCenter = worldCenter;
+        dc->cullWorldRadius = std::max(localRadius * maxScale, 0.001f);
+        dc->cullBoundsValid = true;
+        for (int i = 0; i < 6; ++i) {
+            const float dist = glm::dot(frustum.planes[i].normal, dc->cullWorldCenter) + frustum.planes[i].d;
+            if (dist < -dc->cullWorldRadius * 1.2f) {
+                dc->frustumCulled = true;
+                break;
+            }
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 #define NDEVC_DEFERREDRENDERER_H
 
 #include "Rendering/Visibility/VisibilityGrid.h"
+#include "Rendering/Visibility/InternalVisibilityStage.h"
 #include "Rendering/Interfaces/IRenderer.h"
 #include "Rendering/Camera.h"
 #include "Rendering/DrawCmd.h"
@@ -30,6 +31,7 @@
 #include "Animation/AnimatorNodeInstance.h"
 #include "Engine/SceneManager.h"
 #include <array>
+#include <cstdint>
 #include <unordered_set>
 
 class DeferredRenderer : public NDEVC::Graphics::IRenderer {
@@ -107,6 +109,7 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	size_t pointLightInstanceCapacity = 0;
 	int sphereIndexCount = 0;
 	void generateSphereMesh();
+	bool viewportDisabled_ = false;
 	bool debugShadowView = false;
 	int debugShadowCascade = 0;
 
@@ -115,6 +118,11 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	std::unique_ptr<NDEVC::Graphics::FrameGraph> decalGraph;
 	std::unique_ptr<NDEVC::Graphics::FrameGraph> lightingGraph;
 	std::unique_ptr<NDEVC::Graphics::FrameGraph> particleGraph;
+
+	std::shared_ptr<NDEVC::Graphics::IRenderState> cachedBlitState_;
+	std::shared_ptr<NDEVC::Graphics::IRenderState> cachedEnvState_;
+	std::shared_ptr<NDEVC::Graphics::IRenderState> cachedEnvStateNoCull_;
+	std::shared_ptr<NDEVC::Graphics::IRenderState> cachedGeomState_;
 
 	bool filterEventsOnly = false;
 	int activeEventFilterIndex = 0;
@@ -136,11 +144,16 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	VisibilityGrid waterVisGrid_;
 	VisibilityGrid postAlphaVisGrid_;
 	VisibilityGrid simpleLayerVisGrid_;
+	VisibilityGrid refractionVisGrid_;
+	VisibilityGrid decalVisGrid_;
 
 	bool enableVisibilityGrid_ = true;
+	bool visGridRevealedAll_ = false;
 	float visibleRange_ = 0.0f;         // world units; 0 = no range limit (frustum-only)
 	std::vector<int> visibleCells_;     // scratch buffer, reused per frame
 	std::vector<int> lastVisibleCells_; // previous frame's visible set (change detection)
+	InternalVisibilityStage visibilityStage_;
+	std::uint64_t visibilityStageFrameIndex_ = 0;
 
 	// Top-down isometric camera (Diablo 2 style): ~55° pitch, facing -Z, elevated above origin.
 	// Position is recentered above the map after load.
@@ -167,12 +180,20 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	std::vector<DrawCmd> postAlphaUnlitDraws;
 	std::vector<DrawCmd> waterDraws;
 
+	DrawBatchSystem solidBatchSystem_;
+	DrawBatchSystem alphaTestBatchSystem_;
+	DrawBatchSystem environmentBatchSystem_;
+	DrawBatchSystem environmentAlphaBatchSystem_;
+	DrawBatchSystem decalBatchSystem_;
+
 	int lastFrameDrawCalls_ = 0;
 	int frameDrawCalls_ = 0;
 	bool decalDrawsSorted = false;
 	bool decalBatchDirty = true;
 	std::vector<DrawCmd*> animatedDraws;
 	std::vector<size_t> solidShaderVarAnimatedIndices;
+	bool solidShaderVarAnimatedIndicesDirty_ = true;
+	Camera::Frustum frameFrustum_;
 
 	struct TextureBindingCache {
 		uint32_t boundTextures[16] = {0};
@@ -204,6 +225,8 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	void bindDrawTextures(const DrawCmd& dc);
 	void renderMeshDraw(const DrawCmd& dc);
 	void UpdateLookAtSelection(bool force = false);
+	void InvalidateSelection();
+	void ValidateSelectionPointer();
 	bool InitializeImGui();
 	void ShutdownImGui();
 	void RenderImGui();
@@ -383,6 +406,8 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	}
 
 	inline void clearError(const char* label = nullptr) {
+		extern bool gEnableGLErrorChecking;
+		if (!gEnableGLErrorChecking) return;
 		if (device_) {
 			GLenum err = GL_NO_ERROR;
 			while ((err = glGetError()) != GL_NO_ERROR) {

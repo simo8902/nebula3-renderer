@@ -21,6 +21,16 @@ ShaderManager::ShaderManager() {
 
     NC::LOGGING::Log("[SHADER_MGR] NDEVCdeferred program ID: ", *(GLuint*)shaderProgram->GetNativeHandle());
 
+    auto standardShaderProgram = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
+               SOURCE_DIR "/shaders/standard.vert",
+               SOURCE_DIR "/shaders/standard.frag"
+           );
+
+    if (!standardShaderProgram->IsValid()) {
+        throw NC::Errors::LoggedRuntimeError("Standard shader init failed");
+    }
+    NC::LOGGING::Log("[SHADER_MGR] Ready standard");
+
     auto particleShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
                SOURCE_DIR "/shaders/particle.vert",
                SOURCE_DIR "/shaders/particle.frag"
@@ -195,6 +205,7 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready blit");
 
     shaders["NDEVCdeferred"] = shaderProgram;
+    shaders["standard"] = standardShaderProgram;
     shaders["particle"] = particleShader;
     shaders["environment"] = environmentShader;
     shaders["environmentAlpha"] = environmentAlphaShader;

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <cstdint>
 #include "glm.hpp"
 
 struct DrawCmd {
@@ -30,6 +31,7 @@ struct DrawCmd {
 	mutable glm::vec3 cullWorldCenter{ 0.0f };
 	mutable float cullWorldRadius = 0.0f;
 	mutable bool cullBoundsValid = false;
+	mutable uint64_t cullTransformHash = 0ull;
 
 	int group = -1;
 	NDEVC::Graphics::ITexture* tex[12]{};
@@ -52,6 +54,7 @@ struct DrawCmd {
 	float alphaCutoff = 0.5f;
 	bool hasShaderVarAnimations = false;
 	bool hasPotentialTransformAnimation = false;
+	bool userDisabled = false;
 	bool disabled = false;
 	mutable bool frustumCulled = false;
 	bool isStatic = true;

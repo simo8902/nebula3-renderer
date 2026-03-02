@@ -6,6 +6,7 @@
 #include "Rendering/MegaBuffer.h"
 #include "glad/glad.h"
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
@@ -31,8 +32,64 @@ inline bool IsFrustumCullingDisabled() {
     return disabled;
 }
 
+inline bool UseStaticBatchCache() {
+    // Nebula-style visibility path: static batch cache is opt-in only.
+    // Set NDEVC_ENABLE_STATIC_BATCH_CACHE=1 to enable cache mode.
+    static const bool enabled = []() {
+#if defined(_WIN32)
+        char* value = nullptr;
+        size_t len = 0;
+        if (_dupenv_s(&value, &len, "NDEVC_ENABLE_STATIC_BATCH_CACHE") != 0 || value == nullptr) {
+            return false;
+        }
+        const bool result = value[0] != '\0' && value[0] != '0';
+        std::free(value);
+        return result;
+#else
+        const char* value = std::getenv("NDEVC_ENABLE_STATIC_BATCH_CACHE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+#endif
+    }();
+    return enabled;
+}
+
+inline uint64_t MixHash64(uint64_t value) {
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    value ^= value >> 31;
+    return value;
+}
+
+inline void HashCombine64(uint64_t& seed, uint64_t value) {
+    const uint64_t mixed = MixHash64(value + 0x9e3779b97f4a7c15ull);
+    seed ^= mixed + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+}
+
+inline uint64_t HashPointer64(const void* ptr) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
+}
+
+inline uint64_t HashFloatBits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return static_cast<uint64_t>(bits);
+}
+
+inline uint64_t HashMatrix4(const glm::mat4& matrix) {
+    uint64_t hash = 0x6f3d9b6f3d9b6f3dull;
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            HashCombine64(hash, HashFloatBits(matrix[c][r]));
+        }
+    }
+    return hash;
+}
+
 inline void EnsureCullBounds(const DrawCmd& obj, glm::vec3& worldCenter, float& radius) {
-    if (obj.cullBoundsValid) {
+    const uint64_t transformHash = HashMatrix4(obj.worldMatrix);
+    if (obj.cullBoundsValid && obj.cullTransformHash == transformHash) {
         worldCenter = obj.cullWorldCenter;
         radius = obj.cullWorldRadius;
         return;
@@ -50,6 +107,7 @@ inline void EnsureCullBounds(const DrawCmd& obj, glm::vec3& worldCenter, float& 
     obj.cullWorldCenter = worldCenter;
     obj.cullWorldRadius = radius;
     obj.cullBoundsValid = true;
+    obj.cullTransformHash = transformHash;
 }
 
 inline bool IsValidGroupForDraw(const DrawCmd& obj, const Nvx2Group& g) {
@@ -176,6 +234,132 @@ inline const FallbackTextures& GetFallbackTextures() {
     }
     return fb;
 }
+
+constexpr uint64_t kStaticCacheSignatureNone = 0ull;
+constexpr uint64_t kStaticCacheSignatureSolid = 0x534F4C4944000001ull;
+constexpr uint64_t kStaticCacheSignatureDecal = 0x444543414C000001ull;
+
+inline uint64_t MakeGenericStaticCacheSignature(uint32_t shaderHash, int numTextures) {
+    return (0x47454E4552494300ull |
+            (static_cast<uint64_t>(numTextures & 0xFF) << 32) |
+            static_cast<uint64_t>(shaderHash));
+}
+
+inline uint64_t HashStaticDrawGroups(const DrawCmd& obj) {
+    uint64_t hash = 0x5d6f7a8b9c011223ull;
+    if (!obj.mesh) {
+        return hash;
+    }
+    HashCombine64(hash, static_cast<uint64_t>(obj.mesh->groups.size()));
+    HashCombine64(hash, static_cast<uint64_t>(obj.mesh->idx.size()));
+
+    if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+        const auto& g = obj.mesh->groups[obj.group];
+        HashCombine64(hash, static_cast<uint64_t>(obj.group + 1));
+        HashCombine64(hash, static_cast<uint64_t>(g.firstIndex()));
+        HashCombine64(hash, static_cast<uint64_t>(g.indexCount()));
+    } else {
+        HashCombine64(hash, 0ull);
+        for (const auto& g : obj.mesh->groups) {
+            HashCombine64(hash, static_cast<uint64_t>(g.firstIndex()));
+            HashCombine64(hash, static_cast<uint64_t>(g.indexCount()));
+        }
+    }
+    return hash;
+}
+
+inline uint64_t ComputeSolidStaticCacheFingerprint(const std::vector<DrawCmd>& draws) {
+    uint64_t hash = 0x534f4c4944465052ull;
+    for (const DrawCmd& obj : draws) {
+        if (!obj.isStatic) continue;
+        HashCombine64(hash, 1ull);
+        HashCombine64(hash, HashPointer64(obj.mesh));
+        HashCombine64(hash, HashPointer64(obj.sourceNode));
+        HashCombine64(hash, static_cast<uint64_t>(obj.megaIndexOffset));
+        HashCombine64(hash, static_cast<uint64_t>(obj.receivesDecals ? 1 : 0));
+        for (int i = 0; i < 4; ++i) {
+            HashCombine64(hash, HashPointer64(obj.tex[i]));
+        }
+        HashCombine64(hash, HashMatrix4(obj.worldMatrix));
+        HashCombine64(hash, HashStaticDrawGroups(obj));
+    }
+    return hash;
+}
+
+inline uint64_t ComputeGenericStaticCacheFingerprint(const std::vector<DrawCmd>& draws,
+                                                     uint32_t shaderHash,
+                                                     int textureCount) {
+    uint64_t hash = 0x47454e4552494350ull;
+    HashCombine64(hash, static_cast<uint64_t>(shaderHash));
+    HashCombine64(hash, static_cast<uint64_t>(textureCount));
+    for (const DrawCmd& obj : draws) {
+        if (!obj.isStatic || !obj.mesh) continue;
+        HashCombine64(hash, 1ull);
+        HashCombine64(hash, HashPointer64(obj.mesh));
+        HashCombine64(hash, HashPointer64(obj.sourceNode));
+        HashCombine64(hash, static_cast<uint64_t>(obj.megaIndexOffset));
+        HashCombine64(hash, static_cast<uint64_t>(obj.receivesDecals ? 1 : 0));
+        for (int i = 0; i < textureCount; ++i) {
+            HashCombine64(hash, HashPointer64(obj.tex[i]));
+        }
+        HashCombine64(hash, HashMatrix4(obj.worldMatrix));
+        HashCombine64(hash, HashStaticDrawGroups(obj));
+    }
+    return hash;
+}
+
+inline uint64_t ComputeDecalStaticCacheFingerprint(const std::vector<DrawCmd>& draws) {
+    uint64_t hash = 0x444543414c465052ull;
+    for (const DrawCmd& obj : draws) {
+        if (!obj.isStatic || !obj.mesh) continue;
+        std::string shdrLower = obj.shdr;
+        std::transform(shdrLower.begin(), shdrLower.end(), shdrLower.begin(), ::tolower);
+        const bool isDecalReceiver =
+            shdrLower.find("decalreceive") != std::string::npos ||
+            shdrLower.find("decal_receive") != std::string::npos;
+        const bool isRenderableDecal = !isDecalReceiver &&
+                                       ((shdrLower == "shd:decal") ||
+                                        (shdrLower.find("decal") != std::string::npos) ||
+                                        obj.isDecal);
+        if (!isRenderableDecal) continue;
+
+        HashCombine64(hash, 1ull);
+        HashCombine64(hash, HashPointer64(obj.mesh));
+        HashCombine64(hash, HashPointer64(obj.sourceNode));
+        HashCombine64(hash, static_cast<uint64_t>(obj.megaIndexOffset));
+        HashCombine64(hash, HashPointer64(obj.tex[0]));
+        HashCombine64(hash, HashPointer64(obj.tex[3]));
+        HashCombine64(hash, HashMatrix4(obj.worldMatrix));
+        HashCombine64(hash, HashFloatBits(obj.localBoxMin.x));
+        HashCombine64(hash, HashFloatBits(obj.localBoxMin.y));
+        HashCombine64(hash, HashFloatBits(obj.localBoxMin.z));
+        HashCombine64(hash, HashFloatBits(obj.localBoxMax.x));
+        HashCombine64(hash, HashFloatBits(obj.localBoxMax.y));
+        HashCombine64(hash, HashFloatBits(obj.localBoxMax.z));
+        HashCombine64(hash, HashFloatBits(obj.decalScale));
+        HashCombine64(hash, static_cast<uint64_t>(obj.cullMode));
+        HashCombine64(hash, HashStaticDrawGroups(obj));
+    }
+    return hash;
+}
+
+inline bool PassesFrustum(const DrawCmd& obj, const Camera::Frustum& frustum) {
+    if (IsFrustumCullingDisabled()) {
+        return true;
+    }
+
+    glm::vec3 worldCenter;
+    float radius = 0.0f;
+    EnsureCullBounds(obj, worldCenter, radius);
+
+    for (int i = 0; i < 6; ++i) {
+        const float dist = glm::dot(frustum.planes[i].normal, worldCenter) + frustum.planes[i].d;
+        if (dist < -radius * 1.2f) {
+            return false;
+        }
+    }
+    return true;
+}
 }
 
 DrawBatchSystem& DrawBatchSystem::instance() {
@@ -219,6 +403,12 @@ void DrawBatchSystem::reset(bool invalidateStaticCache) {
     modelMatrices.clear();
     perObjectDataBuffer.clear();
     decalParamsBuffer.clear();
+    dynamicGroupsCache_.clear();
+    dynamicPackedCommands_.clear();
+    packedRanges_.clear();
+    dynamicSolidDrawIndices_.clear();
+    dynamicSolidIndexSourceCount_ = 0;
+    dynamicSolidStaticSourceCount_ = 0;
 
     if (invalidateStaticCache) {
         batches_.clear();
@@ -227,6 +417,19 @@ void DrawBatchSystem::reset(bool invalidateStaticCache) {
         staticBatchCommands.clear();
         staticIndirectCommandsPacked_.clear();
         staticIndirectOffsets_.clear();
+        staticBatchDrawIndices_.clear();
+        staticBatchInstanceDrawIndices_.clear();
+        staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        staticDecalParamsPacked_.clear();
+        staticCacheSignature_ = kStaticCacheSignatureNone;
+        staticCacheContentHash_ = 0ull;
+        staticCacheSourceCount_ = 0;
+        dynamicSolidIndexSourceCount_ = 0;
+        dynamicSolidStaticSourceCount_ = 0;
+        dynamicSolidDrawIndices_.clear();
         staticMatricesUploadedBySlot_.fill(false);
         staticIndirectUploadedBySlot_.fill(false);
         modelMatrixUploadCursor_ = 0;
@@ -247,9 +450,20 @@ void DrawBatchSystem::invalidateStaticCache() {
     staticModelMatrices.clear();
     staticBatchCommands.clear();
     staticBatchDrawIndices_.clear();
+    staticBatchInstanceDrawIndices_.clear();
     staticIndirectCommandsPacked_.clear();
     staticIndirectOffsets_.clear();
     staticCmdDrawIndices_.clear();
+    staticCmdInstanceOffsets_.clear();
+    staticCmdInstanceCounts_.clear();
+    staticCmdInstanceDrawIndices_.clear();
+    staticDecalParamsPacked_.clear();
+    staticCacheSignature_ = kStaticCacheSignatureNone;
+    staticCacheContentHash_ = 0ull;
+    staticCacheSourceCount_ = 0;
+    dynamicSolidIndexSourceCount_ = 0;
+    dynamicSolidStaticSourceCount_ = 0;
+    dynamicSolidDrawIndices_.clear();
     staticMatricesUploadedBySlot_.fill(false);
     staticIndirectUploadedBySlot_.fill(false);
     modelMatrixUploadCursor_ = 0;
@@ -269,12 +483,29 @@ void DrawBatchSystem::invalidateStaticCache() {
 }
 
 void DrawBatchSystem::updateStaticVisibility(const std::vector<DrawCmd>& solidDraws) {
-    if (staticCmdDrawIndices_.size() != staticIndirectCommandsPacked_.size()) return;
+    if (staticCmdInstanceOffsets_.size() != staticIndirectCommandsPacked_.size() ||
+        staticCmdInstanceCounts_.size() != staticIndirectCommandsPacked_.size()) {
+        return;
+    }
+
     bool changed = false;
-    for (size_t i = 0; i < staticCmdDrawIndices_.size(); ++i) {
-        const size_t di = staticCmdDrawIndices_[i];
-        if (di >= solidDraws.size()) continue;
-        const uint32_t want = solidDraws[di].disabled ? 0 : 1;
+    for (size_t i = 0; i < staticIndirectCommandsPacked_.size(); ++i) {
+        const size_t offset = staticCmdInstanceOffsets_[i];
+        const size_t count = static_cast<size_t>(staticCmdInstanceCounts_[i]);
+        uint32_t visibleCount = 0;
+
+        if (offset < staticCmdInstanceDrawIndices_.size()) {
+            const size_t available = staticCmdInstanceDrawIndices_.size() - offset;
+            const size_t clampedCount = std::min(count, available);
+            for (size_t j = 0; j < clampedCount; ++j) {
+                const size_t di = staticCmdInstanceDrawIndices_[offset + j];
+                if (di < solidDraws.size() && !solidDraws[di].disabled) {
+                    ++visibleCount;
+                }
+            }
+        }
+
+        const uint32_t want = visibleCount;
         if (staticIndirectCommandsPacked_[i].instanceCount != want) {
             staticIndirectCommandsPacked_[i].instanceCount = want;
             changed = true;
@@ -288,7 +519,62 @@ void DrawBatchSystem::updateStaticVisibility(const std::vector<DrawCmd>& solidDr
 
 void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
                            const Camera::Frustum& frustum) {
-    const bool buildingStaticBatches = staticModelMatrices.empty();
+    const bool allowStaticCache = UseStaticBatchCache();
+    if (!allowStaticCache) {
+        if (!staticModelMatrices.empty() || !staticIndirectCommandsPacked_.empty() || staticMatrixCount > 0) {
+            invalidateStaticCache();
+        }
+        dynamicSolidDrawIndices_.clear();
+        dynamicSolidDrawIndices_.reserve(solidDraws.size());
+        for (size_t i = 0; i < solidDraws.size(); ++i) {
+            dynamicSolidDrawIndices_.push_back(i);
+        }
+        dynamicSolidIndexSourceCount_ = solidDraws.size();
+        dynamicSolidStaticSourceCount_ = 0;
+    } else {
+        bool rebuildDynamicSolidIndices = dynamicSolidIndexSourceCount_ != solidDraws.size();
+        if (!rebuildDynamicSolidIndices) {
+            if (!dynamicSolidDrawIndices_.empty()) {
+                for (size_t drawIndex : dynamicSolidDrawIndices_) {
+                    if (drawIndex >= solidDraws.size() || solidDraws[drawIndex].isStatic) {
+                        rebuildDynamicSolidIndices = true;
+                        break;
+                    }
+                }
+                if (!rebuildDynamicSolidIndices &&
+                    dynamicSolidDrawIndices_.size() + dynamicSolidStaticSourceCount_ != solidDraws.size()) {
+                    rebuildDynamicSolidIndices = true;
+                }
+            } else if (dynamicSolidStaticSourceCount_ != solidDraws.size()) {
+                rebuildDynamicSolidIndices = true;
+            }
+        }
+
+        if (rebuildDynamicSolidIndices) {
+            dynamicSolidDrawIndices_.clear();
+            dynamicSolidDrawIndices_.reserve(solidDraws.size());
+            dynamicSolidStaticSourceCount_ = 0;
+            for (size_t i = 0; i < solidDraws.size(); ++i) {
+                if (solidDraws[i].isStatic) {
+                    ++dynamicSolidStaticSourceCount_;
+                } else {
+                    dynamicSolidDrawIndices_.push_back(i);
+                }
+            }
+            dynamicSolidIndexSourceCount_ = solidDraws.size();
+        }
+    }
+
+    const size_t staticSourceCount = allowStaticCache ? dynamicSolidStaticSourceCount_ : 0;
+    const uint64_t staticContentHash = allowStaticCache ? ComputeSolidStaticCacheFingerprint(solidDraws) : 0ull;
+    const bool buildingStaticBatches = allowStaticCache && (
+        staticModelMatrices.empty() ||
+        staticCacheSignature_ != kStaticCacheSignatureSolid ||
+        staticCacheContentHash_ != staticContentHash ||
+        staticCacheSourceCount_ != staticSourceCount ||
+        staticCmdDrawIndices_.size() != staticIndirectCommandsPacked_.size() ||
+        staticCmdInstanceOffsets_.size() != staticIndirectCommandsPacked_.size() ||
+        staticCmdInstanceCounts_.size() != staticIndirectCommandsPacked_.size());
 
     for (auto& [k, batch] : batches_) {
         batch.commands.clear();
@@ -297,30 +583,41 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
     active_.clear();
     modelMatrices.clear();
 
-    if (!buildingStaticBatches) {
-        staticMatrixCount = staticModelMatrices.size();
+    if (!allowStaticCache || !buildingStaticBatches) {
+        staticMatrixCount = allowStaticCache ? staticModelMatrices.size() : 0;
     } else {
         staticMatrixCount = 0;
         staticModelMatrices.clear();
         staticBatchCommands.clear();
         staticBatchDrawIndices_.clear();
+        staticBatchInstanceDrawIndices_.clear();
         staticIndirectCommandsPacked_.clear();
         staticIndirectOffsets_.clear();
         staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        staticDecalParamsPacked_.clear();
+        staticCacheSignature_ = kStaticCacheSignatureSolid;
+        staticCacheContentHash_ = staticContentHash;
+        staticCacheSourceCount_ = staticSourceCount;
     }
+
+    auto ensureBatch = [&](const BatchKey& key) -> DrawBatch& {
+        auto it = batches_.find(key);
+        if (it == batches_.end()) {
+            it = batches_.emplace(key, DrawBatch{key}).first;
+        }
+        it->second.key = key;
+        return it->second;
+    };
 
     if (buildingStaticBatches) {
         size_t drawIdx = 0;
         for (const auto& obj : solidDraws) {
             ++drawIdx;
             if (!obj.mesh) continue;
-            // NOTE: do NOT skip disabled here — all statics go into cache.
-            // Visibility is handled by updateStaticVisibility() toggling instanceCount.
             if (!obj.isStatic) continue;
-
-            // Static cache must contain all static solids; frustum-culling here
-            // causes permanently missing geometry based on first-view camera.
-            EnsureCullBounds(obj, obj.cullWorldCenter, obj.cullWorldRadius);
 
             BatchKey key;
             key.tex[0] = obj.tex[0];
@@ -330,14 +627,10 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
             key.receivesDecals = obj.receivesDecals;
             key.shaderHash = 0;
 
-            auto it = batches_.find(key);
-            if (it == batches_.end()) {
-                it = batches_.emplace(key, DrawBatch{key}).first;
-            }
-            DrawBatch& batch = it->second;
-            batch.key = key;
+            ensureBatch(key);
             auto& staticCommands = staticBatchCommands[key];
             auto& staticDrawIdxs = staticBatchDrawIndices_[key];
+            auto& staticInstanceDrawIdxs = staticBatchInstanceDrawIndices_[key];
             const uint32_t baseInstance = static_cast<uint32_t>(staticModelMatrices.size());
             bool matrixAllocated = false;
             auto ensureMatrix = [&]() {
@@ -347,61 +640,57 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
                 }
             };
 
-            const size_t srcIdx = drawIdx - 1; // drawIdx was pre-incremented
-            const uint32_t instCount = obj.disabled ? 0 : 1;
-            if (obj.group >= 0 && obj.group < (int)obj.mesh->groups.size()) {
-                auto& g = obj.mesh->groups[obj.group];
-                if (!IsValidGroupForDraw(obj, g)) continue;
+            const size_t srcIdx = drawIdx - 1;
+            auto appendGroup = [&](const Nvx2Group& g) {
+                if (!IsValidGroupForDraw(obj, g)) return;
                 ensureMatrix();
+
                 DrawCommand cmd{};
                 cmd.count = g.indexCount();
-                cmd.instanceCount = instCount;
+                cmd.instanceCount = 0;
                 cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
                 cmd.baseVertex = 0;
                 cmd.baseInstance = baseInstance;
+
                 staticCommands.push_back(cmd);
                 staticDrawIdxs.push_back(srcIdx);
+                staticInstanceDrawIdxs.emplace_back(std::vector<size_t>{srcIdx});
+            };
+
+            if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+                appendGroup(obj.mesh->groups[obj.group]);
             } else {
-                for (size_t gi = 0; gi < obj.mesh->groups.size(); ++gi) {
-                    auto& g = obj.mesh->groups[gi];
-                    if (!IsValidGroupForDraw(obj, g)) continue;
-                    ensureMatrix();
-                    DrawCommand cmd{};
-                    cmd.count = g.indexCount();
-                    cmd.instanceCount = instCount;
-                    cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
-                    cmd.baseVertex = 0;
-                    cmd.baseInstance = baseInstance;
-                    staticCommands.push_back(cmd);
-                    staticDrawIdxs.push_back(srcIdx);
+                for (const auto& g : obj.mesh->groups) {
+                    appendGroup(g);
                 }
             }
-
-            active_.push_back(&batch);
         }
+
+        for (const auto& [k, staticCmds] : staticBatchCommands) {
+            if (staticCmds.empty()) continue;
+            auto bit = batches_.find(k);
+            if (bit != batches_.end()) {
+                active_.push_back(&bit->second);
+            }
+        }
+
         staticMatrixCount = staticModelMatrices.size();
     }
 
-    for (const auto& obj : solidDraws) {
+    for (auto& [k, outerMap] : dynamicGroupsCache_) {
+        for (auto& [gk, grp] : outerMap) {
+            grp.matrices.clear();
+        }
+    }
+
+    for (size_t drawIndex : dynamicSolidDrawIndices_) {
+        if (drawIndex >= solidDraws.size()) {
+            continue;
+        }
+        const DrawCmd& obj = solidDraws[drawIndex];
         if (!obj.mesh) continue;
         if (obj.disabled) continue;
-        if (obj.isStatic) continue;
-
-        glm::vec3 worldCenter;
-        float radius = 0.0f;
-        EnsureCullBounds(obj, worldCenter, radius);
-
-        bool visible = true;
-        if (!IsFrustumCullingDisabled()) {
-            for (int i = 0; i < 6; ++i) {
-                float dist = glm::dot(frustum.planes[i].normal, worldCenter) + frustum.planes[i].d;
-                if (dist < -radius * 1.2f) {
-                    visible = false;
-                    break;
-                }
-            }
-        }
-        if (!visible) continue;
+        if (!PassesFrustum(obj, frustum)) continue;
 
         BatchKey key;
         key.tex[0] = obj.tex[0];
@@ -411,57 +700,55 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
         key.receivesDecals = obj.receivesDecals;
         key.shaderHash = 0;
 
-        auto it = batches_.find(key);
-        if (it == batches_.end()) {
-            it = batches_.emplace(key, DrawBatch{key}).first;
-        }
-        DrawBatch& batch = it->second;
-        batch.key = key;
-        const uint32_t baseInstance =
-            static_cast<uint32_t>(staticMatrixCount + modelMatrices.size());
-        bool matrixAllocated = false;
-        auto ensureMatrix = [&]() {
-            if (!matrixAllocated) {
-                modelMatrices.push_back(obj.worldMatrix);
-                matrixAllocated = true;
+        auto appendGroup = [&](const Nvx2Group& g) {
+            if (!IsValidGroupForDraw(obj, g)) return;
+            const uint32_t count = g.indexCount();
+            const uint32_t firstIndex = obj.megaIndexOffset + g.firstIndex();
+            const uint64_t geomKey = (static_cast<uint64_t>(count) << 32) | firstIndex;
+            auto& entry = dynamicGroupsCache_[key][geomKey];
+            if (entry.count == 0) {
+                entry.count = count;
+                entry.firstIndex = firstIndex;
             }
+            entry.matrices.push_back(obj.worldMatrix);
         };
 
-        if (obj.group >= 0 && obj.group < (int)obj.mesh->groups.size()) {
-            auto& g = obj.mesh->groups[obj.group];
-            if (!IsValidGroupForDraw(obj, g)) continue;
-            ensureMatrix();
-            DrawCommand cmd{};
-            cmd.count = g.indexCount();
-            cmd.instanceCount = 1;
-            cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
-            cmd.baseVertex = 0;
-            cmd.baseInstance = baseInstance;
-            batch.commands.push_back(cmd);
+        if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+            appendGroup(obj.mesh->groups[obj.group]);
         } else {
-            for (size_t gi = 0; gi < obj.mesh->groups.size(); ++gi) {
-                auto& g = obj.mesh->groups[gi];
-                if (!IsValidGroupForDraw(obj, g)) continue;
-                ensureMatrix();
-                DrawCommand cmd{};
-                cmd.count = g.indexCount();
-                cmd.instanceCount = 1;
-                cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
-                cmd.baseVertex = 0;
-                cmd.baseInstance = baseInstance;
-                batch.commands.push_back(cmd);
+            for (const auto& g : obj.mesh->groups) {
+                appendGroup(g);
             }
         }
-
-        active_.push_back(&batch);
     }
 
-    if (!buildingStaticBatches) {
+    for (auto& [key, groups] : dynamicGroupsCache_) {
+        DrawBatch& batch = ensureBatch(key);
+        for (auto& [geomKey, entry] : groups) {
+            (void)geomKey;
+            if (entry.matrices.empty()) continue;
+
+            DrawCommand cmd{};
+            cmd.count = entry.count;
+            cmd.instanceCount = static_cast<uint32_t>(entry.matrices.size());
+            cmd.firstIndex = entry.firstIndex;
+            cmd.baseVertex = 0;
+            cmd.baseInstance = static_cast<uint32_t>(staticMatrixCount + modelMatrices.size());
+
+            modelMatrices.insert(modelMatrices.end(), entry.matrices.begin(), entry.matrices.end());
+            batch.commands.push_back(cmd);
+        }
+        if (!batch.commands.empty()) {
+            active_.push_back(&batch);
+        }
+    }
+
+    if (allowStaticCache && !buildingStaticBatches) {
         for (auto& [k, batch] : batches_) {
             const bool hasDynamic = !batch.commands.empty();
             auto sit = staticBatchCommands.find(k);
             const bool hasStatic = sit != staticBatchCommands.end() && !sit->second.empty();
-            if (hasDynamic || hasStatic) {
+            if (hasStatic && !hasDynamic) {
                 active_.push_back(&batch);
             }
         }
@@ -477,6 +764,9 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
         staticIndirectCommandsPacked_.clear();
         staticIndirectOffsets_.clear();
         staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
         for (const auto& [k, staticCmds] : staticBatchCommands) {
             if (!staticCmds.empty()) {
                 staticIndirectOffsets_[k] = staticIndirectCommandsPacked_.size();
@@ -484,10 +774,27 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
                                                      staticCmds.begin(),
                                                      staticCmds.end());
                 auto idxIt = staticBatchDrawIndices_.find(k);
-                if (idxIt != staticBatchDrawIndices_.end()) {
-                    staticCmdDrawIndices_.insert(staticCmdDrawIndices_.end(),
-                                                 idxIt->second.begin(),
-                                                 idxIt->second.end());
+                auto instIdxIt = staticBatchInstanceDrawIndices_.find(k);
+                for (size_t cmdIdx = 0; cmdIdx < staticCmds.size(); ++cmdIdx) {
+                    const size_t representativeIdx =
+                        (idxIt != staticBatchDrawIndices_.end() && cmdIdx < idxIt->second.size())
+                            ? idxIt->second[cmdIdx]
+                            : 0u;
+                    staticCmdDrawIndices_.push_back(representativeIdx);
+                    staticCmdInstanceOffsets_.push_back(staticCmdInstanceDrawIndices_.size());
+
+                    if (instIdxIt != staticBatchInstanceDrawIndices_.end() &&
+                        cmdIdx < instIdxIt->second.size() &&
+                        !instIdxIt->second[cmdIdx].empty()) {
+                        const auto& refs = instIdxIt->second[cmdIdx];
+                        staticCmdInstanceDrawIndices_.insert(staticCmdInstanceDrawIndices_.end(),
+                                                             refs.begin(),
+                                                             refs.end());
+                        staticCmdInstanceCounts_.push_back(static_cast<uint32_t>(refs.size()));
+                    } else {
+                        staticCmdInstanceDrawIndices_.push_back(representativeIdx);
+                        staticCmdInstanceCounts_.push_back(1u);
+                    }
                 }
                 auto bit = batches_.find(k);
                 if (bit != batches_.end()) {
@@ -497,11 +804,44 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
         }
         staticIndirectUploadedBySlot_.fill(false);
     }
+
+    if (allowStaticCache) {
+        updateStaticVisibility(solidDraws);
+    }
+
 }
 
 void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camera::Frustum& frustum,
                                     uint32_t shaderHash, int numTextures) {
-    staticMatrixCount = 0;
+    const bool allowStaticCache = UseStaticBatchCache();
+    const int textureCount = std::clamp(numTextures, 0, 12);
+    const uint64_t cacheSignature = MakeGenericStaticCacheSignature(shaderHash, textureCount);
+    const uint64_t staticContentHash =
+        ComputeGenericStaticCacheFingerprint(draws, shaderHash, textureCount);
+    size_t staticSourceCount = 0;
+    if (allowStaticCache) {
+        for (const DrawCmd& obj : draws) {
+            if (obj.mesh != nullptr && obj.isStatic) {
+                ++staticSourceCount;
+            }
+        }
+    }
+    const bool hasStaticCandidates = allowStaticCache && staticSourceCount > 0;
+    const bool buildingStaticBatches =
+        hasStaticCandidates && (
+            staticModelMatrices.empty() ||
+            staticCacheSignature_ != cacheSignature ||
+            staticCacheContentHash_ != staticContentHash ||
+            staticCacheSourceCount_ != staticSourceCount ||
+            staticCmdDrawIndices_.size() != staticIndirectCommandsPacked_.size() ||
+            staticCmdInstanceOffsets_.size() != staticIndirectCommandsPacked_.size() ||
+            staticCmdInstanceCounts_.size() != staticIndirectCommandsPacked_.size());
+
+    if (!allowStaticCache &&
+        (!staticModelMatrices.empty() || !staticIndirectCommandsPacked_.empty() || staticMatrixCount > 0)) {
+        invalidateStaticCache();
+    }
+
     for (auto& [k, batch] : batches_) {
         batch.commands.clear();
         batch.perObjectData.clear();
@@ -511,77 +851,267 @@ void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camer
     modelMatrices.clear();
     perObjectDataBuffer.clear();
 
-    for (const auto& obj : draws) {
-        if (!obj.mesh) continue;
-        if (obj.disabled) continue;
+    if (!hasStaticCandidates) {
+        staticMatrixCount = 0;
+        staticModelMatrices.clear();
+        staticBatchCommands.clear();
+        staticBatchDrawIndices_.clear();
+        staticBatchInstanceDrawIndices_.clear();
+        staticIndirectCommandsPacked_.clear();
+        staticIndirectOffsets_.clear();
+        staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        staticDecalParamsPacked_.clear();
+        staticCacheSignature_ = kStaticCacheSignatureNone;
+        staticCacheContentHash_ = 0ull;
+        staticCacheSourceCount_ = 0;
+    } else if (buildingStaticBatches) {
+        staticMatrixCount = 0;
+        staticModelMatrices.clear();
+        staticBatchCommands.clear();
+        staticBatchDrawIndices_.clear();
+        staticBatchInstanceDrawIndices_.clear();
+        staticIndirectCommandsPacked_.clear();
+        staticIndirectOffsets_.clear();
+        staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        staticDecalParamsPacked_.clear();
+        staticCacheSignature_ = cacheSignature;
+        staticCacheContentHash_ = staticContentHash;
+        staticCacheSourceCount_ = staticSourceCount;
 
-        glm::vec3 worldCenter;
-        float radius = 0.0f;
-        EnsureCullBounds(obj, worldCenter, radius);
+        size_t drawIdx = 0;
+        for (const auto& obj : draws) {
+            ++drawIdx;
+            if (!obj.mesh || !obj.isStatic) continue;
 
-        bool visible = true;
-        if (!IsFrustumCullingDisabled()) {
-            for (int i = 0; i < 6; ++i) {
-                float dist = glm::dot(frustum.planes[i].normal, worldCenter) + frustum.planes[i].d;
-                if (dist < -radius * 1.2f) {
-                    visible = false;
-                    break;
+            BatchKey key;
+            for (int i = 0; i < textureCount; ++i) {
+                key.tex[i] = obj.tex[i];
+            }
+            key.receivesDecals = obj.receivesDecals;
+            key.shaderHash = shaderHash;
+
+            auto it = batches_.find(key);
+            if (it == batches_.end()) {
+                it = batches_.emplace(key, DrawBatch{key}).first;
+            }
+            DrawBatch& batch = it->second;
+            batch.key = key;
+            auto& staticCommands = staticBatchCommands[key];
+            auto& staticDrawIdxs = staticBatchDrawIndices_[key];
+            auto& staticInstanceDrawIdxs = staticBatchInstanceDrawIndices_[key];
+            const uint32_t baseInstance = static_cast<uint32_t>(staticModelMatrices.size());
+            bool matrixAllocated = false;
+            auto ensureMatrix = [&]() {
+                if (!matrixAllocated) {
+                    staticModelMatrices.push_back(obj.worldMatrix);
+                    matrixAllocated = true;
+                }
+            };
+
+            const size_t srcIdx = drawIdx - 1;
+            if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+                auto& g = obj.mesh->groups[obj.group];
+                if (!IsValidGroupForDraw(obj, g)) continue;
+                ensureMatrix();
+                DrawCommand cmd{};
+                cmd.count = g.indexCount();
+                cmd.instanceCount = 0;
+                cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
+                cmd.baseVertex = 0;
+                cmd.baseInstance = baseInstance;
+                staticCommands.push_back(cmd);
+                staticDrawIdxs.push_back(srcIdx);
+                staticInstanceDrawIdxs.emplace_back(std::vector<size_t>{srcIdx});
+            } else {
+                for (size_t gi = 0; gi < obj.mesh->groups.size(); ++gi) {
+                    auto& g = obj.mesh->groups[gi];
+                    if (!IsValidGroupForDraw(obj, g)) continue;
+                    ensureMatrix();
+                    DrawCommand cmd{};
+                    cmd.count = g.indexCount();
+                    cmd.instanceCount = 0;
+                    cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
+                    cmd.baseVertex = 0;
+                    cmd.baseInstance = baseInstance;
+                    staticCommands.push_back(cmd);
+                    staticDrawIdxs.push_back(srcIdx);
+                    staticInstanceDrawIdxs.emplace_back(std::vector<size_t>{srcIdx});
+                }
+            }
+
+            active_.push_back(&batch);
+        }
+
+        staticMatrixCount = staticModelMatrices.size();
+        staticMatricesUploadedBySlot_.fill(false);
+        staticIndirectCommandsPacked_.clear();
+        staticIndirectOffsets_.clear();
+        staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        for (const auto& [k, staticCmds] : staticBatchCommands) {
+            if (!staticCmds.empty()) {
+                staticIndirectOffsets_[k] = staticIndirectCommandsPacked_.size();
+                staticIndirectCommandsPacked_.insert(staticIndirectCommandsPacked_.end(),
+                                                     staticCmds.begin(),
+                                                     staticCmds.end());
+                auto idxIt = staticBatchDrawIndices_.find(k);
+                auto instIdxIt = staticBatchInstanceDrawIndices_.find(k);
+                for (size_t cmdIdx = 0; cmdIdx < staticCmds.size(); ++cmdIdx) {
+                    const size_t representativeIdx =
+                        (idxIt != staticBatchDrawIndices_.end() && cmdIdx < idxIt->second.size())
+                            ? idxIt->second[cmdIdx]
+                            : 0u;
+                    staticCmdDrawIndices_.push_back(representativeIdx);
+                    staticCmdInstanceOffsets_.push_back(staticCmdInstanceDrawIndices_.size());
+
+                    if (instIdxIt != staticBatchInstanceDrawIndices_.end() &&
+                        cmdIdx < instIdxIt->second.size() &&
+                        !instIdxIt->second[cmdIdx].empty()) {
+                        const auto& refs = instIdxIt->second[cmdIdx];
+                        staticCmdInstanceDrawIndices_.insert(staticCmdInstanceDrawIndices_.end(),
+                                                             refs.begin(),
+                                                             refs.end());
+                        staticCmdInstanceCounts_.push_back(static_cast<uint32_t>(refs.size()));
+                    } else {
+                        staticCmdInstanceDrawIndices_.push_back(representativeIdx);
+                        staticCmdInstanceCounts_.push_back(1u);
+                    }
+                }
+                auto bit = batches_.find(k);
+                if (bit != batches_.end()) {
+                    bit->second.staticCommandCount = staticCmds.size();
                 }
             }
         }
-        if (!visible) continue;
+        staticIndirectUploadedBySlot_.fill(false);
+    } else {
+        staticMatrixCount = staticModelMatrices.size();
+    }
+
+    if (hasStaticCandidates &&
+        staticCmdInstanceOffsets_.size() == staticIndirectCommandsPacked_.size() &&
+        staticCmdInstanceCounts_.size() == staticIndirectCommandsPacked_.size()) {
+        bool changed = false;
+        for (size_t i = 0; i < staticIndirectCommandsPacked_.size(); ++i) {
+            const size_t offset = staticCmdInstanceOffsets_[i];
+            const size_t count = static_cast<size_t>(staticCmdInstanceCounts_[i]);
+            uint32_t visibleCount = 0;
+
+            if (offset < staticCmdInstanceDrawIndices_.size()) {
+                const size_t available = staticCmdInstanceDrawIndices_.size() - offset;
+                const size_t clampedCount = std::min(count, available);
+                for (size_t j = 0; j < clampedCount; ++j) {
+                    const size_t di = staticCmdInstanceDrawIndices_[offset + j];
+                    if (di < draws.size() && !draws[di].disabled) {
+                        ++visibleCount;
+                    }
+                }
+            }
+
+            const uint32_t want = visibleCount;
+            if (staticIndirectCommandsPacked_[i].instanceCount != want) {
+                staticIndirectCommandsPacked_[i].instanceCount = want;
+                changed = true;
+            }
+        }
+        if (changed) {
+            staticIndirectUploadedBySlot_.fill(false);
+        }
+    }
+
+    auto& groupedDynamics = dynamicGroupsCache_;
+    for (auto& [groupKey, groups] : groupedDynamics) {
+        (void)groupKey;
+        for (auto& [geomKey, entry] : groups) {
+            (void)geomKey;
+            entry.count = 0;
+            entry.firstIndex = 0;
+            entry.alphaCutoff = 0.5f;
+            entry.matrices.clear();
+        }
+    }
+
+    for (const auto& obj : draws) {
+        if (!obj.mesh) continue;
+        if (obj.disabled) continue;
+        if (hasStaticCandidates && obj.isStatic) continue;
+        if (!PassesFrustum(obj, frustum)) continue;
 
         BatchKey key;
-        for (int i = 0; i < numTextures && i < 12; ++i) {
+        for (int i = 0; i < textureCount; ++i) {
             key.tex[i] = obj.tex[i];
         }
         key.receivesDecals = obj.receivesDecals;
         key.shaderHash = shaderHash;
 
-        auto it = batches_.find(key);
-        if (it == batches_.end())
-            it = batches_.emplace(key, DrawBatch{key}).first;
-        DrawBatch& batch = it->second;
-        const uint32_t baseInstance = static_cast<uint32_t>(modelMatrices.size());
-        bool matrixAllocated = false;
-        auto ensureMatrix = [&]() {
-            if (!matrixAllocated) {
-                modelMatrices.push_back(obj.worldMatrix);
-                matrixAllocated = true;
+        auto appendGroup = [&](const Nvx2Group& g) {
+            if (!IsValidGroupForDraw(obj, g)) return;
+            const uint32_t count = g.indexCount();
+            const uint32_t firstIndex = obj.megaIndexOffset + g.firstIndex();
+            const uint64_t geomKey = (static_cast<uint64_t>(count) << 32) | firstIndex;
+            auto& entry = groupedDynamics[key][geomKey];
+            if (entry.matrices.empty()) {
+                entry.count = count;
+                entry.firstIndex = firstIndex;
+                entry.alphaCutoff = obj.alphaCutoff;
             }
+            entry.matrices.push_back(obj.worldMatrix);
         };
 
-        if (obj.group >= 0 && obj.group < (int)obj.mesh->groups.size()) {
-            auto& g = obj.mesh->groups[obj.group];
-            if (!IsValidGroupForDraw(obj, g)) continue;
-            ensureMatrix();
-            DrawCommand cmd{};
-            cmd.count = g.indexCount();
-            cmd.instanceCount = 1;
-            cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
-            cmd.baseVertex = 0;
-            cmd.baseInstance = baseInstance;
-
-            batch.perObjectData.push_back(obj.alphaCutoff);
-            batch.commands.push_back(cmd);
+        if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+            appendGroup(obj.mesh->groups[obj.group]);
         } else {
-            for (size_t gi = 0; gi < obj.mesh->groups.size(); ++gi) {
-                auto& g = obj.mesh->groups[gi];
-                if (!IsValidGroupForDraw(obj, g)) continue;
-                ensureMatrix();
-                DrawCommand cmd{};
-                cmd.count = g.indexCount();
-                cmd.instanceCount = 1;
-                cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
-                cmd.baseVertex = 0;
-                cmd.baseInstance = baseInstance;
-
-                batch.perObjectData.push_back(obj.alphaCutoff);
-                batch.commands.push_back(cmd);
+            for (const auto& g : obj.mesh->groups) {
+                appendGroup(g);
             }
         }
+    }
 
-        active_.push_back(&batch);
+    for (auto& [key, groups] : groupedDynamics) {
+        auto it = batches_.find(key);
+        if (it == batches_.end()) {
+            it = batches_.emplace(key, DrawBatch{key}).first;
+        }
+        DrawBatch& batch = it->second;
+        batch.key = key;
+
+        for (auto& [geomKey, entry] : groups) {
+            (void)geomKey;
+            if (entry.matrices.empty()) continue;
+            DrawCommand cmd{};
+            cmd.count = entry.count;
+            cmd.instanceCount = static_cast<uint32_t>(entry.matrices.size());
+            cmd.firstIndex = entry.firstIndex;
+            cmd.baseVertex = 0;
+            cmd.baseInstance = static_cast<uint32_t>(staticMatrixCount + modelMatrices.size());
+
+            modelMatrices.insert(modelMatrices.end(), entry.matrices.begin(), entry.matrices.end());
+            batch.perObjectData.push_back(entry.alphaCutoff);
+            batch.commands.push_back(cmd);
+        }
+
+        if (!batch.commands.empty()) {
+            active_.push_back(&batch);
+        }
+    }
+
+    if (hasStaticCandidates && !buildingStaticBatches) {
+        for (auto& [k, batch] : batches_) {
+            const bool hasDynamic = !batch.commands.empty();
+            auto sit = staticBatchCommands.find(k);
+            const bool hasStatic = sit != staticBatchCommands.end() && !sit->second.empty();
+            if (hasStatic && !hasDynamic) {
+                active_.push_back(&batch);
+            }
+        }
     }
 
     if (!active_.empty()) {
@@ -591,7 +1121,46 @@ void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camer
 }
 
 void DrawBatchSystem::cullDecals(const std::vector<DrawCmd>& draws) {
-    staticMatrixCount = 0;
+    const bool allowStaticCache = UseStaticBatchCache();
+    auto isRenderableDecal = [](const DrawCmd& obj) {
+        if (!obj.mesh) return false;
+        std::string shdrLower = obj.shdr;
+        std::transform(shdrLower.begin(), shdrLower.end(), shdrLower.begin(), ::tolower);
+        const bool isDecalReceiver =
+            shdrLower.find("decalreceive") != std::string::npos ||
+            shdrLower.find("decal_receive") != std::string::npos;
+        return !isDecalReceiver &&
+               ((shdrLower == "shd:decal") ||
+                (shdrLower.find("decal") != std::string::npos) ||
+                obj.isDecal);
+    };
+
+    size_t staticSourceCount = 0;
+    if (allowStaticCache) {
+        for (const DrawCmd& obj : draws) {
+            if (obj.isStatic && isRenderableDecal(obj)) {
+                ++staticSourceCount;
+            }
+        }
+    }
+    const uint64_t staticContentHash = ComputeDecalStaticCacheFingerprint(draws);
+    const bool hasStaticCandidates = allowStaticCache && staticSourceCount > 0;
+    const bool buildingStaticBatches =
+        hasStaticCandidates && (
+            staticModelMatrices.empty() ||
+            staticCacheSignature_ != kStaticCacheSignatureDecal ||
+            staticCacheContentHash_ != staticContentHash ||
+            staticCacheSourceCount_ != staticSourceCount ||
+            staticCmdDrawIndices_.size() != staticIndirectCommandsPacked_.size() ||
+            staticCmdInstanceOffsets_.size() != staticIndirectCommandsPacked_.size() ||
+            staticCmdInstanceCounts_.size() != staticIndirectCommandsPacked_.size() ||
+            staticDecalParamsPacked_.size() != staticModelMatrices.size() * 2u);
+
+    if (!allowStaticCache &&
+        (!staticModelMatrices.empty() || !staticIndirectCommandsPacked_.empty() || staticMatrixCount > 0)) {
+        invalidateStaticCache();
+    }
+
     for (auto& [k, batch] : batches_) {
         batch.commands.clear();
         batch.decalParams.clear();
@@ -601,22 +1170,201 @@ void DrawBatchSystem::cullDecals(const std::vector<DrawCmd>& draws) {
     modelMatrices.clear();
     decalParamsBuffer.clear();
 
-    int validCount = 0;
-    for (auto& obj : draws) {
-        if (!obj.mesh) continue;
-        if (obj.disabled) continue;
+    if (!hasStaticCandidates) {
+        staticMatrixCount = 0;
+        staticModelMatrices.clear();
+        staticBatchCommands.clear();
+        staticBatchDrawIndices_.clear();
+        staticBatchInstanceDrawIndices_.clear();
+        staticIndirectCommandsPacked_.clear();
+        staticIndirectOffsets_.clear();
+        staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        staticDecalParamsPacked_.clear();
+        staticCacheSignature_ = kStaticCacheSignatureNone;
+        staticCacheContentHash_ = 0ull;
+        staticCacheSourceCount_ = 0;
+    } else if (buildingStaticBatches) {
+        staticMatrixCount = 0;
+        staticModelMatrices.clear();
+        staticBatchCommands.clear();
+        staticBatchDrawIndices_.clear();
+        staticBatchInstanceDrawIndices_.clear();
+        staticIndirectCommandsPacked_.clear();
+        staticIndirectOffsets_.clear();
+        staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        staticDecalParamsPacked_.clear();
+        staticCacheSignature_ = kStaticCacheSignatureDecal;
+        staticCacheContentHash_ = staticContentHash;
+        staticCacheSourceCount_ = staticSourceCount;
 
-        std::string shdrLower = obj.shdr;
-        std::transform(shdrLower.begin(), shdrLower.end(), shdrLower.begin(), ::tolower);
-        const bool isDecalReceiver =
-            shdrLower.find("decalreceive") != std::string::npos ||
-            shdrLower.find("decal_receive") != std::string::npos;
-        bool isValidDecal = !isDecalReceiver &&
-                            ((shdrLower == "shd:decal") ||
-                             (shdrLower.find("decal") != std::string::npos) ||
-                             obj.isDecal);
-        if (!isValidDecal) continue;
-        validCount++;
+        size_t drawIdx = 0;
+        for (const auto& obj : draws) {
+            ++drawIdx;
+            if (!obj.isStatic || !isRenderableDecal(obj)) continue;
+
+            BatchKey key;
+            key.tex[0] = obj.tex[0];
+            key.tex[3] = obj.tex[3];
+            key.receivesDecals = false;
+            key.shaderHash = 0xDECAL;
+
+            auto it = batches_.find(key);
+            if (it == batches_.end()) {
+                it = batches_.emplace(key, DrawBatch{key}).first;
+            }
+            DrawBatch& batch = it->second;
+            batch.key = key;
+            auto& staticCommands = staticBatchCommands[key];
+            auto& staticDrawIdxs = staticBatchDrawIndices_[key];
+            auto& staticInstanceDrawIdxs = staticBatchInstanceDrawIndices_[key];
+            const uint32_t baseInstance = static_cast<uint32_t>(staticModelMatrices.size());
+            bool matrixAllocated = false;
+            auto ensureMatrix = [&]() {
+                if (!matrixAllocated) {
+                    staticModelMatrices.push_back(obj.worldMatrix);
+                    glm::vec4 params;
+                    params.x = obj.localBoxMin.x;
+                    params.y = obj.localBoxMin.y;
+                    params.z = obj.localBoxMin.z;
+                    params.w = obj.localBoxMax.x;
+                    staticDecalParamsPacked_.push_back(params);
+
+                    glm::vec4 params2;
+                    params2.x = obj.localBoxMax.y;
+                    params2.y = obj.localBoxMax.z;
+                    params2.z = obj.decalScale;
+                    params2.w = static_cast<float>(obj.cullMode);
+                    staticDecalParamsPacked_.push_back(params2);
+                    matrixAllocated = true;
+                }
+            };
+
+            const size_t srcIdx = drawIdx - 1;
+            if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+                auto& g = obj.mesh->groups[obj.group];
+                if (!IsValidGroupForDraw(obj, g)) continue;
+                ensureMatrix();
+                DrawCommand cmd{};
+                cmd.count = g.indexCount();
+                cmd.instanceCount = 0;
+                cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
+                cmd.baseVertex = 0;
+                cmd.baseInstance = baseInstance;
+                staticCommands.push_back(cmd);
+                staticDrawIdxs.push_back(srcIdx);
+                staticInstanceDrawIdxs.emplace_back(std::vector<size_t>{srcIdx});
+            } else {
+                for (size_t gi = 0; gi < obj.mesh->groups.size(); ++gi) {
+                    auto& g = obj.mesh->groups[gi];
+                    if (!IsValidGroupForDraw(obj, g)) continue;
+                    ensureMatrix();
+                    DrawCommand cmd{};
+                    cmd.count = g.indexCount();
+                    cmd.instanceCount = 0;
+                    cmd.firstIndex = obj.megaIndexOffset + g.firstIndex();
+                    cmd.baseVertex = 0;
+                    cmd.baseInstance = baseInstance;
+                    staticCommands.push_back(cmd);
+                    staticDrawIdxs.push_back(srcIdx);
+                    staticInstanceDrawIdxs.emplace_back(std::vector<size_t>{srcIdx});
+                }
+            }
+
+            active_.push_back(&batch);
+        }
+
+        staticMatrixCount = staticModelMatrices.size();
+        staticMatricesUploadedBySlot_.fill(false);
+        staticIndirectCommandsPacked_.clear();
+        staticIndirectOffsets_.clear();
+        staticCmdDrawIndices_.clear();
+        staticCmdInstanceOffsets_.clear();
+        staticCmdInstanceCounts_.clear();
+        staticCmdInstanceDrawIndices_.clear();
+        for (const auto& [k, staticCmds] : staticBatchCommands) {
+            if (!staticCmds.empty()) {
+                staticIndirectOffsets_[k] = staticIndirectCommandsPacked_.size();
+                staticIndirectCommandsPacked_.insert(staticIndirectCommandsPacked_.end(),
+                                                     staticCmds.begin(),
+                                                     staticCmds.end());
+                auto idxIt = staticBatchDrawIndices_.find(k);
+                auto instIdxIt = staticBatchInstanceDrawIndices_.find(k);
+                for (size_t cmdIdx = 0; cmdIdx < staticCmds.size(); ++cmdIdx) {
+                    const size_t representativeIdx =
+                        (idxIt != staticBatchDrawIndices_.end() && cmdIdx < idxIt->second.size())
+                            ? idxIt->second[cmdIdx]
+                            : 0u;
+                    staticCmdDrawIndices_.push_back(representativeIdx);
+                    staticCmdInstanceOffsets_.push_back(staticCmdInstanceDrawIndices_.size());
+
+                    if (instIdxIt != staticBatchInstanceDrawIndices_.end() &&
+                        cmdIdx < instIdxIt->second.size() &&
+                        !instIdxIt->second[cmdIdx].empty()) {
+                        const auto& refs = instIdxIt->second[cmdIdx];
+                        staticCmdInstanceDrawIndices_.insert(staticCmdInstanceDrawIndices_.end(),
+                                                             refs.begin(),
+                                                             refs.end());
+                        staticCmdInstanceCounts_.push_back(static_cast<uint32_t>(refs.size()));
+                    } else {
+                        staticCmdInstanceDrawIndices_.push_back(representativeIdx);
+                        staticCmdInstanceCounts_.push_back(1u);
+                    }
+                }
+                auto bit = batches_.find(k);
+                if (bit != batches_.end()) {
+                    bit->second.staticCommandCount = staticCmds.size();
+                }
+            }
+        }
+        staticIndirectUploadedBySlot_.fill(false);
+    } else {
+        staticMatrixCount = staticModelMatrices.size();
+    }
+
+    if (hasStaticCandidates &&
+        staticCmdInstanceOffsets_.size() == staticIndirectCommandsPacked_.size() &&
+        staticCmdInstanceCounts_.size() == staticIndirectCommandsPacked_.size()) {
+        bool changed = false;
+        for (size_t i = 0; i < staticIndirectCommandsPacked_.size(); ++i) {
+            const size_t offset = staticCmdInstanceOffsets_[i];
+            const size_t count = static_cast<size_t>(staticCmdInstanceCounts_[i]);
+            uint32_t visibleCount = 0;
+
+            if (offset < staticCmdInstanceDrawIndices_.size()) {
+                const size_t available = staticCmdInstanceDrawIndices_.size() - offset;
+                const size_t clampedCount = std::min(count, available);
+                for (size_t j = 0; j < clampedCount; ++j) {
+                    const size_t di = staticCmdInstanceDrawIndices_[offset + j];
+                    if (di < draws.size()) {
+                        const DrawCmd& obj = draws[di];
+                        if (!obj.disabled && isRenderableDecal(obj)) {
+                            ++visibleCount;
+                        }
+                    }
+                }
+            }
+
+            const uint32_t want = visibleCount;
+            if (staticIndirectCommandsPacked_[i].instanceCount != want) {
+                staticIndirectCommandsPacked_[i].instanceCount = want;
+                changed = true;
+            }
+        }
+        if (changed) {
+            staticIndirectUploadedBySlot_.fill(false);
+        }
+    }
+
+    for (const auto& obj : draws) {
+        if (!isRenderableDecal(obj)) continue;
+        if (obj.disabled) continue;
+        if (hasStaticCandidates && obj.isStatic) continue;
 
         BatchKey key;
         key.tex[0] = obj.tex[0];
@@ -628,7 +1376,8 @@ void DrawBatchSystem::cullDecals(const std::vector<DrawCmd>& draws) {
         if (it == batches_.end())
             it = batches_.emplace(key, DrawBatch{key}).first;
         DrawBatch& batch = it->second;
-        const uint32_t baseInstance = static_cast<uint32_t>(modelMatrices.size());
+        batch.key = key;
+        const uint32_t baseInstance = static_cast<uint32_t>(staticMatrixCount + modelMatrices.size());
         bool matrixAllocated = false;
         auto ensureMatrix = [&]() {
             if (!matrixAllocated) {
@@ -637,7 +1386,7 @@ void DrawBatchSystem::cullDecals(const std::vector<DrawCmd>& draws) {
             }
         };
 
-        if (obj.group >= 0 && obj.group < (int)obj.mesh->groups.size()) {
+        if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
             auto& g = obj.mesh->groups[obj.group];
             if (!IsValidGroupForDraw(obj, g)) continue;
             ensureMatrix();
@@ -659,7 +1408,7 @@ void DrawBatchSystem::cullDecals(const std::vector<DrawCmd>& draws) {
             params2.x = obj.localBoxMax.y;
             params2.y = obj.localBoxMax.z;
             params2.z = obj.decalScale;
-            params2.w = (float)obj.cullMode;
+            params2.w = static_cast<float>(obj.cullMode);
             batch.decalParams.push_back(params2);
 
             batch.commands.push_back(cmd);
@@ -686,25 +1435,33 @@ void DrawBatchSystem::cullDecals(const std::vector<DrawCmd>& draws) {
                 params2.x = obj.localBoxMax.y;
                 params2.y = obj.localBoxMax.z;
                 params2.z = obj.decalScale;
-                params2.w = (float)obj.cullMode;
+                params2.w = static_cast<float>(obj.cullMode);
                 batch.decalParams.push_back(params2);
 
                 batch.commands.push_back(cmd);
             }
         }
-
         active_.push_back(&batch);
+    }
+
+    if (hasStaticCandidates && !buildingStaticBatches) {
+        for (auto& [k, batch] : batches_) {
+            const bool hasDynamic = !batch.commands.empty();
+            auto sit = staticBatchCommands.find(k);
+            const bool hasStatic = sit != staticBatchCommands.end() && !sit->second.empty();
+            if (hasStatic && !hasDynamic) {
+                active_.push_back(&batch);
+            }
+        }
     }
 
     if (!active_.empty()) {
         std::sort(active_.begin(), active_.end(), BatchPtrLess);
         active_.erase(std::unique(active_.begin(), active_.end()), active_.end());
     }
-
-    (void)validCount;
 }
 
-void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTexturesToBind) {
+void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTexturesToBind, GLuint currentProgram) {
     const bool logThis = false;
     const int textureBindCount = std::min(numTexturesToBind, 12);
     GLuint samplerRepeatHandle = 0;
@@ -718,18 +1475,10 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
     }
 
     GLint receivesDecalsLoc = -1;
-    GLint currentProgram = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
     if (currentProgram != 0) {
-        static std::unordered_map<GLuint, GLint> receivesDecalsLocCache;
-        const GLuint program = static_cast<GLuint>(currentProgram);
-        auto it = receivesDecalsLocCache.find(program);
-        if (it != receivesDecalsLocCache.end()) {
-            receivesDecalsLoc = it->second;
-        } else {
-            receivesDecalsLoc = glGetUniformLocation(program, "ReceivesDecals");
-            receivesDecalsLocCache.emplace(program, receivesDecalsLoc);
-        }
+        // Resolve per flush from the currently linked program to avoid stale
+        // location reuse across program/context recreation or GL id reuse.
+        receivesDecalsLoc = glGetUniformLocation(currentProgram, "ReceivesDecals");
     }
 
     MegaBuffer::instance().bind();
@@ -828,39 +1577,17 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                   << " matrices (" << (modelMatrices.size() * sizeof(glm::mat4)) << " bytes)\n";
     }
 
-    struct PackedDrawRange {
-        size_t staticOffset = 0;
-        size_t staticCount = 0;
-        size_t dynamicOffset = 0;
-        size_t dynamicCount = 0;
-    };
-
     const bool useStaticIndirect = useStaticMatrixCache && !staticIndirectCommandsPacked_.empty();
     const size_t staticPackedCount = useStaticIndirect ? staticIndirectCommandsPacked_.size() : 0;
-    size_t dynamicPackedReserve = 0;
-    for (DrawBatch* batch : active_) {
+
+    dynamicPackedCommands_.clear();
+    packedRanges_.assign(active_.size(), PackedDrawRange{});
+
+    for (size_t i = 0; i < active_.size(); ++i) {
+        DrawBatch* batch = active_[i];
         if (!batch) continue;
-        bool hasStatic = false;
-        if (useStaticIndirect) {
-            auto staticCmdIt = staticBatchCommands.find(batch->key);
-            auto staticOffsetIt = staticIndirectOffsets_.find(batch->key);
-            hasStatic = staticCmdIt != staticBatchCommands.end() &&
-                        staticOffsetIt != staticIndirectOffsets_.end() &&
-                        !staticCmdIt->second.empty();
-        }
-        if (!hasStatic && batch->commands.empty()) continue;
-        dynamicPackedReserve += batch->commands.size();
-    }
+        PackedDrawRange& range = packedRanges_[i];
 
-    std::vector<DrawCommand> dynamicPackedCommands;
-    dynamicPackedCommands.reserve(dynamicPackedReserve);
-    std::unordered_map<DrawBatch*, PackedDrawRange> packedRanges;
-    packedRanges.reserve(active_.size());
-
-    for (DrawBatch* batch : active_) {
-        if (!batch) continue;
-
-        PackedDrawRange range{};
         if (useStaticIndirect) {
             auto staticCmdIt = staticBatchCommands.find(batch->key);
             auto staticOffsetIt = staticIndirectOffsets_.find(batch->key);
@@ -874,19 +1601,13 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
 
         const size_t dynamicCount = batch->commands.size();
         if (dynamicCount > 0) {
-            range.dynamicOffset = staticPackedCount + dynamicPackedCommands.size();
+            range.dynamicOffset = staticPackedCount + dynamicPackedCommands_.size();
             range.dynamicCount = dynamicCount;
-            dynamicPackedCommands.insert(dynamicPackedCommands.end(), batch->commands.begin(), batch->commands.end());
+            dynamicPackedCommands_.insert(dynamicPackedCommands_.end(), batch->commands.begin(), batch->commands.end());
         }
-
-        if (range.staticCount == 0 && range.dynamicCount == 0) {
-            continue;
-        }
-
-        packedRanges.emplace(batch, range);
     }
 
-    const size_t totalPackedCommands = staticPackedCount + dynamicPackedCommands.size();
+    const size_t totalPackedCommands = staticPackedCount + dynamicPackedCommands_.size();
     size_t indirectSlotBaseOffset = 0;
     auto& passIndirectBuffer = useStaticIndirect ? indirectBuffer : transientIndirectBuffer;
     size_t& passIndirectCapacity = useStaticIndirect ? indirectBufferCapacity_ : transientIndirectBufferCapacity_;
@@ -922,11 +1643,11 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                 staticIndirectUploadedBySlot_[slot] = true;
             }
 
-            if (!dynamicPackedCommands.empty()) {
+            if (!dynamicPackedCommands_.empty()) {
                 UploadRangeOrFallback(GL_DRAW_INDIRECT_BUFFER,
                                       static_cast<GLintptr>(indirectSlotBaseOffset + staticBytes),
-                                      dynamicPackedCommands.size() * sizeof(DrawCommand),
-                                      dynamicPackedCommands.data());
+                                      dynamicPackedCommands_.size() * sizeof(DrawCommand),
+                                      dynamicPackedCommands_.data());
             }
         }
     }
@@ -941,52 +1662,54 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
     }
 
     size_t totalDrawCalls = 0;
+    GLint lastStencilRef = std::numeric_limits<GLint>::min();
     if (totalPackedCommands > 0) {
         glBindBuffer(GL_DRAW_INDIRECT_BUFFER, passIndirectBuffer);
     }
 
-    for (DrawBatch* batch : active_) {
+    for (size_t i = 0; i < active_.size(); ++i) {
+        DrawBatch* batch = active_[i];
         if (!batch) continue;
-        auto rangeIt = packedRanges.find(batch);
-        if (rangeIt == packedRanges.end()) continue;
-        const PackedDrawRange& range = rangeIt->second;
+        const PackedDrawRange& range = packedRanges_[i];
+        if (range.staticCount == 0 && range.dynamicCount == 0) continue;
 
-        for (int i = 0; i < textureBindCount; ++i) {
+        for (int j = 0; j < textureBindCount; ++j) {
             GLuint textureHandle = 0;
             GLenum textureTarget = GL_TEXTURE_2D;
-            if (batch->key.tex[i] &&
-                batch->key.tex[i]->GetType() == NDEVC::Graphics::TextureType::TextureCube) {
+            if (batch->key.tex[j] &&
+                batch->key.tex[j]->GetType() == NDEVC::Graphics::TextureType::TextureCube) {
                 textureTarget = GL_TEXTURE_CUBE_MAP;
             }
-            if (batch->key.tex[i]) {
-                textureHandle = *(GLuint*)batch->key.tex[i]->GetNativeHandle();
+            if (batch->key.tex[j]) {
+                textureHandle = *(GLuint*)batch->key.tex[j]->GetNativeHandle();
             }
             if (textureHandle == 0) {
                 const auto& fallback = GetFallbackTextures();
-                if (textureTarget == GL_TEXTURE_CUBE_MAP || i == 9) {
+                if (textureTarget == GL_TEXTURE_CUBE_MAP || j == 9) {
                     textureHandle = fallback.blackCube;
                     textureTarget = GL_TEXTURE_CUBE_MAP;
-                } else if (i == 0 || i == 4 || i == 8) {
+                } else if (j == 0 || j == 4 || j == 8) {
                     textureHandle = fallback.white;
-                } else if (i == 2 || i == 6) {
+                } else if (j == 2 || j == 6) {
                     textureHandle = fallback.normal;
                 } else {
                     textureHandle = fallback.black;
                 }
             }
 
-            if (lastBoundTextures[i] != textureHandle || lastBoundTargets[i] != textureTarget) {
-                glActiveTexture(GL_TEXTURE0 + i);
-                if (lastBoundTargets[i] != textureTarget) {
-                    glBindTexture(lastBoundTargets[i] == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, 0);
+            if (lastBoundTextures[j] != textureHandle || lastBoundTargets[j] != textureTarget) {
+                glActiveTexture(GL_TEXTURE0 + j);
+                if (lastBoundTargets[j] != textureTarget) {
+                    glBindTexture(lastBoundTargets[j] == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, 0);
                 }
                 glBindTexture(textureTarget, textureHandle);
-                lastBoundTextures[i] = textureHandle;
-                lastBoundTargets[i] = textureTarget;
+                lastBoundTextures[j] = textureHandle;
+                lastBoundTargets[j] = textureTarget;
             }
-            if (lastBoundSamplers[i] != samplerRepeatHandle) {
-                glBindSampler(i, samplerRepeatHandle);
-                lastBoundSamplers[i] = samplerRepeatHandle;
+            const GLuint desiredSampler = (textureTarget == GL_TEXTURE_CUBE_MAP) ? 0u : samplerRepeatHandle;
+            if (lastBoundSamplers[j] != desiredSampler) {
+                glBindSampler(j, desiredSampler);
+                lastBoundSamplers[j] = desiredSampler;
             }
         }
 
@@ -994,7 +1717,11 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
             glUniform1i(receivesDecalsLoc, batch->key.receivesDecals ? 1 : 0);
         }
 
-        glStencilFunc(GL_ALWAYS, batch->key.receivesDecals ? 1 : 0, 0xFF);
+        const GLint stencilRef = batch->key.receivesDecals ? 1 : 0;
+        if (lastStencilRef != stencilRef) {
+            glStencilFunc(GL_ALWAYS, stencilRef, 0xFF);
+            lastStencilRef = stencilRef;
+        }
 
         if (range.staticCount > 0) {
             const uintptr_t byteOffset =
@@ -1031,7 +1758,6 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
 }
 
 void DrawBatchSystem::flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEVC::Graphics::ISampler* samplerClamp) {
-    constexpr bool kDecalDebugLog = false;
     GLuint samplerRepeatHandle = 0;
     GLuint samplerClampHandle = 0;
     if (samplerRepeat) {
@@ -1041,21 +1767,23 @@ void DrawBatchSystem::flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEV
         samplerClampHandle = *(GLuint*)samplerClamp->GetNativeHandle();
     }
     if (active_.empty()) {
-        if (kDecalDebugLog) {
-            std::cout << "[flushDecals] No active batches\n";
-        }
         return;
     }
 
-    if (kDecalDebugLog) {
-        std::cout << "[flushDecals] Active batches: " << active_.size() << ", Model matrices: " << modelMatrices.size() << "\n";
-    }
+    MegaBuffer::instance().bind();
 
-    if (!transientModelMatrixSSBO) glGenBuffers(1, transientModelMatrixSSBO.put());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, transientModelMatrixSSBO);
+    const bool useStaticMatrixCache = staticMatrixCount > 0;
+    auto& matrixSSBO = useStaticMatrixCache ? modelMatrixSSBO : transientModelMatrixSSBO;
+    size_t& matrixCapacity = useStaticMatrixCache ? modelMatrixSSBOCapacity_ : transientModelMatrixSSBOCapacity_;
+    uint32_t& matrixCursor = useStaticMatrixCache ? modelMatrixUploadCursor_ : transientModelMatrixUploadCursor_;
 
-    size_t needed = modelMatrices.size() * sizeof(glm::mat4);
-    if (needed > transientModelMatrixSSBOCapacity_) {
+    if (!matrixSSBO) glGenBuffers(1, matrixSSBO.put());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, matrixSSBO);
+
+    const size_t dynamicMatrixCount = modelMatrices.size();
+    const size_t totalMatrixCount = staticMatrixCount + dynamicMatrixCount;
+    const size_t needed = totalMatrixCount * sizeof(glm::mat4);
+    if (needed > matrixCapacity) {
         const size_t newCapRaw = needed ? (needed * 2) : sizeof(glm::mat4);
         const size_t newCap = AlignUp(newCapRaw, SsboOffsetAlignment());
         glBufferData(GL_SHADER_STORAGE_BUFFER,
@@ -1063,26 +1791,45 @@ void DrawBatchSystem::flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEV
                      nullptr,
                      GL_STREAM_DRAW);
         if (glGetError() == GL_NO_ERROR) {
-            transientModelMatrixSSBOCapacity_ = newCap;
+            matrixCapacity = newCap;
+            if (useStaticMatrixCache) {
+                staticMatricesUploadedBySlot_.fill(false);
+            }
         }
     }
-    if (needed > 0 && transientModelMatrixSSBOCapacity_ > 0) {
-        const uint32_t slot = NextUploadSlot(transientModelMatrixUploadCursor_);
-        const size_t slotBaseOffset = static_cast<size_t>(slot) * transientModelMatrixSSBOCapacity_;
-        UploadRangeOrFallback(GL_SHADER_STORAGE_BUFFER,
-                              static_cast<GLintptr>(slotBaseOffset),
-                              needed,
-                              modelMatrices.data());
+    if (needed > 0 && matrixCapacity > 0) {
+        const uint32_t slot = NextUploadSlot(matrixCursor);
+        const size_t slotBaseOffset = static_cast<size_t>(slot) * matrixCapacity;
+        const size_t staticBytes = useStaticMatrixCache ? (staticMatrixCount * sizeof(glm::mat4)) : 0;
 
-        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, transientModelMatrixSSBO,
+        if (staticBytes > 0 && !staticMatricesUploadedBySlot_[slot]) {
+            UploadRangeOrFallback(GL_SHADER_STORAGE_BUFFER,
+                                  static_cast<GLintptr>(slotBaseOffset),
+                                  staticBytes,
+                                  staticModelMatrices.data());
+            staticMatricesUploadedBySlot_[slot] = true;
+        }
+
+        if (dynamicMatrixCount > 0) {
+            const size_t dynamicBytes = dynamicMatrixCount * sizeof(glm::mat4);
+            UploadRangeOrFallback(GL_SHADER_STORAGE_BUFFER,
+                                  static_cast<GLintptr>(slotBaseOffset + staticBytes),
+                                  dynamicBytes,
+                                  modelMatrices.data());
+        }
+
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, matrixSSBO,
                           static_cast<GLintptr>(slotBaseOffset),
                           static_cast<GLsizeiptr>(needed));
     }
 
     decalParamsBuffer.clear();
-    decalParamsBuffer.resize(modelMatrices.size() * 2u, glm::vec4(0.0f));
+    decalParamsBuffer.resize(totalMatrixCount * 2u, glm::vec4(0.0f));
+    if (useStaticMatrixCache && staticDecalParamsPacked_.size() == staticMatrixCount * 2u) {
+        std::copy(staticDecalParamsPacked_.begin(), staticDecalParamsPacked_.end(), decalParamsBuffer.begin());
+    }
     for (DrawBatch* batch : active_) {
-        if (batch->commands.empty()) continue;
+        if (!batch) continue;
         for (size_t i = 0; i < batch->commands.size(); ++i) {
             const size_t src = i * 2u;
             if (src + 1u >= batch->decalParams.size()) break;
@@ -1097,15 +1844,8 @@ void DrawBatchSystem::flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEV
 
     if (!decalParamsSSBO) glGenBuffers(1, decalParamsSSBO.put());
     if (!decalParamsBuffer.empty()) {
-        if (kDecalDebugLog) {
-            std::cout << "[flushDecals] DecalParams buffer size: " << decalParamsBuffer.size() << "\n";
-        }
-        if (kDecalDebugLog && decalParamsBuffer.size() >= 2) {
-            std::cout << "  First decal params[0]: " << decalParamsBuffer[0].x << ", " << decalParamsBuffer[0].y << ", " << decalParamsBuffer[0].z << ", " << decalParamsBuffer[0].w << "\n";
-            std::cout << "  First decal params[1]: " << decalParamsBuffer[1].x << ", " << decalParamsBuffer[1].y << ", " << decalParamsBuffer[1].z << ", " << decalParamsBuffer[1].w << "\n";
-        }
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, decalParamsSSBO);
-        size_t dataSize = decalParamsBuffer.size() * sizeof(glm::vec4);
+        const size_t dataSize = decalParamsBuffer.size() * sizeof(glm::vec4);
         if (dataSize > decalParamsSSBOCapacity_) {
             const size_t newCapRaw = dataSize * 2;
             const size_t newCap = AlignUp(newCapRaw, SsboOffsetAlignment());
@@ -1130,70 +1870,105 @@ void DrawBatchSystem::flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEV
         }
     }
 
-    struct PackedDrawRange {
-        size_t offset = 0;
-        size_t count = 0;
-    };
-
-    std::vector<DrawCommand> packedCommands;
-    size_t totalCommands = 0;
+    const bool useStaticIndirect = useStaticMatrixCache && !staticIndirectCommandsPacked_.empty();
+    const size_t staticPackedCount = useStaticIndirect ? staticIndirectCommandsPacked_.size() : 0;
+    size_t dynamicPackedReserve = 0;
+    packedRanges_.assign(active_.size(), PackedDrawRange{});
     for (DrawBatch* batch : active_) {
         if (!batch) continue;
-        totalCommands += batch->commands.size();
-    }
-    packedCommands.reserve(totalCommands);
-    std::unordered_map<DrawBatch*, PackedDrawRange> packedRanges;
-    packedRanges.reserve(active_.size());
-
-    for (DrawBatch* batch : active_) {
-        if (!batch || batch->commands.empty()) continue;
-        PackedDrawRange range{};
-        range.offset = packedCommands.size();
-        range.count = batch->commands.size();
-        packedCommands.insert(packedCommands.end(), batch->commands.begin(), batch->commands.end());
-        packedRanges.emplace(batch, range);
+        bool hasStatic = false;
+        if (useStaticIndirect) {
+            auto staticCmdIt = staticBatchCommands.find(batch->key);
+            auto staticOffsetIt = staticIndirectOffsets_.find(batch->key);
+            hasStatic = staticCmdIt != staticBatchCommands.end() &&
+                        staticOffsetIt != staticIndirectOffsets_.end() &&
+                        !staticCmdIt->second.empty();
+        }
+        if (!hasStatic && batch->commands.empty()) continue;
+        dynamicPackedReserve += batch->commands.size();
     }
 
+    dynamicPackedCommands_.clear();
+    dynamicPackedCommands_.reserve(dynamicPackedReserve);
+
+    for (size_t i = 0; i < active_.size(); ++i) {
+        DrawBatch* batch = active_[i];
+        if (!batch) continue;
+        PackedDrawRange& range = packedRanges_[i];
+        if (useStaticIndirect) {
+            auto staticCmdIt = staticBatchCommands.find(batch->key);
+            auto staticOffsetIt = staticIndirectOffsets_.find(batch->key);
+            if (staticCmdIt != staticBatchCommands.end() &&
+                staticOffsetIt != staticIndirectOffsets_.end() &&
+                !staticCmdIt->second.empty()) {
+                range.staticOffset = staticOffsetIt->second;
+                range.staticCount = staticCmdIt->second.size();
+            }
+        }
+
+        const size_t dynamicCount = batch->commands.size();
+        if (dynamicCount > 0) {
+            range.dynamicOffset = staticPackedCount + dynamicPackedCommands_.size();
+            range.dynamicCount = dynamicCount;
+            dynamicPackedCommands_.insert(dynamicPackedCommands_.end(), batch->commands.begin(), batch->commands.end());
+        }
+    }
+
+    const size_t totalPackedCommands = staticPackedCount + dynamicPackedCommands_.size();
     size_t indirectSlotBaseOffset = 0;
-    if (!packedCommands.empty()) {
-        if (!transientIndirectBuffer) glGenBuffers(1, transientIndirectBuffer.put());
-        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, transientIndirectBuffer);
+    auto& passIndirectBuffer = useStaticIndirect ? indirectBuffer : transientIndirectBuffer;
+    size_t& passIndirectCapacity = useStaticIndirect ? indirectBufferCapacity_ : transientIndirectBufferCapacity_;
+    uint32_t& passIndirectCursor = useStaticIndirect ? indirectUploadCursor_ : transientIndirectUploadCursor_;
+    if (totalPackedCommands > 0) {
+        if (!passIndirectBuffer) glGenBuffers(1, passIndirectBuffer.put());
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, passIndirectBuffer);
 
-        const size_t neededBytes = packedCommands.size() * sizeof(DrawCommand);
-        if (neededBytes > transientIndirectBufferCapacity_) {
-            const size_t newCap = neededBytes ? (neededBytes * 2) : sizeof(DrawCommand);
+        const size_t neededIndirectBytes = totalPackedCommands * sizeof(DrawCommand);
+        if (neededIndirectBytes > passIndirectCapacity) {
+            const size_t newCap = neededIndirectBytes ? (neededIndirectBytes * 2) : sizeof(DrawCommand);
             glBufferData(GL_DRAW_INDIRECT_BUFFER,
                          static_cast<GLsizeiptr>(newCap * kUploadRingSize),
                          nullptr,
                          GL_STREAM_DRAW);
             if (glGetError() == GL_NO_ERROR) {
-                transientIndirectBufferCapacity_ = newCap;
+                passIndirectCapacity = newCap;
+                if (useStaticIndirect) {
+                    staticIndirectUploadedBySlot_.fill(false);
+                }
             }
         }
 
-        if (transientIndirectBufferCapacity_ > 0) {
-            const uint32_t slot = NextUploadSlot(transientIndirectUploadCursor_);
-            indirectSlotBaseOffset = static_cast<size_t>(slot) * transientIndirectBufferCapacity_;
-            UploadRangeOrFallback(GL_DRAW_INDIRECT_BUFFER,
-                                  static_cast<GLintptr>(indirectSlotBaseOffset),
-                                  neededBytes,
-                                  packedCommands.data());
+        if (passIndirectCapacity > 0) {
+            const uint32_t slot = NextUploadSlot(passIndirectCursor);
+            indirectSlotBaseOffset = static_cast<size_t>(slot) * passIndirectCapacity;
+            const size_t staticBytes = staticPackedCount * sizeof(DrawCommand);
+            if (useStaticIndirect && staticBytes > 0 && !staticIndirectUploadedBySlot_[slot]) {
+                UploadRangeOrFallback(GL_DRAW_INDIRECT_BUFFER,
+                                      static_cast<GLintptr>(indirectSlotBaseOffset),
+                                      staticBytes,
+                                      staticIndirectCommandsPacked_.data());
+                staticIndirectUploadedBySlot_[slot] = true;
+            }
+
+            if (!dynamicPackedCommands_.empty()) {
+                UploadRangeOrFallback(GL_DRAW_INDIRECT_BUFFER,
+                                      static_cast<GLintptr>(indirectSlotBaseOffset + staticBytes),
+                                      dynamicPackedCommands_.size() * sizeof(DrawCommand),
+                                      dynamicPackedCommands_.data());
+            }
         }
     }
 
-    if (!packedCommands.empty()) {
-        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, transientIndirectBuffer);
+    if (totalPackedCommands > 0) {
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, passIndirectBuffer);
     }
 
-    for (DrawBatch* batch : active_) {
-        if (!batch || batch->commands.empty()) continue;
-        auto rangeIt = packedRanges.find(batch);
-        if (rangeIt == packedRanges.end()) continue;
-        const PackedDrawRange& range = rangeIt->second;
-
-        if (kDecalDebugLog) {
-            std::cout << "[flushDecals] Batch: " << batch->commands.size() << " draws, tex[0]=" << batch->key.tex[0] << ", tex[3]=" << batch->key.tex[3] << "\n";
-        }
+    for (size_t i = 0; i < active_.size(); ++i) {
+        DrawBatch* batch = active_[i];
+        if (!batch) continue;
+        if (i >= packedRanges_.size()) continue;
+        const PackedDrawRange& range = packedRanges_[i];
+        if (range.staticCount == 0 && range.dynamicCount == 0) continue;
 
         GLuint tex0 = 0;
         if (batch->key.tex[0]) {
@@ -1211,12 +1986,22 @@ void DrawBatchSystem::flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEV
         glBindTexture(GL_TEXTURE_2D, tex3);
         glBindSampler(3, samplerClampHandle);
 
-        const uintptr_t byteOffset =
-            static_cast<uintptr_t>(indirectSlotBaseOffset + range.offset * sizeof(DrawCommand));
-        glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
-                                    reinterpret_cast<const void*>(byteOffset),
-                                    static_cast<GLsizei>(range.count),
-                                    0);
+        if (range.staticCount > 0) {
+            const uintptr_t byteOffset =
+                static_cast<uintptr_t>(indirectSlotBaseOffset + range.staticOffset * sizeof(DrawCommand));
+            glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
+                                        reinterpret_cast<const void*>(byteOffset),
+                                        static_cast<GLsizei>(range.staticCount),
+                                        0);
+        }
+        if (range.dynamicCount > 0) {
+            const uintptr_t byteOffset =
+                static_cast<uintptr_t>(indirectSlotBaseOffset + range.dynamicOffset * sizeof(DrawCommand));
+            glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
+                                        reinterpret_cast<const void*>(byteOffset),
+                                        static_cast<GLsizei>(range.dynamicCount),
+                                        0);
+        }
     }
 
     glBindSampler(2, 0);
