@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -105,8 +106,58 @@ public:
     void AppendModel(const std::string& path, const glm::vec3& pos,
                      const glm::quat& rot, const glm::vec3& scale);
     void LoadMap(const MapData* map);
+    void LoadMap(const MapData* map, const std::string& sourcePath);
     void ReloadMap();                        // reloads currentMapSourcePath_
     void Clear();                            // unloads everything
+
+    using SceneEntityId = uint64_t;
+    struct AuthoredEntity {
+        SceneEntityId id = 0;
+        SceneEntityId parentId = 0;  // 0 = root
+        std::string name;
+        std::string modelPath;
+        glm::vec3 position{0.0f};
+        glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+        glm::vec3 scale{1.0f};
+        bool enabled = true;
+        void* runtimeOwner = nullptr;
+    };
+    struct SceneAssetInfo {
+        std::string guid;
+        std::string name;
+        std::string sourcePath;
+        std::string mapPath;
+        bool dirty = false;
+        size_t entityCount = 0;
+    };
+    void CreateScene(const std::string& sceneName = "Untitled Scene");
+    bool OpenScene(const std::string& path);
+    bool SetActiveScene(const std::string& path);
+    bool SaveScene();
+    bool SaveScene(const std::string& path);
+    bool SaveSceneAs(const std::string& path);
+    void ImportMapAsEditableScene(const MapData* map, const std::string& sourcePath);
+    SceneEntityId CreateEntity(const std::string& name,
+                               const glm::vec3& pos = glm::vec3(0.0f),
+                               const glm::quat& rot = glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                               const glm::vec3& scale = glm::vec3(1.0f));
+    SceneEntityId CreateModelEntity(const std::string& modelPath,
+                                    const glm::vec3& pos,
+                                    const glm::quat& rot,
+                                    const glm::vec3& scale,
+                                    const std::string& name = "");
+    bool DestroyEntity(SceneEntityId id);
+    bool SetEntityTransform(SceneEntityId id,
+                            const glm::vec3& pos,
+                            const glm::quat& rot,
+                            const glm::vec3& scale);
+    bool SetEntityName(SceneEntityId id, const std::string& name);
+    SceneAssetInfo GetActiveSceneInfo() const;
+    bool HasActiveScenePath() const { return !activeScenePath_.empty(); }
+    bool IsSceneDirty() const { return activeSceneDirty_; }
+    const std::vector<AuthoredEntity>& GetAuthoredEntities() const { return authoredEntities_; }
+    SceneEntityId FindEntityIdByRuntimeOwner(void* owner) const;
+    size_t GetParticleNodeCount() const { return particleNodes.size(); }
 
     // Per-frame update: streaming tick, animation, particle attachment
     void Tick(double dt, const Camera& camera);
@@ -140,6 +191,33 @@ public:
         { return loadedModelRefCountByPath_; }
     const std::unordered_map<std::string, std::string>& GetLoadedMeshPaths() const
         { return loadedMeshByModelPath_; }
+
+    struct ExportSceneEntity {
+        std::string name;
+        std::string templateName;
+        glm::vec3   position{0.0f};
+        glm::vec4   rotation{0.0f, 0.0f, 0.0f, 1.0f};
+        glm::vec3   scale{1.0f};
+        bool        isStatic = true;
+        bool        isAlpha  = false;
+        bool        isDecal  = false;
+    };
+
+    struct ExportSceneSnapshot {
+        std::string sceneGuid;
+        std::string sceneName;
+        std::string mapPath;
+        std::string mapName;
+        MapInfo mapInfo{};
+        std::vector<ExportSceneEntity> entities;
+        std::vector<std::string> loadedModelPaths;
+        std::vector<std::string> loadedMeshPaths;
+        std::vector<std::string> loadedAnimPaths;
+        std::vector<std::string> loadedTexturePaths;
+        std::vector<std::string> loadedShaderNames;
+    };
+
+    ExportSceneSnapshot BuildExportSceneSnapshot(bool includeUnloadedDependencies = false) const;
     friend class DeferredRenderer;
 
 private:
@@ -228,6 +306,21 @@ private:
         const std::string& meshResourceId);
     void NotifyWebModelUnloaded(const std::string& modelPath,
         const std::string& meshResourceId);
+    AuthoredEntity* FindAuthoredEntity(SceneEntityId id);
+    const AuthoredEntity* FindAuthoredEntity(SceneEntityId id) const;
+    std::string BuildDefaultEntityName(const std::string& preferredBase) const;
+    std::string EnsureScenePathHasExtension(const std::string& path) const;
+    bool SaveSceneToPath(const std::string& path);
+    void MarkSceneDirty();
+    void RebindAuthoredRuntimeOwners();
+    void ClearAuthoredRuntimeOwners();
+    bool suppressSceneDirty_ = false;
+    uint64_t nextSceneEntityId_ = 1;
+    std::vector<AuthoredEntity> authoredEntities_;
+    std::string activeSceneGuid_;
+    std::string activeSceneName_ = "Untitled Scene";
+    std::string activeScenePath_;
+    bool activeSceneDirty_ = false;
 
     // ── Parity diagnostics state ───────────────────────────────────────
     ParityStage    parityStage_ = ParityStage::Idle;

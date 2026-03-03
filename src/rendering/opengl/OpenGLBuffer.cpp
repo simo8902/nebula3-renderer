@@ -37,6 +37,7 @@ GLenum OpenGLBuffer::BufferType2GL(BufferType type) {
         case BufferType::Index: return GL_ELEMENT_ARRAY_BUFFER;
         case BufferType::Uniform: return GL_UNIFORM_BUFFER;
         case BufferType::Indirect: return GL_DRAW_INDIRECT_BUFFER;
+        case BufferType::Storage: return GL_SHADER_STORAGE_BUFFER;
         default: return GL_ARRAY_BUFFER;
     }
 }

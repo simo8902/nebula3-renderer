@@ -6,12 +6,29 @@
 #include "Core/Logger.h"
 #include "Rendering/OpenGL/OpenGLShader.h"
 
+// Returns the base directory that contains the shaders/ folder.
+// Checks NDEVC_SOURCE_DIR env var first (set by the standalone player at startup),
+// then falls back to the compile-time SOURCE_DIR macro.
+static const std::string& GetShaderBaseDir() {
+    static const std::string s = []() -> std::string {
+        const char* ov = std::getenv("NDEVC_SOURCE_DIR");
+        return (ov && ov[0]) ? std::string(ov) : std::string(SOURCE_DIR);
+    }();
+    return s;
+}
+
+// Returns an absolute path to a shader file inside the shaders/ directory.
+// Temporary std::string lifetime is safe for c_str() use as a constructor argument.
+static std::string ShdrPath(const char* filename) {
+    return GetShaderBaseDir() + "/shaders/" + filename;
+}
+
 ShaderManager::ShaderManager() {
-    NC::LOGGING::Log("[SHADER_MGR] Constructor");
+    NC::LOGGING::Log("[SHADER_MGR] Constructor shaderBaseDir=", GetShaderBaseDir());
 
     shaderProgram = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/NDEVCdeferred.vert",
-               SOURCE_DIR "/shaders/NDEVCdeferred.frag"
+               ShdrPath("NDEVCdeferred.vert").c_str(),
+               ShdrPath("NDEVCdeferred.frag").c_str()
            );
 
     if (!shaderProgram->IsValid()) {
@@ -22,8 +39,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] NDEVCdeferred program ID: ", *(GLuint*)shaderProgram->GetNativeHandle());
 
     auto standardShaderProgram = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/standard.vert",
-               SOURCE_DIR "/shaders/standard.frag"
+               ShdrPath("standard.vert").c_str(),
+               ShdrPath("standard.frag").c_str()
            );
 
     if (!standardShaderProgram->IsValid()) {
@@ -32,8 +49,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready standard");
 
     auto particleShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/particle.vert",
-               SOURCE_DIR "/shaders/particle.frag"
+               ShdrPath("particle.vert").c_str(),
+               ShdrPath("particle.frag").c_str()
            );
 
     if (!particleShader->IsValid()) {
@@ -42,8 +59,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready particle");
 
     auto environmentShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/environment.vert",
-               SOURCE_DIR "/shaders/environment.frag"
+               ShdrPath("environment.vert").c_str(),
+               ShdrPath("environment.frag").c_str()
            );
     if (!environmentShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Environment shader init failed");
@@ -51,8 +68,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready environment");
 
     auto environmentAlphaShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/environment.vert",
-               SOURCE_DIR "/shaders/environment_alpha.frag"
+               ShdrPath("environment.vert").c_str(),
+               ShdrPath("environment_alpha.frag").c_str()
            );
     if (!environmentAlphaShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("EnvironmentAlpha shader init failed");
@@ -60,8 +77,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready environmentAlpha");
 
     auto simpleLayerShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/simplelayer.vert",
-               SOURCE_DIR "/shaders/simplelayer.frag",
+               ShdrPath("simplelayer.vert").c_str(),
+               ShdrPath("simplelayer.frag").c_str(),
                "#define SKINNING_MODE 2\n#define PASS 1\n",
                "#define PASS 3\n"
             );
@@ -71,8 +88,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready simplelayer");
 
     auto simpleLayerGBufferShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/simplelayer.vert",
-               SOURCE_DIR "/shaders/simplelayer.frag",
+               ShdrPath("simplelayer.vert").c_str(),
+               ShdrPath("simplelayer.frag").c_str(),
                "#define SKINNING_MODE 2\n#define PASS 2\n",
                "#define PASS 5\n"
             );
@@ -82,8 +99,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready simplelayer_gbuffer");
 
     auto simpleLayerGBufferClipShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/simplelayer.vert",
-               SOURCE_DIR "/shaders/simplelayer.frag",
+               ShdrPath("simplelayer.vert").c_str(),
+               ShdrPath("simplelayer.frag").c_str(),
                "#define SKINNING_MODE 2\n#define PASS 2\n",
                "#define PASS 4\n"
             );
@@ -93,8 +110,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready simplelayer_gbuffer_clip");
 
     auto simpleLayerShadowShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/simplelayer.vert",
-               SOURCE_DIR "/shaders/simplelayer.frag",
+               ShdrPath("simplelayer.vert").c_str(),
+               ShdrPath("simplelayer.frag").c_str(),
                "#define SKINNING_MODE 2\n#define PASS 3\n",
                "#define PASS 6\n"
             );
@@ -104,8 +121,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready simplelayer_shadow");
 
     auto simpleLayerDepthShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/simplelayer.vert",
-               SOURCE_DIR "/shaders/simplelayer.frag",
+               ShdrPath("simplelayer.vert").c_str(),
+               ShdrPath("simplelayer.frag").c_str(),
                "#define SKINNING_MODE 2\n#define PASS 4\n",
                "#define PASS 7\n"
             );
@@ -115,8 +132,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready simplelayer_depth");
 
     auto postAlphaUnlitShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/postalphaunlit.vert",
-               SOURCE_DIR "/shaders/postalphaunlit.frag"
+               ShdrPath("postalphaunlit.vert").c_str(),
+               ShdrPath("postalphaunlit.frag").c_str()
            );
     if (!postAlphaUnlitShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("PostAlphaUnlit shader init failed");
@@ -124,8 +141,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready postalphaunlit");
 
     auto decalShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/NDEVCdecal_mesh.vert",
-               SOURCE_DIR "/shaders/NDEVCdecal_mesh.frag"
+               ShdrPath("NDEVCdecal_mesh.vert").c_str(),
+               ShdrPath("NDEVCdecal_mesh.frag").c_str()
            );
     if (!decalShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Decal shader init failed");
@@ -133,8 +150,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready NDEVCdecal_mesh");
 
     auto refractionShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/refraction.vert",
-               SOURCE_DIR "/shaders/refraction.frag"
+               ShdrPath("refraction.vert").c_str(),
+               ShdrPath("refraction.frag").c_str()
            );
     if (!refractionShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Refraction shader init failed");
@@ -142,8 +159,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready refraction");
 
     auto waterShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               SOURCE_DIR "/shaders/water.vert",
-               SOURCE_DIR "/shaders/water.frag"
+               ShdrPath("water.vert").c_str(),
+               ShdrPath("water.frag").c_str()
            );
     if (!waterShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Water shader init failed");
@@ -151,8 +168,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready water");
 
     auto lightingShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-           SOURCE_DIR "/shaders/lighting.vert",
-           SOURCE_DIR "/shaders/lighting.frag"
+           ShdrPath("lighting.vert").c_str(),
+           ShdrPath("lighting.frag").c_str()
        );
     if (!lightingShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Lighting shader init failed");
@@ -160,8 +177,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready lighting");
 
     auto lightCompose = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-           SOURCE_DIR "/shaders/lighting.vert",
-           SOURCE_DIR "/shaders/lightCompose.frag"
+           ShdrPath("lighting.vert").c_str(),
+           ShdrPath("lightCompose.frag").c_str()
        );
     if (!lightCompose->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Lighting compose shader init failed");
@@ -169,8 +186,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready lightCompose");
 
     auto lightComposition = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-       SOURCE_DIR "/shaders/lighting.vert",
-       SOURCE_DIR "/shaders/lightComposition.frag"
+       ShdrPath("lighting.vert").c_str(),
+       ShdrPath("lightComposition.frag").c_str()
     );
     if (!lightComposition->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Lighting composition shader init failed");
@@ -178,8 +195,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready lightComposition");
 
     auto pointLight = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-   SOURCE_DIR "/shaders/pointLight.vert",
-   SOURCE_DIR "/shaders/pointLight.frag"
+   ShdrPath("pointLight.vert").c_str(),
+   ShdrPath("pointLight.frag").c_str()
     );
     if (!pointLight->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Point lighting shader init failed");
@@ -187,8 +204,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready pointLight");
 
     auto lightShadow = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-       SOURCE_DIR "/shaders/lightShadows.vert",
-       SOURCE_DIR "/shaders/lightShadows.frag"
+       ShdrPath("lightShadows.vert").c_str(),
+       ShdrPath("lightShadows.frag").c_str()
     );
     if (!lightShadow->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Light Shadows shader init failed");
@@ -196,8 +213,8 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready lightShadows");
 
     auto blitShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-       SOURCE_DIR "/shaders/blit.vert",
-       SOURCE_DIR "/shaders/blit.frag"
+       ShdrPath("blit.vert").c_str(),
+       ShdrPath("blit.frag").c_str()
     );
     if (!blitShader->IsValid()) {
         throw NC::Errors::LoggedRuntimeError("Blit shader init failed");
@@ -231,7 +248,7 @@ ShaderManager::ShaderManager() {
 
     NC::LOGGING::Log("[SHADER_MGR] Initialized with ", shaders.size(), " shaders");
 
-    std::filesystem::path shadersPath = SOURCE_DIR "/shaders/";
+    std::filesystem::path shadersPath(ShdrPath("").c_str());
     searchPaths.emplace_back(shadersPath);
 }
 
@@ -463,7 +480,6 @@ void ShaderManager::ReloadShader(const std::string& name) {
 }
 
 void ShaderManager::HandleFileDrop(const std::vector<std::string>& paths) {
-    std::lock_guard<std::mutex> lock(shaderMutex);
     NC::LOGGING::Log("[SHADER_MGR] HandleFileDrop count=", paths.size());
     for(const auto& path : paths) {
         NC::LOGGING::Log("[SHADER_MGR] HandleFileDrop path=", path);

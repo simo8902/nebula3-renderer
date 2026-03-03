@@ -86,15 +86,32 @@ void DeferredRenderer::ApplyDisabledDrawFlags() {
             dc.disabled = dc.userDisabled;
         }
     };
-    apply(solidDraws);
-    apply(alphaTestDraws);
     apply(simpleLayerDraws);
-    apply(environmentDraws);
     apply(environmentAlphaDraws);
     apply(waterDraws);
     apply(decalDraws);
     apply(refractionDraws);
     apply(postAlphaUnlitDraws);
+
+    // Apply and simultaneously count visible (non-disabled) objects for the UI.
+    uiCachedSolidVisible_ = 0;
+    for (auto& dc : solidDraws) {
+        dc.userDisabled = IsDrawDisabled(dc);
+        dc.disabled = dc.userDisabled;
+        if (!dc.disabled) ++uiCachedSolidVisible_;
+    }
+    uiCachedAlphaVisible_ = 0;
+    for (auto& dc : alphaTestDraws) {
+        dc.userDisabled = IsDrawDisabled(dc);
+        dc.disabled = dc.userDisabled;
+        if (!dc.disabled) ++uiCachedAlphaVisible_;
+    }
+    uiCachedEnvVisible_ = 0;
+    for (auto& dc : environmentDraws) {
+        dc.userDisabled = IsDrawDisabled(dc);
+        dc.disabled = dc.userDisabled;
+        if (!dc.disabled) ++uiCachedEnvVisible_;
+    }
 }
 
 

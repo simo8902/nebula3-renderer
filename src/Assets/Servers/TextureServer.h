@@ -97,6 +97,16 @@ public:
 
     bool hasCachedTextures() const { return !gTexCache.empty(); }
 
+    std::vector<std::string> GetLoadedTextureIds() const {
+        std::vector<std::string> out;
+        out.reserve(gTexCache.size());
+        for (const auto& [id, tex] : gTexCache) {
+            (void)tex;
+            out.push_back(id);
+        }
+        return out;
+    }
+
     GLuint64 getOrCreateBindlessHandle(GLuint texID) {
         if (!sBindlessSupported || texID == 0) return 0;
         auto it = bindlessHandles_.find(texID);

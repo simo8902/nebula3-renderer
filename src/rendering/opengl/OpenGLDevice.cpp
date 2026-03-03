@@ -7,6 +7,8 @@
 #include "Rendering/OpenGL/OpenGLRenderState.h"
 #include "Rendering/OpenGL/OpenGLBuffer.h"
 #include "Rendering/OpenGL/OpenGLSampler.h"
+#include "Core/Logger.h"
+#include <cstring>
 
 namespace NDEVC::Graphics::OpenGL {
 
@@ -16,6 +18,12 @@ OpenGLDevice::OpenGLDevice()
         boundTextures_[i] = 0;
         boundTextureTargets_[i] = GL_TEXTURE_2D;
     }
+    if (!GLAD_GL_ARB_shader_storage_buffer_object)
+        NC::LOGGING::Warning("[GL] GL_ARB_shader_storage_buffer_object not supported — SSBOs unavailable");
+    if (!GLAD_GL_ARB_shader_draw_parameters)
+        NC::LOGGING::Warning("[GL] GL_ARB_shader_draw_parameters not supported — gl_DrawID/gl_BaseVertex unavailable");
+    if (!GLAD_GL_ARB_gpu_shader_int64)
+        NC::LOGGING::Warning("[GL] GL_ARB_gpu_shader_int64 not supported — int64 uniforms unavailable");
 }
 
 std::shared_ptr<ITexture> OpenGLDevice::CreateTexture(const TextureDesc& desc) {
@@ -38,7 +46,18 @@ std::shared_ptr<ISampler> OpenGLDevice::CreateSampler(const SamplerDesc& desc) {
     return std::make_shared<OpenGLSampler>(desc);
 }
 
+void OpenGLDevice::BindStorageBuffer(IBuffer* buffer, uint32_t bindingPoint) {
+    const GLuint handle = buffer ? *(const GLuint*)buffer->GetNativeHandle() : 0;
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, bindingPoint, handle);
+}
+
 void OpenGLDevice::SetViewport(const Viewport& viewport) {
+    if (cachedViewport_.x     == viewport.x        && cachedViewport_.y        == viewport.y &&
+        cachedViewport_.width == viewport.width     && cachedViewport_.height   == viewport.height &&
+        cachedViewport_.minDepth == viewport.minDepth && cachedViewport_.maxDepth == viewport.maxDepth) {
+        return;
+    }
+    cachedViewport_ = viewport;
     glViewport((GLint)viewport.x, (GLint)viewport.y, (GLsizei)viewport.width, (GLsizei)viewport.height);
     glDepthRange(viewport.minDepth, viewport.maxDepth);
 }
@@ -79,10 +98,16 @@ void OpenGLDevice::ApplyRenderState(IRenderState* state) {
 
     const RenderStateDesc& desc = state->GetDesc();
 
-    ApplyDepthState(desc.depth);
-    ApplyBlendState(desc.blend);
-    ApplyRasterizerState(desc.rasterizer);
-    ApplyStencilState(desc.stencil);
+    const bool depthChanged   = !renderStateCacheValid_ || std::memcmp(&desc.depth,      &cachedRenderState_.depth,      sizeof(DepthState))     != 0;
+    const bool blendChanged   = !renderStateCacheValid_ || std::memcmp(&desc.blend,      &cachedRenderState_.blend,      sizeof(BlendState))     != 0;
+    const bool rastChanged    = !renderStateCacheValid_ || std::memcmp(&desc.rasterizer, &cachedRenderState_.rasterizer, sizeof(RasterizerState))!= 0;
+    const bool stencilChanged = !renderStateCacheValid_ || std::memcmp(&desc.stencil,    &cachedRenderState_.stencil,    sizeof(StencilState))   != 0;
+
+    if (depthChanged)   { ApplyDepthState(desc.depth);           cachedRenderState_.depth      = desc.depth; }
+    if (blendChanged)   { ApplyBlendState(desc.blend);           cachedRenderState_.blend      = desc.blend; }
+    if (rastChanged)    { ApplyRasterizerState(desc.rasterizer); cachedRenderState_.rasterizer = desc.rasterizer; }
+    if (stencilChanged) { ApplyStencilState(desc.stencil);       cachedRenderState_.stencil    = desc.stencil; }
+    renderStateCacheValid_ = true;
 }
 
 void OpenGLDevice::ApplyDepthState(const DepthState& depth) {

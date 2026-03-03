@@ -25,11 +25,16 @@ public:
     virtual std::shared_ptr<IBuffer> CreateBuffer(const BufferDesc& desc) = 0;
     virtual std::shared_ptr<ISampler> CreateSampler(const SamplerDesc& desc) = 0;
 
+    virtual void BindStorageBuffer(IBuffer* buffer, uint32_t bindingPoint) = 0;
+
     virtual void SetViewport(const Viewport& viewport) = 0;
     virtual void BindFramebuffer(IFramebuffer* fbo) = 0;
     virtual void BindTexture(ITexture* texture, uint32_t slot) = 0;
     virtual void BindSampler(ISampler* sampler, uint32_t slot) = 0;
     virtual void ApplyRenderState(IRenderState* state) = 0;
+
+    // Invalidates the render state cache. Call after raw GL state changes bypass the device API.
+    virtual void InvalidateRenderStateCache() {}
 
     virtual void Clear(bool color, bool depth, bool stencil,
         const glm::vec4& clearColor = glm::vec4(0),

@@ -58,6 +58,7 @@ struct DrawCmd {
 	bool hasPotentialTransformAnimation = false;
 	bool userDisabled = false;
 	bool disabled = false;
+	bool costControlDisabled = false; // set by ApplyDistanceCostControl; cleared on aggression restore
 	mutable bool frustumCulled = false;
 	bool isStatic = true;
 	uint32_t gpuMaterialIndex = UINT32_MAX;

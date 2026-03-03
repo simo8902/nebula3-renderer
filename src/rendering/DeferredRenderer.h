@@ -4,6 +4,31 @@
 #ifndef NDEVC_DEFERREDRENDERER_H
 #define NDEVC_DEFERREDRENDERER_H
 
+// ── Work/Play Mode Policy System ─────────────────────────────────────────
+enum class RenderMode { Work, Play };
+
+struct FramePolicy {
+	bool  editorLayoutEnabled      = true;
+	bool  viewportOnlyUI           = false;
+	bool  forceFullSceneVisible    = false;
+	bool  visibilityCullingEnabled = true;
+	bool  allowPVS                 = true;
+	bool  dirtyRenderingEnabled    = false;
+	bool  limitEditorPanelRefresh  = false;
+	int   targetFps                = 0;      // <= 0 means uncapped
+	float lodBias                  = 0.0f;
+	float maxDrawDistance          = 0.0f;   // 0 = unlimited
+	// Phase 2: visibility and quality control
+	float alphaReductionNearDist   = 200.0f;
+	float alphaReductionFarDist    = 600.0f;
+	float gpuBudgetMs              = 10.0f;
+	float cpuBudgetMs              = 8.0f;
+	int   highDetailRadiusChunks   = 2;
+	bool  budgetGovernorEnabled    = true;
+};
+
+FramePolicy BuildPolicy(RenderMode mode);
+
 #include "Rendering/Visibility/VisibilityGrid.h"
 #include "Rendering/Visibility/InternalVisibilityStage.h"
 #include "Rendering/Interfaces/IRenderer.h"
@@ -32,9 +57,68 @@
 #include "Animation/AnimatorNodeInstance.h"
 #include "Engine/SceneManager.h"
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
+#include <memory>
+#include <vector>
+
+// ── Phase 2: PVS Provider Interface ──────────────────────────────────────
+class IPVSProvider {
+public:
+	virtual ~IPVSProvider() = default;
+	virtual bool IsAvailable() const = 0;
+	virtual void FilterCells(const glm::vec3& viewPoint,
+	                         const std::vector<int>& inCells,
+	                         std::vector<int>& outCells) const = 0;
+};
+
+// ── Phase 2: Quality Tier & Budget Governor ──────────────────────────────
+enum class QualityTier : int { Full = 0, Reduced = 1, Minimum = 2 };
+
+struct BudgetGovernor {
+	QualityTier tier              = QualityTier::Full;
+	float lodBiasAdjust           = 0.0f;
+	float drawDistAdjust          = 0.0f;
+	float alphaAggressiveness     = 0.0f;   // 0..1
+	int   overBudgetCount         = 0;
+	int   underBudgetCount        = 0;
+
+	static constexpr int   kHysteresisFrames = 30;
+	static constexpr float kLodBiasStep      = 0.5f;
+	static constexpr float kDrawDistStep     = 200.0f;
+	static constexpr float kAlphaStep        = 0.25f;
+
+	void Update(double gpuMs, double cpuMs, float gpuBudget, float cpuBudget);
+	void Reset();
+};
+
+// ---------------------------------------------------------------------------
+// Rolling frame-time statistics — p50/p95/p99 for frame/cpu/swap
+// ---------------------------------------------------------------------------
+struct RollingStats {
+    static constexpr int kWindow = 600;
+    float buf[kWindow] = {};
+    int   pos   = 0;
+    int   count = 0;
+
+    void Push(float v) {
+        buf[pos % kWindow] = v;
+        ++pos;
+        if (count < kWindow) ++count;
+    }
+
+    float Percentile(float pct) const {
+        if (count == 0) return 0.0f;
+        float tmp[kWindow];
+        std::copy(buf, buf + count, tmp);
+        std::sort(tmp, tmp + count);
+        const int idx = static_cast<int>(pct * 0.01f * (count - 1) + 0.5f);
+        return tmp[std::max(0, std::min(idx, count - 1))];
+    }
+};
+
 
 class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	std::unique_ptr<NDEVC::Graphics::IGraphicsDevice> device_;
@@ -124,6 +208,12 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	};
 	std::vector<ShadowGeomGroup> solidShadowGeomGroups_;
 
+	// Shadow per-cascade command cache: reused when casters and view matrix are unchanged
+	glm::mat4 shadowGroupCacheViewMatrix_{0.0f};
+	bool shadowGroupCacheValid_ = false;
+	std::vector<glm::mat4>   shadowGroupCachedMatrices_[NUM_CASCADES];
+	std::vector<DrawCommand> shadowGroupCachedCommands_[NUM_CASCADES];
+
 	// SimpleLayer shadow instancing GPU resources (fix #4)
 	NDEVC::Graphics::GL::UniqueBuffer slShadowMatrixSSBO_;
 	size_t slShadowMatrixSSBOCapacity_ = 0;
@@ -157,6 +247,8 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	std::vector<float>        slGBufTilings_;
 	bool slGBufCacheValid_ = false;
 	uint64_t slGBufVisHash_ = 0;
+	glm::mat4 slCachedViewProj_{ 1.0f };
+	bool slViewProjCacheValid_ = false;
 
 	struct PointLight {
 		glm::vec3 position;
@@ -216,6 +308,8 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	std::vector<int> lastVisibleCells_; // previous frame's visible set (change detection)
 	InternalVisibilityStage visibilityStage_;
 	std::uint64_t visibilityStageFrameIndex_ = 0;
+	Camera::Frustum visCachedFrustum_{};
+	bool visFrustumCacheValid_ = false;
 
 	// Top-down isometric camera (Diablo 2 style): ~55° pitch, facing -Z, elevated above origin.
 	// Position is recentered above the map after load.
@@ -293,6 +387,7 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	void ShutdownImGui();
 	void RenderImGui();
 	void RenderEditorShell();
+	void RenderViewportOnlyImage();
 	void BuildEditorDockLayout(unsigned int dockspaceId);
 	void RenderLookAtPanel();
 	struct DisabledDrawKey {
@@ -441,17 +536,88 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 		// GPU timer query results (ms)
 		double gpuShadow    = 0.0;
 		double gpuGeometry  = 0.0;
+		double gpuGeomSolid = 0.0;
+		double gpuGeomAlpha = 0.0;
+		double gpuGeomSL    = 0.0;
+		double gpuGeomEnv   = 0.0;
 		double gpuDecal     = 0.0;
 		double gpuLighting  = 0.0;
 		double gpuForward   = 0.0;
 		int    fwdFlushCount = 0;
+        // ── Extended profiler fields ─────────────────────────────────────
+        // Pre-render CPU phases (previously unmeasured or discarded)
+        double inputPoll        = 0.0;  // camera + key input at frame start
+        double shaderReload     = 0.0;  // shaderManager->ProcessPendingReloads
+        double animationTick    = 0.0;  // animation update (was silently discarded)
+        double prePassSetup     = 0.0;  // frustum extract + GL baseline state reset
+        double materialSSBO     = 0.0;  // materialSSBO rebuild (sub-phase of rebuild)
+        double blitCompose      = 0.0;  // final blit / editor clear to backbuffer
+        // Forward pass GPU timer breakdown (per sub-pass)
+        double gpuEnvAlpha      = 0.0;
+        double gpuRefraction    = 0.0;
+        double gpuWater         = 0.0;
+        double gpuPostAlpha     = 0.0;
+        double gpuParticles     = 0.0;
+        // Derived summary (computed each log interval)
+        double fps              = 0.0;
+        double gpuTotal         = 0.0;  // sum of all gpu* fields
+        double cpuWork          = 0.0;  // frameTotal - swapBuffers
+        // Draw list sizes (populated after PrepareDrawLists)
+        int solidCount          = 0;
+        int alphaCount          = 0;
+        int slCount             = 0;
+        int envCount            = 0;
+        int envAlphaCount       = 0;
+        int decalCount          = 0;
+        int waterCount          = 0;
+        int refractionCount     = 0;
+        int postAlphaCount      = 0;
+        int particleCount       = 0;
+        int animatedCount       = 0;
+        // Batch metrics (populated after geometry pass)
+        int solidBatchCount     = 0;
+        int alphaBatchCount     = 0;
+        int envBatchCount       = 0;
+        int decalBatchCount     = 0;
+        // Work/Play mode profiler fields
+        int  renderMode            = 0;  // 0=Work, 1=Play
+        int  dirtyFrameSkipped     = 0;  // 1 if this frame was skipped by dirty rendering
+        float panelUpdateHzEffective = 0.0f;
+        // Phase 2: visibility & quality metrics
+        int   visCellsTotal        = 0;
+        int   visCellsFrustum      = 0;
+        int   visCellsAfterPVS     = 0;
+        int   visCellsHigh         = 0;
+        int   visCellsLow          = 0;
+        int   visObjectsAfterGate  = 0;
+        int   alphaReduced         = 0;
+        int   decalReduced         = 0;
+        int   envAlphaReduced      = 0;
+        int   postAlphaReduced     = 0;
+        int   qualityTier          = 0;
+        float governorLodBias      = 0.0f;
+        float governorAlphaAggr    = 0.0f;
 	};
 	FrameProfile frameProfile_;
 	int profileFrameCounter_ = 0;
-	static constexpr int kProfileLogInterval = 300;
+	static constexpr int kProfileLogInterval = 1200;
 	static constexpr int kGpuQueryCount = 5;
-	GLuint gpuQueries_[kGpuQueryCount] = {};
-	bool gpuQueriesInit_ = false;
+    static constexpr int kGpuQueryBufs = 2;
+	static constexpr int kGpuGeomPhaseCount = 4;
+	static constexpr int kGpuGeomTimestampQueryCount = kGpuGeomPhaseCount * 2;
+	GLuint gpuQueriesDB_[kGpuQueryBufs][kGpuQueryCount] = {};
+	GLuint gpuGeomTsDB_[kGpuQueryBufs][kGpuGeomTimestampQueryCount] = {};
+	bool   gpuQueriesInit_     = false;
+	int    gpuQueryBufWrite_   = 0;   // write-side buffer index (0 or 1)
+	bool   gpuQueryBufsReady_  = false; // true once both buffers have been written
+    static constexpr int kGpuFwdPhaseCount = 5;
+    static constexpr int kGpuFwdTimestampQueryCount = kGpuFwdPhaseCount * 2;
+    GLuint gpuFwdTsDB_[kGpuQueryBufs][kGpuFwdTimestampQueryCount] = {};
+
+    // Rolling percentile trackers (p50/p95/p99)
+    RollingStats rsFrame_;
+    RollingStats rsCpu_;
+    RollingStats rsSwap_;
 
 	// Frame-level fence sync for GPU pacing (Patch #11)
 	static constexpr int kMaxFramesInFlight = 2;
@@ -492,10 +658,80 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	size_t envAlphaMaterialSSBOCount_ = 0;
 	void buildEnvAlphaMaterialSSBO();
 
+	// ── Work/Play Mode Policy State ─────────────────────────────────────
+	RenderMode   renderMode_       = RenderMode::Work;
+	FramePolicy  activePolicy_     = {};
+	bool         modeSwitchPending_ = false;
+
+	// Dirty-frame tracking: skip expensive passes when nothing changed
+	bool   dirtyFlag_              = true;   // starts dirty so first frame always renders
+	bool   dirtyFrameSkippedLast_  = false;
+	glm::mat4 dirtyLastViewMatrix_       = glm::mat4(0.0f);
+	glm::mat4 dirtyLastProjectionMatrix_ = glm::mat4(0.0f);
+	int    dirtyLastWidth_         = 0;
+	int    dirtyLastHeight_        = 0;
+	int    dirtyLastSelectedIndex_ = -2;     // sentinel: different from initial -1
+
+	void MarkDirty();
+	bool ConsumeDirty();
+	void HandleDroppedPaths();
+	bool ProcessPendingDroppedMapLoad(double currentFrame);
+	void QueueDroppedMapLoad(const std::string& mapDropPath);
+
+	// Editor panel refresh rate limiting (reserved for future retained-mode approach)
+	double panelLastUpdateTime_    = 0.0;
+	float  panelEffectiveHz_       = 60.0f;
+	static constexpr float kPanelIdleHz   = 15.0f;
+	static constexpr float kPanelActiveHz = 60.0f;
+	std::vector<std::string> pendingDroppedPaths_;
+	enum class MapDropLoadStage : int {
+		Idle = 0,
+		Queued,
+		LoadFile,
+		ApplyScene,
+		Complete,
+		Failed
+	};
+	MapDropLoadStage mapDropLoadStage_ = MapDropLoadStage::Idle;
+	std::string mapDropLoadPath_;
+	std::unique_ptr<MapData> mapDropLoadedMap_;
+	double mapDropLoadStartSec_ = 0.0;
+	double mapDropLoadFileSec_ = 0.0;
+	double mapDropLoadApplySec_ = 0.0;
+	double mapDropLoadTotalSec_ = 0.0;
+	double mapDropLoadDisplayUntilSec_ = 0.0;
+	float mapDropLoadProgress_ = 0.0f;
+	std::string mapDropLoadStatus_;
+
+	void ApplyPolicy(const FramePolicy& policy);
+	void LogPolicySnapshot(const char* reason) const;
+
+	// ── Phase 2: PVS, Budget Governor, Cost Control ────────────────────
+	std::unique_ptr<IPVSProvider> pvsProvider_;
+	BudgetGovernor budgetGovernor_;
+	QualityTier    lastAppliedTier_ = QualityTier::Full;
+	int costControlAlphaReduced_     = 0;
+	int costControlDecalReduced_     = 0;
+	int costControlEnvAlphaReduced_  = 0;
+	int costControlPostAlphaReduced_ = 0;
+	int visCellsHighDetail_          = 0;
+	int visCellsLowDetail_           = 0;
+
+	void ApplyDistanceCostControl(const glm::vec3& visCenter);
+	void ClassifyChunkDetail(const glm::vec3& visCenter);
+	void UpdateBudgetGovernor();
+
+	// CachedUI visible-object counts — updated in ApplyDisabledDrawFlags(), read by RenderEditorShell().
+	int uiCachedSolidVisible_ = 0;
+	int uiCachedAlphaVisible_ = 0;
+	int uiCachedEnvVisible_   = 0;
+
 	DrawCmd cachedObj;
 	int cachedIndex = -1;
 	bool imguiInitialized = false;
+	bool imguiDockingAvailable_ = false; // set at ImGui init, constrains mode switch
 	bool editorModeEnabled_ = false;
+	bool imguiViewportOnly_ = false;
 	bool editorDockInitialized_ = false;
 	float editorToolbarHeight_ = 44.0f;
 	float sceneViewportX_ = 0.0f;
@@ -605,5 +841,8 @@ public:
 	SceneManager& GetScene() override;
 	Camera& GetCamera() override;
 	const Camera& GetCamera() const override;
+
+	RenderMode GetRenderMode() const;
+	void SetRenderMode(RenderMode mode);
 };
 #endif

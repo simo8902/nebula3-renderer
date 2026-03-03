@@ -49,7 +49,7 @@ namespace Particles {
         void Render(const glm::mat4& viewProj, const glm::mat4& view, const glm::mat4& invView,
                     const glm::vec3& eyePos, const glm::vec2& fogDistances, const glm::vec4& fogColor,
                     const glm::mat4& emitterTransform, uint32_t numParticles, uint32_t baseInstance,
-                    GLuint texture, GLuint gPositionVSTex, const glm::vec2& invViewport,
+                    GLuint texture, GLuint gPositionWSTex, const glm::vec2& invViewport,
                     int numAnimPhases, float animFramesPerSecond, float time, bool billboard,
                     int colorMode, float intensity0, float emissiveIntensity);
 

@@ -73,6 +73,16 @@ public:
         meshCache.clear();
     }
 
+    std::vector<std::string> GetLoadedMeshIds() const {
+        std::vector<std::string> out;
+        out.reserve(meshCache.size());
+        for (const auto& [id, mesh] : meshCache) {
+            (void)mesh;
+            out.push_back(id);
+        }
+        return out;
+    }
+
 private:
     MeshServer() = default;
     std::unordered_map<std::string, std::unique_ptr<Mesh>> meshCache;

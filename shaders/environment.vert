@@ -1,5 +1,9 @@
 #version 460 core
 
+#ifdef BINDLESS
+#extension GL_ARB_gpu_shader_int64 : require
+#endif
+
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in vec2 texcoord0;
@@ -14,7 +18,19 @@ uniform mat4 view;
 uniform mat4 model;
 uniform mat4 JointMatrices[128];
 uniform int UseSkinning;
+uniform int UseInstancing;
 uniform mat4 textureTransform0;
+
+layout(binding = 1, std430) readonly buffer ModelMatrixBuffer {
+    mat4 models[];
+};
+
+#ifdef BINDLESS
+layout(binding = 3, std430) readonly buffer MaterialIndexBuffer {
+    uint matIndices[];
+};
+flat out uint vMaterialID;
+#endif
 
 out vec3 vWorldPos;
 out vec3 vViewPos;
@@ -44,11 +60,13 @@ void main() {
         lb = mat3(m) * lb;
     }
 
-    vec4 wpos = model * lp;
+    mat4 modelMat = (UseInstancing > 0) ? models[gl_BaseInstance + gl_InstanceID] : model;
+
+    vec4 wpos = modelMat * lp;
     vWorldPos = wpos.xyz;
     vViewPos = (view * wpos).xyz;
 
-    mat3 nM = transpose(inverse(mat3(model)));
+    mat3 nM = mat3(modelMat);
     vec3 N = normalize(nM * ln);
     vec3 T = normalize(nM * lt);
     T = normalize(T - N * dot(T, N));
@@ -62,6 +80,10 @@ void main() {
 
     vUV  = (textureTransform0 * vec4(texcoord0, 0.0, 1.0)).xy;
     vUV1 = (textureTransform0 * vec4(texcoord1, 0.0, 1.0)).xy;
+
+#ifdef BINDLESS
+    vMaterialID = matIndices[gl_BaseInstance + gl_InstanceID];
+#endif
 
     gl_Position = projection * view * wpos;
 }

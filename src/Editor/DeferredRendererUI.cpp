@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
+// Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
 #include "Rendering/DeferredRenderer.h"
@@ -20,10 +20,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -34,13 +37,13 @@
 #include "gtc/matrix_transform.hpp"
 #include "gtc/quaternion.hpp"
 #include "gtx/string_cast.hpp"
-#include "Assets/Model/ModelServer.h"
-#include "Assets/Servers/MeshServer.h"
-#include "Assets/Servers/TextureServer.h"
 #include "Assets/Map/MapHeader.h"
 #include "Assets/Particles/ParticleServer.h"
 #include "Core/Logger.h"
 #include "gtx/norm.hpp"
+#include "Export/ExportGraph.h"
+#include "Export/Cooker.h"
+#include "Export/StandaloneBuilder.h"
 
 namespace {
 bool ReadEditorEnvToggle(const char* name, bool defaultValue = false) {
@@ -189,17 +192,35 @@ bool DeferredRenderer::InitializeImGui() {
     GLFWwindow* glfwWin = static_cast<GLFWwindow*>(window_ ? window_->GetNativeHandle() : nullptr);
     if (!glfwWin) return false;
 
+    editorModeEnabled_ = ReadEditorEnvToggle("NDEVC_EDITOR_MODE");
+    editorViewportInputRouting_ = ReadEditorEnvToggle("NDEVC_EDITOR_ROUTE_INPUT", true);
+    imguiViewportOnly_ = ReadEditorEnvToggle("NDEVC_IMGUI_VIEWPORT_ONLY", false);
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    // Persist window positions, sizes, and dock layout between sessions.
-    // File is written next to the executable on shutdown via DestroyContext().
-    io.IniFilename = "n3_editor_layout.ini";
-    ApplyEditorTheme(io);
-    editorModeEnabled_ = ReadEditorEnvToggle("NDEVC_EDITOR_MODE");
-    editorViewportInputRouting_ = ReadEditorEnvToggle("NDEVC_EDITOR_ROUTE_INPUT", true);
+    if (imguiViewportOnly_) {
+        io.IniFilename = nullptr;
+        io.FontDefault = io.Fonts->AddFontDefault();
+        ImGui::StyleColorsDark();
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowPadding = ImVec2(0.0f, 0.0f);
+        style.WindowBorderSize = 0.0f;
+        style.ChildBorderSize = 0.0f;
+        style.FrameBorderSize = 0.0f;
+        style.AntiAliasedLines = false;
+        style.AntiAliasedLinesUseTex = false;
+        style.AntiAliasedFill = false;
+    } else if (editorModeEnabled_) {
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        io.IniFilename = "n3_editor_layout.ini";
+        ApplyEditorTheme(io);
+    } else {
+        // Standalone play mode: no editor chrome, no ini persistence.
+        io.IniFilename = nullptr;
+        ApplyEditorTheme(io);
+    }
 
     if (!ImGui_ImplGlfw_InitForOpenGL(glfwWin, true)) {
         ImGui::DestroyContext();
@@ -212,6 +233,7 @@ bool DeferredRenderer::InitializeImGui() {
     }
 
     imguiInitialized = true;
+    imguiDockingAvailable_ = editorModeEnabled_ && !imguiViewportOnly_;
     return true;
 }
 
@@ -248,21 +270,12 @@ void DeferredRenderer::RenderEditorShell() {
     sceneViewportHovered_ = false;
     sceneViewportFocused_ = false;
 
-    int solidTotal = static_cast<int>(solidDraws.size());
-    int solidVisible = 0;
-    for (const auto& d : solidDraws) {
-        if (!d.disabled) ++solidVisible;
-    }
-    int alphaTotal = static_cast<int>(alphaTestDraws.size());
-    int alphaVisible = 0;
-    for (const auto& d : alphaTestDraws) {
-        if (!d.disabled) ++alphaVisible;
-    }
-    int envTotal = static_cast<int>(environmentDraws.size());
-    int envVisible = 0;
-    for (const auto& d : environmentDraws) {
-        if (!d.disabled) ++envVisible;
-    }
+    const int solidTotal = static_cast<int>(solidDraws.size());
+    const int solidVisible = uiCachedSolidVisible_;
+    const int alphaTotal = static_cast<int>(alphaTestDraws.size());
+    const int alphaVisible = uiCachedAlphaVisible_;
+    const int envTotal = static_cast<int>(environmentDraws.size());
+    const int envVisible = uiCachedEnvVisible_;
     const int envAlphaTotal    = static_cast<int>(environmentAlphaDraws.size());
     const int simpleLayerTotal = static_cast<int>(simpleLayerDraws.size());
     const int decalTotal       = static_cast<int>(decalDraws.size());
@@ -280,10 +293,77 @@ void DeferredRenderer::RenderEditorShell() {
     const ImVec4 roseHighlight= ImVec4(0.910f, 0.478f, 0.627f, 1.00f); // #E87AA0
 
     // ── Menu Bar ──────────────────────────────────────────────────────────────
+    static bool exportModalOpen = false;
+    static bool workSceneCaptureRequested = false;
+    static bool createEmptySceneRequested = false;
+    static bool openScenePopupRequested = false;
+    static bool saveSceneAsPopupRequested = false;
+    static SceneManager::SceneEntityId selectedSceneEntityId = 0;
+    static char openScenePathBuf[512] = {};
+    static char saveScenePathBuf[512] = {};
+    static bool hasWorkSceneAsset = false;
+    static uint64_t workSceneRevision = 0;
+    static std::string workSceneAssetName = "WorkScene";
+    static NDEVC::Export::SceneDesc workSceneAsset;
+    // Dirty scene protection: deferred actions pending user confirmation
+    enum class PendingSceneAction : int { None, NewScene, OpenScene, ImportMap };
+    static PendingSceneAction pendingSceneAction = PendingSceneAction::None;
+    static std::string pendingActionPath;
+    static bool unsavedChangesModalRequested = false;
+
+    auto RequestSceneAction = [&](PendingSceneAction action, const std::string& actionPath = {}) {
+        if (scene_.IsSceneDirty()) {
+            pendingSceneAction = action;
+            pendingActionPath = actionPath;
+            unsavedChangesModalRequested = true;
+        } else {
+            if (action == PendingSceneAction::NewScene)      { createEmptySceneRequested = true; }
+            else if (action == PendingSceneAction::OpenScene){ openScenePopupRequested = true; }
+            else if (action == PendingSceneAction::ImportMap){ QueueDroppedMapLoad(actionPath); }
+        }
+    };
+
+    const SceneManager::SceneAssetInfo activeSceneInfo = scene_.GetActiveSceneInfo();
+    if (!activeSceneInfo.name.empty()) {
+        workSceneAssetName = activeSceneInfo.name;
+    }
+    const SceneManager::ExportSceneSnapshot liveSceneSnapshot = scene_.BuildExportSceneSnapshot();
+    const bool hasLiveSceneContent =
+        !liveSceneSnapshot.mapPath.empty() ||
+        !liveSceneSnapshot.entities.empty() ||
+        !liveSceneSnapshot.loadedModelPaths.empty() ||
+        !liveSceneSnapshot.loadedMeshPaths.empty() ||
+        !liveSceneSnapshot.loadedAnimPaths.empty() ||
+        !liveSceneSnapshot.loadedTexturePaths.empty();
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            ImGui::MenuItem("Open", "Ctrl+O", false, false);
-            ImGui::MenuItem("Save", "Ctrl+S", false, false);
+            if (ImGui::MenuItem("New Scene", "Ctrl+N")) {
+                RequestSceneAction(PendingSceneAction::NewScene);
+            }
+            if (ImGui::MenuItem("Open Scene...", "Ctrl+O")) {
+                if (!activeSceneInfo.sourcePath.empty()) {
+                    std::strncpy(openScenePathBuf, activeSceneInfo.sourcePath.c_str(), sizeof(openScenePathBuf) - 1);
+                    openScenePathBuf[sizeof(openScenePathBuf) - 1] = '\0';
+                }
+                RequestSceneAction(PendingSceneAction::OpenScene);
+            }
+            if (ImGui::MenuItem("Save", "Ctrl+S", false, scene_.HasActiveScenePath())) {
+                if (!scene_.SaveScene()) {
+                    saveSceneAsPopupRequested = true;
+                }
+            }
+            if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S")) {
+                if (!activeSceneInfo.sourcePath.empty()) {
+                    std::strncpy(saveScenePathBuf, activeSceneInfo.sourcePath.c_str(), sizeof(saveScenePathBuf) - 1);
+                } else {
+                    std::strncpy(saveScenePathBuf, "scene.ndscene", sizeof(saveScenePathBuf) - 1);
+                }
+                saveScenePathBuf[sizeof(saveScenePathBuf) - 1] = '\0';
+                saveSceneAsPopupRequested = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Export...", nullptr, false, hasLiveSceneContent))
+                exportModalOpen = true;
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Edit")) {
@@ -293,13 +373,546 @@ void DeferredRenderer::RenderEditorShell() {
         }
         if (ImGui::BeginMenu("View")) {
             if (ImGui::MenuItem("Reset Layout")) {
-                layoutResetPending   = true;   // force rebuild even if ini exists
+                layoutResetPending   = true;
                 editorDockInitialized_ = false;
             }
             ImGui::MenuItem("Route Input To Viewport", nullptr, &editorViewportInputRouting_);
+            ImGui::Separator();
+            ImGui::Checkbox("Visibility Culling", &enableVisibilityGrid_);
+            ImGui::Checkbox("Debug Cells", &debugShowVisibilityCells_);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Scene")) {
+            if (ImGui::MenuItem("New Empty Scene")) {
+                createEmptySceneRequested = true;
+            }
+            ImGui::Separator();
+            const bool canCaptureScene = (renderMode_ == RenderMode::Work) && hasLiveSceneContent;
+            if (ImGui::MenuItem("Create/Update Work Scene", nullptr, false, canCaptureScene)) {
+                workSceneCaptureRequested = true;
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("Active: %s%s",
+                                activeSceneInfo.name.empty() ? "Untitled Scene" : activeSceneInfo.name.c_str(),
+                                activeSceneInfo.dirty ? "*" : "");
+            ImGui::TextDisabled("Path: %s",
+                                activeSceneInfo.sourcePath.empty() ? "<unsaved>" : activeSceneInfo.sourcePath.c_str());
+            if (hasWorkSceneAsset) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Name: %s", workSceneAssetName.c_str());
+                ImGui::TextDisabled("Map: %s", workSceneAsset.mapPath.c_str());
+                ImGui::TextDisabled("Revision: %llu", static_cast<unsigned long long>(workSceneRevision));
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Mode")) {
+            const bool isWork = (renderMode_ == RenderMode::Work);
+            if (ImGui::MenuItem("Work Mode", "F1", isWork)) {
+                if (!isWork) SetRenderMode(RenderMode::Work);
+            }
+            if (ImGui::MenuItem("Play Mode", "F1", !isWork)) {
+                if (isWork) SetRenderMode(RenderMode::Play);
+            }
+            ImGui::Separator();
+            ImGui::MenuItem("Dirty Rendering", nullptr, &activePolicy_.dirtyRenderingEnabled);
+            ImGui::MenuItem("Budget Governor", nullptr, &activePolicy_.budgetGovernorEnabled);
+            ImGui::Separator();
+            if (activePolicy_.targetFps <= 0) {
+                ImGui::TextDisabled("FPS: uncapped");
+            } else {
+                ImGui::Text("FPS: %d (capped)", activePolicy_.targetFps);
+            }
+            const char* tierNames[] = { "Full", "Reduced", "Minimum" };
+            int tierIdx = static_cast<int>(budgetGovernor_.tier);
+            ImGui::Text("Quality: %s", tierNames[tierIdx]);
+            if (budgetGovernor_.lodBiasAdjust > 0.0f || budgetGovernor_.alphaAggressiveness > 0.0f) {
+                ImGui::TextDisabled("  lodAdj=%.1f alphaAggr=%.0f%%",
+                    budgetGovernor_.lodBiasAdjust,
+                    budgetGovernor_.alphaAggressiveness * 100.0f);
+            }
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
+    }
+
+    auto ResetEditorRuntimeState = [&](bool resetCamera) {
+        ClearDisabledDraws();
+        solidDraws.clear();
+        alphaTestDraws.clear();
+        decalDraws.clear();
+        particleDraws.clear();
+        environmentDraws.clear();
+        environmentAlphaDraws.clear();
+        simpleLayerDraws.clear();
+        refractionDraws.clear();
+        postAlphaUnlitDraws.clear();
+        waterDraws.clear();
+        animatedDraws.clear();
+        selectedObject = nullptr;
+        selectedIndex = -1;
+        selectedSceneEntityId = 0;
+        cachedObj = DrawCmd{};
+        cachedIndex = -1;
+        visibleCells_.clear();
+        lastVisibleCells_.clear();
+        visibilityStage_.Reset();
+        visibilityStageFrameIndex_ = 0;
+        visFrustumCacheValid_ = false;
+        scenePrepared = false;
+        if (resetCamera) {
+            camera_.setPosition(glm::vec3(0.0f, 0.0f, 5.0f));
+            camera_.lookAt(glm::vec3(0.0f, 0.0f, 0.0f));
+        }
+    };
+
+    if (openScenePopupRequested) {
+        ImGui::OpenPopup("Open Scene");
+        openScenePopupRequested = false;
+    }
+    if (saveSceneAsPopupRequested) {
+        ImGui::OpenPopup("Save Scene As");
+        saveSceneAsPopupRequested = false;
+    }
+    if (unsavedChangesModalRequested) {
+        ImGui::OpenPopup("Unsaved Changes");
+        unsavedChangesModalRequested = false;
+    }
+
+    // ── Unsaved Changes modal ──────────────────────────────────────────────
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("The scene '%s' has unsaved changes.",
+                    activeSceneInfo.name.empty() ? "Untitled Scene" : activeSceneInfo.name.c_str());
+        ImGui::Text("Do you want to save before continuing?");
+        ImGui::Spacing();
+        if (ImGui::Button("Save", ImVec2(100.0f, 0.0f))) {
+            if (scene_.HasActiveScenePath()) {
+                scene_.SaveScene();
+            } else {
+                std::strncpy(saveScenePathBuf, "scene.ndscene", sizeof(saveScenePathBuf) - 1);
+                saveSceneAsPopupRequested = true;
+            }
+            // Execute pending action (OpenScene with known path opens directly)
+            if (pendingSceneAction == PendingSceneAction::NewScene) {
+                createEmptySceneRequested = true;
+            } else if (pendingSceneAction == PendingSceneAction::OpenScene) {
+                if (!pendingActionPath.empty()) {
+                    if (scene_.OpenScene(pendingActionPath)) {
+                        ResetEditorRuntimeState(false); hasWorkSceneAsset = false; ++workSceneRevision; MarkDirty();
+                    }
+                } else { openScenePopupRequested = true; }
+            } else if (pendingSceneAction == PendingSceneAction::ImportMap) {
+                QueueDroppedMapLoad(pendingActionPath);
+            }
+            pendingSceneAction = PendingSceneAction::None;
+            pendingActionPath.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Save", ImVec2(100.0f, 0.0f))) {
+            if (pendingSceneAction == PendingSceneAction::NewScene) {
+                createEmptySceneRequested = true;
+            } else if (pendingSceneAction == PendingSceneAction::OpenScene) {
+                if (!pendingActionPath.empty()) {
+                    if (scene_.OpenScene(pendingActionPath)) {
+                        ResetEditorRuntimeState(false); hasWorkSceneAsset = false; ++workSceneRevision; MarkDirty();
+                    }
+                } else { openScenePopupRequested = true; }
+            } else if (pendingSceneAction == PendingSceneAction::ImportMap) {
+                QueueDroppedMapLoad(pendingActionPath);
+            }
+            pendingSceneAction = PendingSceneAction::None;
+            pendingActionPath.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0f, 0.0f))) {
+            pendingSceneAction = PendingSceneAction::None;
+            pendingActionPath.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(580.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Open Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputText("Scene Path", openScenePathBuf, sizeof(openScenePathBuf));
+        if (ImGui::Button("Open", ImVec2(100.0f, 0.0f))) {
+            if (scene_.OpenScene(openScenePathBuf)) {
+                ResetEditorRuntimeState(false);
+                workSceneAssetName = scene_.GetActiveSceneInfo().name;
+                hasWorkSceneAsset = false;
+                ++workSceneRevision;
+                MarkDirty();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0f, 0.0f))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(580.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Save Scene As", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputText("Scene Path", saveScenePathBuf, sizeof(saveScenePathBuf));
+        if (ImGui::Button("Save", ImVec2(100.0f, 0.0f))) {
+            if (scene_.SaveSceneAs(saveScenePathBuf)) {
+                MarkDirty();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0f, 0.0f))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    auto BuildSceneDescFromWorkState = [&](bool includeUnloadedDependencies = false) -> NDEVC::Export::SceneDesc {
+        namespace Ex = NDEVC::Export;
+        Ex::SceneDesc sceneDesc;
+        const SceneManager::ExportSceneSnapshot snapshot =
+            scene_.BuildExportSceneSnapshot(includeUnloadedDependencies);
+        sceneDesc.sceneGuid = snapshot.sceneGuid;
+        sceneDesc.sceneName = snapshot.sceneName;
+        sceneDesc.mapPath = snapshot.mapPath;
+        sceneDesc.mapName = snapshot.mapName;
+        sceneDesc.mapInfo = snapshot.mapInfo;
+
+        sceneDesc.entities.reserve(snapshot.entities.size());
+        for (const SceneManager::ExportSceneEntity& src : snapshot.entities) {
+            Ex::EntityDesc dst;
+            dst.name = src.name;
+            dst.templateName = src.templateName;
+            dst.position = src.position;
+            dst.rotation = src.rotation;
+            dst.scale = src.scale;
+            dst.isStatic = src.isStatic;
+            dst.isAlpha = src.isAlpha;
+            dst.isDecal = src.isDecal;
+            sceneDesc.entities.push_back(std::move(dst));
+        }
+
+        sceneDesc.requiredModelPaths = snapshot.loadedModelPaths;
+        sceneDesc.requiredMeshPaths = snapshot.loadedMeshPaths;
+        sceneDesc.requiredAnimPaths = snapshot.loadedAnimPaths;
+        sceneDesc.requiredTexturePaths = snapshot.loadedTexturePaths;
+        sceneDesc.requiredShaderNames = snapshot.loadedShaderNames;
+        return sceneDesc;
+    };
+
+    if (createEmptySceneRequested) {
+        createEmptySceneRequested = false;
+        scene_.CreateScene("Untitled Scene");
+        ResetEditorRuntimeState(true);
+        saveScenePathBuf[0] = '\0';
+        openScenePathBuf[0] = '\0';
+        workSceneAssetName = scene_.GetActiveSceneInfo().name;
+        workSceneAsset = BuildSceneDescFromWorkState();
+        hasWorkSceneAsset = true;
+        ++workSceneRevision;
+        MarkDirty();
+        NC::LOGGING::Log("[WORK_SCENE] Created empty scene with default camera");
+    }
+
+    if (!hasWorkSceneAsset &&
+        renderMode_ == RenderMode::Work &&
+        hasLiveSceneContent) {
+        workSceneAsset = BuildSceneDescFromWorkState();
+        hasWorkSceneAsset = true;
+        ++workSceneRevision;
+        NC::LOGGING::Log("[WORK_SCENE] Auto-created from Work Mode map=", workSceneAsset.mapPath,
+                         " revision=", static_cast<unsigned long long>(workSceneRevision));
+    }
+    if (hasWorkSceneAsset &&
+        renderMode_ == RenderMode::Work &&
+        hasLiveSceneContent &&
+        (workSceneAsset.mapPath != liveSceneSnapshot.mapPath || scene_.IsDrawListsDirty())) {
+        workSceneAsset = BuildSceneDescFromWorkState();
+        ++workSceneRevision;
+    }
+
+    if (workSceneCaptureRequested) {
+        workSceneCaptureRequested = false;
+        if (renderMode_ == RenderMode::Work && hasLiveSceneContent) {
+            workSceneAsset = BuildSceneDescFromWorkState();
+            hasWorkSceneAsset = true;
+            ++workSceneRevision;
+            NC::LOGGING::Log("[WORK_SCENE] Captured scene name=", workSceneAssetName,
+                             " map=", workSceneAsset.mapPath,
+                             " entities=", workSceneAsset.entities.size(),
+                             " models=", workSceneAsset.requiredModelPaths.size(),
+                             " meshes=", workSceneAsset.requiredMeshPaths.size(),
+                             " anims=", workSceneAsset.requiredAnimPaths.size(),
+                             " textures=", workSceneAsset.requiredTexturePaths.size(),
+                             " shaders=", workSceneAsset.requiredShaderNames.size(),
+                             " revision=", static_cast<unsigned long long>(workSceneRevision));
+        }
+    }
+
+    // ── Export Modal ──────────────────────────────────────────────────────────
+    if (exportModalOpen) {
+        ImGui::OpenPopup("Export Scene");
+        exportModalOpen = false;
+    }
+    const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Export Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        namespace Ex = NDEVC::Export;
+
+        static Ex::ExportProfile exportProfile = Ex::ExportProfile::Work;
+        static char exportOutDir[512]          = "C:/export";
+        static Ex::ExportReport lastReport     = {};
+        static bool hasLastResult              = false;
+        static bool exportRunning              = false;
+        // Standalone build state
+        static char standaloneExeName[128]             = "NDEVC";
+        static Ex::StandaloneBuildResult buildResult   = {};
+        static bool hasBuildResult                     = false;
+        static std::string lastNdpkPath;
+        static std::string lastStartupMapPath;
+        static std::vector<std::string> lastSourceAssets;
+
+        // Profile selector
+        const char* profileNames[] = { "Work", "Playtest", "Shipping" };
+        int profileIdx = static_cast<int>(exportProfile);
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::Combo("Profile", &profileIdx, profileNames, 3))
+            exportProfile = static_cast<Ex::ExportProfile>(profileIdx);
+
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("Output Dir", exportOutDir, sizeof(exportOutDir));
+        ImGui::SetNextItemWidth(200.0f);
+        ImGui::InputText("Exe Name", standaloneExeName, sizeof(standaloneExeName));
+        ImGui::Spacing();
+
+        const bool canCaptureScene = hasLiveSceneContent;
+        ImGui::BeginDisabled(!canCaptureScene);
+        if (ImGui::Button("Create/Update Scene", ImVec2(150.0f, 24.0f))) {
+            workSceneAsset = BuildSceneDescFromWorkState(true);
+            hasWorkSceneAsset = true;
+            ++workSceneRevision;
+            NC::LOGGING::Log("[WORK_SCENE] Captured scene name=", workSceneAssetName,
+                             " map=", workSceneAsset.mapPath,
+                             " entities=", workSceneAsset.entities.size(),
+                             " models=", workSceneAsset.requiredModelPaths.size(),
+                             " meshes=", workSceneAsset.requiredMeshPaths.size(),
+                             " anims=", workSceneAsset.requiredAnimPaths.size(),
+                             " textures=", workSceneAsset.requiredTexturePaths.size(),
+                             " shaders=", workSceneAsset.requiredShaderNames.size(),
+                             " revision=", static_cast<unsigned long long>(workSceneRevision));
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (hasWorkSceneAsset) {
+            ImGui::TextDisabled("scene: %s (rev %llu)", workSceneAssetName.c_str(),
+                                static_cast<unsigned long long>(workSceneRevision));
+        } else {
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.30f, 1.0f), "Create scene first (Work Mode).");
+        }
+        ImGui::TextDisabled("Loaded now: entities=%d models=%d meshes=%d anims=%d textures=%d shaders=%d",
+            static_cast<int>(liveSceneSnapshot.entities.size()),
+            static_cast<int>(liveSceneSnapshot.loadedModelPaths.size()),
+            static_cast<int>(liveSceneSnapshot.loadedMeshPaths.size()),
+            static_cast<int>(liveSceneSnapshot.loadedAnimPaths.size()),
+            static_cast<int>(liveSceneSnapshot.loadedTexturePaths.size()),
+            static_cast<int>(liveSceneSnapshot.loadedShaderNames.size()));
+        if (hasWorkSceneAsset) {
+            ImGui::TextDisabled("Captured scene: entities=%d models=%d meshes=%d anims=%d textures=%d shaders=%d",
+                static_cast<int>(workSceneAsset.entities.size()),
+                static_cast<int>(workSceneAsset.requiredModelPaths.size()),
+                static_cast<int>(workSceneAsset.requiredMeshPaths.size()),
+                static_cast<int>(workSceneAsset.requiredAnimPaths.size()),
+                static_cast<int>(workSceneAsset.requiredTexturePaths.size()),
+                static_cast<int>(workSceneAsset.requiredShaderNames.size()));
+        }
+        ImGui::Spacing();
+
+        const bool canExportScene = hasWorkSceneAsset || hasLiveSceneContent;
+        ImGui::BeginDisabled(exportRunning || !canExportScene);
+        const bool doExport = ImGui::Button("Export", ImVec2(120.0f, 26.0f));
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        // Build Standalone always performs a fresh export first.
+        ImGui::BeginDisabled(exportRunning || !canExportScene);
+        const bool doBuildStandalone = ImGui::Button("Build Standalone", ImVec2(150.0f, 26.0f));
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Close", ImVec2(80.0f, 26.0f)))
+            ImGui::CloseCurrentPopup();
+
+        if (doExport) {
+            exportRunning = true;
+
+            if (hasLiveSceneContent) {
+                workSceneAsset = BuildSceneDescFromWorkState(true);
+                hasWorkSceneAsset = true;
+                ++workSceneRevision;
+            } else if (!hasWorkSceneAsset) {
+                workSceneAsset = BuildSceneDescFromWorkState();
+                hasWorkSceneAsset = true;
+                ++workSceneRevision;
+            }
+            Ex::SceneDesc sceneDesc = workSceneAsset;
+            lastStartupMapPath = sceneDesc.mapPath;
+            lastSourceAssets.clear();
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    sceneDesc.requiredModelPaths.begin(),
+                                    sceneDesc.requiredModelPaths.end());
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    sceneDesc.requiredMeshPaths.begin(),
+                                    sceneDesc.requiredMeshPaths.end());
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    sceneDesc.requiredAnimPaths.begin(),
+                                    sceneDesc.requiredAnimPaths.end());
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    sceneDesc.requiredTexturePaths.begin(),
+                                    sceneDesc.requiredTexturePaths.end());
+
+            Ex::ExportContext ctx;
+            ctx.profile     = exportProfile;
+            ctx.settings    = Ex::Cooker::BuildSettings(exportProfile);
+            ctx.outputDir   = exportOutDir;
+            ctx.sourceScene = std::move(sceneDesc);
+
+            Ex::ExportGraph graph = Ex::BuildStandardGraph();
+            graph.Execute(ctx);
+
+            lastReport    = ctx.report;
+            lastNdpkPath  = ctx.outputPackagePath;
+            hasLastResult = true;
+            exportRunning = false;
+        }
+
+        // ── Build Standalone ──────────────────────────────────────────────
+        if (doBuildStandalone) {
+            // Always export first so standalone reflects the current scene state.
+            exportRunning = true;
+            if (hasLiveSceneContent) {
+                workSceneAsset = BuildSceneDescFromWorkState(true);
+                hasWorkSceneAsset = true;
+                ++workSceneRevision;
+            } else if (!hasWorkSceneAsset) {
+                workSceneAsset = BuildSceneDescFromWorkState();
+                hasWorkSceneAsset = true;
+                ++workSceneRevision;
+            }
+            Ex::SceneDesc autoSceneDesc = workSceneAsset;
+            lastStartupMapPath = autoSceneDesc.mapPath;
+            lastSourceAssets.clear();
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    autoSceneDesc.requiredModelPaths.begin(),
+                                    autoSceneDesc.requiredModelPaths.end());
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    autoSceneDesc.requiredMeshPaths.begin(),
+                                    autoSceneDesc.requiredMeshPaths.end());
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    autoSceneDesc.requiredAnimPaths.begin(),
+                                    autoSceneDesc.requiredAnimPaths.end());
+            lastSourceAssets.insert(lastSourceAssets.end(),
+                                    autoSceneDesc.requiredTexturePaths.begin(),
+                                    autoSceneDesc.requiredTexturePaths.end());
+            Ex::ExportContext autoCtx;
+            autoCtx.profile     = exportProfile;
+            autoCtx.settings    = Ex::Cooker::BuildSettings(exportProfile);
+            autoCtx.outputDir   = exportOutDir;
+            autoCtx.sourceScene = std::move(autoSceneDesc);
+            Ex::ExportGraph autoGraph = Ex::BuildStandardGraph();
+            autoGraph.Execute(autoCtx);
+            lastReport    = autoCtx.report;
+            lastNdpkPath  = autoCtx.outputPackagePath;
+            hasLastResult = true;
+            exportRunning = false;
+
+            if (!lastNdpkPath.empty() && std::filesystem::exists(lastNdpkPath)) {
+                Ex::StandaloneBuildConfig sbCfg;
+                sbCfg.outputDir       = std::string(exportOutDir) + "/standalone";
+                sbCfg.executableName  = standaloneExeName[0] ? standaloneExeName : "NDEVC";
+                sbCfg.sourceDir       = SOURCE_DIR;
+                sbCfg.ndpkPath        = lastNdpkPath;
+                sbCfg.startupMapPath  = lastStartupMapPath;
+                sbCfg.assetPaths      = lastSourceAssets;
+                buildResult    = Ex::BuildStandalone(sbCfg);
+                hasBuildResult = true;
+            } else {
+                buildResult = {};
+                buildResult.errorMsg = "Standalone build skipped: export did not produce a package.";
+                hasBuildResult = true;
+            }
+        }
+
+        if (hasLastResult) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            if (lastReport.success) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+                ImGui::TextUnformatted("\xe2\x9c\x94  Export succeeded");
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.30f, 0.30f, 1.0f));
+                ImGui::TextUnformatted("\xe2\x9c\x98  Export failed");
+            }
+            ImGui::PopStyleColor();
+            ImGui::Text("VRAM estimate: %.1f MB",
+                static_cast<double>(lastReport.totalVRAMEstimateBytes) / (1024.0 * 1024.0));
+            ImGui::Text("Draw calls:    %d",    lastReport.totalDrawCalls);
+            ImGui::Text("Frame cost:    %.2f ms", lastReport.frameCostEstimate);
+
+            if (!lastReport.issues.empty()) {
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.05f, 0.07f, 1.0f));
+                ImGui::BeginChild("##ExIssues", ImVec2(-1.0f, 120.0f), true);
+                ImGui::PopStyleColor();
+                for (const Ex::ExportIssue& iss : lastReport.issues) {
+                    const bool isErr = (iss.severity == Ex::ExportIssue::Severity::Error);
+                    ImGui::PushStyleColor(ImGuiCol_Text, isErr
+                        ? ImVec4(0.90f, 0.30f, 0.30f, 1.0f)
+                        : ImVec4(0.90f, 0.75f, 0.30f, 1.0f));
+                    ImGui::TextWrapped("[%s] %s: %s",
+                        isErr ? "ERR" : "WRN",
+                        iss.assetPath.c_str(), iss.message.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndChild();
+            }
+            if (!lastReport.topOffenders.empty()) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Top VRAM:");
+                for (const auto& [name, vram] : lastReport.topOffenders) {
+                    ImGui::Text("  %.1f MB  %s",
+                        static_cast<double>(vram) / (1024.0 * 1024.0), name.c_str());
+                }
+            }
+        }
+
+        // ── Standalone Build Result ───────────────────────────────────────
+        if (hasBuildResult) {
+            ImGui::Spacing();
+            ImGui::SeparatorText("Standalone Build");
+            if (buildResult.success) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+                ImGui::TextUnformatted("\xe2\x9c\x94  Build succeeded");
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.30f, 0.30f, 1.0f));
+                ImGui::TextUnformatted("\xe2\x9c\x98  Build failed");
+                ImGui::PopStyleColor();
+                ImGui::TextWrapped("%s", buildResult.errorMsg.c_str());
+            }
+            if (!buildResult.runtimeExeFound.empty())
+                ImGui::TextDisabled("Runtime: %s", buildResult.runtimeExeFound.c_str());
+            if (!buildResult.copiedFiles.empty()) {
+                ImGui::TextDisabled("%d file(s) copied:", static_cast<int>(buildResult.copiedFiles.size()));
+                ImGui::BeginChild("##SBFiles", ImVec2(-1.0f, 90.0f), true);
+                for (const auto& f : buildResult.copiedFiles)
+                    ImGui::TextDisabled("  %s", f.c_str());
+                ImGui::EndChild();
+            }
+        }
+
+        ImGui::EndPopup();
     }
 
     // ── Dockspace ─────────────────────────────────────────────────────────────
@@ -359,12 +972,27 @@ void DeferredRenderer::RenderEditorShell() {
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,  ImVec2(7.0f, 4.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(5.0f, 4.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(7.0f, 5.0f));
+        static bool addModelPopupRequested = false;
+        static char addModelPathBuf[512] = {};
         if (ImGui::Begin("ActionStrip", nullptr, toolbarFlags)) {
             // Transform buttons
             if (ImGui::Button("Select"))    {}  ImGui::SameLine();
             if (ImGui::Button("Translate")) {}  ImGui::SameLine();
             if (ImGui::Button("Rotate"))    {}  ImGui::SameLine();
             if (ImGui::Button("Scale"))     {}  ImGui::SameLine();
+
+            // Vertical separator
+            ImGui::TextDisabled("|");  ImGui::SameLine();
+
+            if (ImGui::Button("Add Empty")) {
+                selectedSceneEntityId = scene_.CreateEntity("GameObject");
+                MarkDirty();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Add Model")) {
+                addModelPopupRequested = true;
+            }
+            ImGui::SameLine();
 
             // Vertical separator
             ImGui::TextDisabled("|");  ImGui::SameLine();
@@ -377,18 +1005,65 @@ void DeferredRenderer::RenderEditorShell() {
             // Vertical separator
             ImGui::TextDisabled("|");  ImGui::SameLine();
 
-            // Centered playback controls
-            const float windowWidth    = ImGui::GetWindowWidth();
-            const float buttonWidth    = 72.0f;
-            const float groupW         = buttonWidth * 3.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f;
-            const float centerX        = (windowWidth - groupW) * 0.5f;
-            if (centerX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(centerX);
-            if (ImGui::Button("Play",  ImVec2(buttonWidth, 0.0f))) {}  ImGui::SameLine();
-            if (ImGui::Button("Pause", ImVec2(buttonWidth, 0.0f))) {}  ImGui::SameLine();
-            if (ImGui::Button("Step",  ImVec2(buttonWidth, 0.0f))) {}
+            // Centered mode-aware playback controls
+            const bool isWork = (renderMode_ == RenderMode::Work);
+            const float windowWidth = ImGui::GetWindowWidth();
+            const float buttonWidth = 72.0f;
+            if (isWork) {
+                const float groupW  = buttonWidth;
+                const float centerX = (windowWidth - groupW) * 0.5f;
+                if (centerX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(centerX);
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.50f, 0.26f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.24f, 0.62f, 0.32f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.14f, 0.42f, 0.20f, 1.0f));
+                if (ImGui::Button("\xe2\x96\xb6 Play", ImVec2(buttonWidth, 0.0f))) {
+                    SetRenderMode(RenderMode::Play);
+                }
+                ImGui::PopStyleColor(3);
+            } else {
+                const float groupW  = buttonWidth * 3.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+                const float centerX = (windowWidth - groupW) * 0.5f;
+                if (centerX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(centerX);
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.62f, 0.18f, 0.18f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.75f, 0.24f, 0.24f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.50f, 0.14f, 0.14f, 1.0f));
+                if (ImGui::Button("\xe2\x96\xa0 Stop", ImVec2(buttonWidth, 0.0f))) {
+                    SetRenderMode(RenderMode::Work);
+                }
+                ImGui::PopStyleColor(3);
+                ImGui::SameLine();
+                if (ImGui::Button("Pause", ImVec2(buttonWidth, 0.0f))) {}
+                ImGui::SameLine();
+                if (ImGui::Button("Step",  ImVec2(buttonWidth, 0.0f))) {}
+            }
         }
         ImGui::End();
         ImGui::PopStyleVar(3);
+
+        if (addModelPopupRequested) {
+            ImGui::OpenPopup("Add Model Entity");
+            addModelPopupRequested = false;
+        }
+        ImGui::SetNextWindowSize(ImVec2(580.0f, 0.0f), ImGuiCond_Appearing);
+        if (ImGui::BeginPopupModal("Add Model Entity", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("Model Path", addModelPathBuf, sizeof(addModelPathBuf));
+            if (ImGui::Button("Create", ImVec2(100.0f, 0.0f))) {
+                if (addModelPathBuf[0] != '\0') {
+                    selectedSceneEntityId = scene_.CreateModelEntity(
+                        addModelPathBuf,
+                        glm::vec3(0.0f, 0.0f, 0.0f),
+                        glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                        glm::vec3(1.0f));
+                    MarkDirty();
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(100.0f, 0.0f))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
     }
 
     // ── Viewport ──────────────────────────────────────────────────────────────
@@ -420,8 +1095,22 @@ void DeferredRenderer::RenderEditorShell() {
             sceneViewportValid_   = sceneViewportW_ > 1.0f && sceneViewportH_ > 1.0f;
             sceneViewportHovered_ = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
 
-            // Overlay card — rose/graphite
             ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+            // Play Mode: Unity-style colored border to signal game is running
+            if (renderMode_ == RenderMode::Play) {
+                constexpr float kBorderThickness = 3.0f;
+                const ImU32 playBorderColor = IM_COL32(65, 195, 80, 230);  // green
+                drawList->AddRect(itemMin, itemMax, playBorderColor, 0.0f, 0, kBorderThickness);
+                // "PLAY" badge top-centre
+                const char* playLabel = "\xe2\x96\xb6  PLAY MODE";
+                const ImVec2 textSize = ImGui::CalcTextSize(playLabel);
+                const ImVec2 badgeMin(itemMin.x + (sceneViewportW_ - textSize.x - 16.0f) * 0.5f, itemMin.y + 6.0f);
+                const ImVec2 badgeMax(badgeMin.x + textSize.x + 16.0f, badgeMin.y + textSize.y + 6.0f);
+                drawList->AddRectFilled(badgeMin, badgeMax, IM_COL32(14, 80, 20, 200), 4.0f);
+                drawList->AddText(ImVec2(badgeMin.x + 8.0f, badgeMin.y + 3.0f),
+                                  IM_COL32(65, 230, 80, 255), playLabel);
+            }
             const ImVec2 cardMin(itemMin.x + 12.0f, itemMin.y + 12.0f);
             const ImVec2 cardMax(cardMin.x + 318.0f, cardMin.y + 58.0f);
             drawList->AddRectFilled(cardMin, cardMax, IM_COL32(14, 10, 13, 220), 6.0f);
@@ -433,12 +1122,13 @@ void DeferredRenderer::RenderEditorShell() {
             drawList->AddText(ImVec2(cardMin.x + 10.0f, cardMin.y + 9.0f),
                               IM_COL32(220, 140, 175, 255),
                               "N3 ENGINE  \xc2\xb7  DEFERRED");
-            std::string overlayLine = std::to_string(sceneVisible) + "/" + std::to_string(sceneTotal)
-                                    + " objects  \xc2\xb7  ";
-            overlayLine += selectedObject ? selectedObject->nodeName : "<none>";
+            char overlayLine[256];
+            const char* selName = selectedObject ? selectedObject->nodeName.c_str() : "<none>";
+            snprintf(overlayLine, sizeof(overlayLine), "%d/%d objects  \xc2\xb7  %s",
+                     sceneVisible, sceneTotal, selName);
             drawList->AddText(ImVec2(cardMin.x + 10.0f, cardMin.y + 33.0f),
                               IM_COL32(170, 110, 148, 255),
-                              overlayLine.c_str());
+                              overlayLine);
         } else {
             ImGui::TextUnformatted("Scene texture is unavailable.");
         }
@@ -447,20 +1137,109 @@ void DeferredRenderer::RenderEditorShell() {
 
     // ── Hierarchy (left — Unity-style scene object list) ─────────────────────
     if (ImGui::Begin("Hierarchy")) {
-        // Colored draw-type rows
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.82f, 0.45f, 1.0f)); // green
+        auto findDrawByOwner = [&](void* owner) -> DrawCmd* {
+            if (!owner) return nullptr;
+            auto scan = [&](std::vector<DrawCmd>& draws) -> DrawCmd* {
+                for (DrawCmd& dc : draws) {
+                    if (dc.instance == owner) return &dc;
+                }
+                return nullptr;
+            };
+            if (DrawCmd* dc = scan(solidDraws)) return dc;
+            if (DrawCmd* dc = scan(alphaTestDraws)) return dc;
+            if (DrawCmd* dc = scan(environmentDraws)) return dc;
+            if (DrawCmd* dc = scan(environmentAlphaDraws)) return dc;
+            if (DrawCmd* dc = scan(simpleLayerDraws)) return dc;
+            if (DrawCmd* dc = scan(decalDraws)) return dc;
+            if (DrawCmd* dc = scan(waterDraws)) return dc;
+            if (DrawCmd* dc = scan(refractionDraws)) return dc;
+            if (DrawCmd* dc = scan(postAlphaUnlitDraws)) return dc;
+            return scan(particleDraws);
+        };
+
+        // Sync selectedSceneEntityId from picking result (unify selection)
+        {
+            static DrawCmd* lastSyncedSelectedObject = nullptr;
+            if (selectedObject != lastSyncedSelectedObject) {
+                lastSyncedSelectedObject = selectedObject;
+                if (selectedObject) {
+                    const auto eid = scene_.FindEntityIdByRuntimeOwner(selectedObject->instance);
+                    selectedSceneEntityId = eid; // 0 if not found (unmanaged draw)
+                } else {
+                    selectedSceneEntityId = 0;
+                }
+            }
+        }
+
+        const auto& authoredEntities = scene_.GetAuthoredEntities();
+        ImGui::SeparatorText("Objects");
+        if (authoredEntities.empty()) {
+            ImGui::TextDisabled("Scene has no authored objects.");
+        } else {
+            // Build depth map for indent display (parent-child from parentId)
+            std::unordered_map<SceneManager::SceneEntityId, int> entityDepth;
+            entityDepth.reserve(authoredEntities.size());
+            for (const auto& entity : authoredEntities) {
+                entityDepth[entity.id] = 0; // initialized below
+            }
+            // Compute depth via parent walk (capped at 16 to avoid cycles)
+            for (const auto& entity : authoredEntities) {
+                if (entity.parentId == 0) {
+                    entityDepth[entity.id] = 0;
+                    continue;
+                }
+                int depth = 0;
+                SceneManager::SceneEntityId cur = entity.parentId;
+                while (cur != 0 && depth < 16) {
+                    ++depth;
+                    const auto* parent = [&]() -> const SceneManager::AuthoredEntity* {
+                        for (const auto& e : authoredEntities)
+                            if (e.id == cur) return &e;
+                        return nullptr;
+                    }();
+                    cur = parent ? parent->parentId : 0;
+                }
+                entityDepth[entity.id] = depth;
+            }
+
+            for (const auto& entity : authoredEntities) {
+                const int depth = entityDepth.count(entity.id) ? entityDepth[entity.id] : 0;
+                if (depth > 0) ImGui::Indent(static_cast<float>(depth) * 12.0f);
+                const bool isSelected = (selectedSceneEntityId == entity.id);
+                const std::string label = entity.name + "##ent_" + std::to_string(entity.id);
+                if (ImGui::Selectable(label.c_str(), isSelected)) {
+                    selectedSceneEntityId = entity.id;
+                    DrawCmd* sceneDraw = findDrawByOwner(entity.runtimeOwner);
+                    if (sceneDraw) {
+                        selectedObject = sceneDraw;
+                    } else {
+                        selectedObject = nullptr;
+                        selectedIndex = -1;
+                    }
+                }
+                if (depth > 0) ImGui::Unindent(static_cast<float>(depth) * 12.0f);
+            }
+        }
+        if (selectedSceneEntityId != 0 && ImGui::Button("Delete Selected Object", ImVec2(-1.0f, 0.0f))) {
+            if (scene_.DestroyEntity(selectedSceneEntityId)) {
+                selectedSceneEntityId = 0;
+                InvalidateSelection();
+                MarkDirty();
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::SeparatorText("Render Stats");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.82f, 0.45f, 1.0f));
         ImGui::Text("Solid        %d / %d", solidVisible, solidTotal);
         ImGui::PopStyleColor();
-
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.72f, 0.30f, 1.0f)); // amber
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.72f, 0.30f, 1.0f));
         ImGui::Text("AlphaTest    %d / %d", alphaVisible, alphaTotal);
         ImGui::PopStyleColor();
-
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.72f, 0.96f, 1.0f)); // blue
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.72f, 0.96f, 1.0f));
         ImGui::Text("Environment  %d / %d", envVisible, envTotal);
         ImGui::PopStyleColor();
-
-        ImGui::Text("Particles    %d", static_cast<int>(scene_.particleNodes.size()));
+        ImGui::Text("Particles    %d", static_cast<int>(scene_.GetParticleNodeCount()));
 
         // Thin rose visibility ratio bar
         if (sceneTotal > 0) {
@@ -526,6 +1305,47 @@ void DeferredRenderer::RenderEditorShell() {
 
     // ── Properties (was Node Codex) ───────────────────────────────────────────
     if (ImGui::Begin("Properties")) {
+        const auto& authoredEntities = scene_.GetAuthoredEntities();
+        const SceneManager::AuthoredEntity* selectedEntity = nullptr;
+        for (const auto& entity : authoredEntities) {
+            if (entity.id == selectedSceneEntityId) {
+                selectedEntity = &entity;
+                break;
+            }
+        }
+
+        if (selectedEntity) {
+            static SceneManager::SceneEntityId cachedEntityId = 0;
+            static char entityNameBuf[256] = {};
+            if (cachedEntityId != selectedEntity->id) {
+                cachedEntityId = selectedEntity->id;
+                std::strncpy(entityNameBuf, selectedEntity->name.c_str(), sizeof(entityNameBuf) - 1);
+                entityNameBuf[sizeof(entityNameBuf) - 1] = '\0';
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, roseAccent);
+            ImGui::Text("Entity #%llu", static_cast<unsigned long long>(selectedEntity->id));
+            ImGui::PopStyleColor();
+            if (ImGui::InputText("Name", entityNameBuf, sizeof(entityNameBuf))) {
+                scene_.SetEntityName(selectedEntity->id, entityNameBuf);
+                MarkDirty();
+            }
+            ImGui::TextDisabled("Model: %s",
+                                selectedEntity->modelPath.empty() ? "<empty>" : selectedEntity->modelPath.c_str());
+            glm::vec3 pos = selectedEntity->position;
+            glm::vec4 rot(selectedEntity->rotation.x, selectedEntity->rotation.y,
+                          selectedEntity->rotation.z, selectedEntity->rotation.w);
+            glm::vec3 scale = selectedEntity->scale;
+            bool transformChanged = false;
+            transformChanged |= ImGui::DragFloat3("Position", &pos.x, 0.05f);
+            transformChanged |= ImGui::DragFloat4("Rotation (xyzw)", &rot.x, 0.01f);
+            transformChanged |= ImGui::DragFloat3("Scale", &scale.x, 0.01f);
+            if (transformChanged) {
+                scene_.SetEntityTransform(selectedEntity->id, pos, glm::quat(rot.w, rot.x, rot.y, rot.z), scale);
+                MarkDirty();
+            }
+            ImGui::Separator();
+        }
+
         if (selectedObject) {
             // Node name in rose accent
             ImGui::PushStyleColor(ImGuiCol_Text, roseAccent);
@@ -549,7 +1369,7 @@ void DeferredRenderer::RenderEditorShell() {
                 ImGui::Text("vec4_params:   %d", static_cast<int>(parserNode->shader_params_vec4.size()));
                 ImGui::TreePop();
             }
-        } else {
+        } else if (!selectedEntity) {
             ImGui::TextDisabled("No object selected.");
         }
     }
@@ -578,8 +1398,8 @@ void DeferredRenderer::RenderEditorShell() {
                 static std::vector<std::string> cachedMaps;
 
                 // ---- rebuild caches whenever the loaded map changes -----------------
-                if (lastMapPath != scene_.currentMapSourcePath_) {
-                    lastMapPath = scene_.currentMapSourcePath_;
+                if (lastMapPath != scene_.GetCurrentMapPath()) {
+                    lastMapPath = scene_.GetCurrentMapPath();
                     cachedModels.clear();
                     cachedMeshes.clear();
                     cachedTextures.clear();
@@ -588,11 +1408,11 @@ void DeferredRenderer::RenderEditorShell() {
                     selItem = -1;
 
                     // Models: one entry per unique model path loaded by the renderer
-                    for (const auto& kv : scene_.loadedModelRefCountByPath_)
+                    for (const auto& kv : scene_.GetLoadedModelRefCounts())
                         cachedModels.push_back(kv.first);
 
                     // Meshes: one entry per unique mesh path
-                    for (const auto& kv : scene_.loadedMeshByModelPath_)
+                    for (const auto& kv : scene_.GetLoadedMeshPaths())
                         cachedMeshes.push_back(kv.first);
 
                     // Textures + Animations: harvest from every draw call's source node
@@ -623,8 +1443,8 @@ void DeferredRenderer::RenderEditorShell() {
                     cachedAnims.assign(animSet.begin(), animSet.end());
 
                     // Map: the currently loaded map file
-                    if (!scene_.currentMapSourcePath_.empty())
-                        cachedMaps.push_back(scene_.currentMapSourcePath_);
+                    if (!scene_.GetCurrentMapPath().empty())
+                        cachedMaps.push_back(scene_.GetCurrentMapPath());
 
                     std::sort(cachedModels.begin(),   cachedModels.end());
                     std::sort(cachedMeshes.begin(),   cachedMeshes.end());
@@ -751,7 +1571,7 @@ void DeferredRenderer::RenderEditorShell() {
                         static_cast<int>(catVec[selCat]->size()));
                 }
                 ImGui::PopStyleColor();
-                if (scene_.currentMapSourcePath_.empty())
+                if (scene_.GetCurrentMapPath().empty())
                     ImGui::TextDisabled("  — no map loaded");
                 ImGui::Spacing();
 
@@ -832,15 +1652,26 @@ void DeferredRenderer::RenderEditorShell() {
                 } else {
                     const std::vector<std::string>& items = *catVec[selCat];
                     const int typeIdx = selCat - 1; // 0=Model,1=Mesh,2=Tex,3=Anim,4=Map
-                    for (const auto& path : items) {
-                        if (!matchSearch(fileTail(path))) continue;
-                        drawCell(path, typeIdx);
+                    const bool isMapCategory = (selCat == 5);
+                    for (const auto& itemPath : items) {
+                        if (!matchSearch(fileTail(itemPath))) continue;
+                        const bool itemHit = drawCell(itemPath, typeIdx);
+                        // Map items: double-click imports as editable scene
+                        if (isMapCategory && ImGui::IsItemHovered() &&
+                            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                            RequestSceneAction(PendingSceneAction::ImportMap, itemPath);
+                        }
+                        (void)itemHit;
                     }
                     if (cellIdx == 0) {
-                        if (scene_.currentMapSourcePath_.empty())
+                        if (scene_.GetCurrentMapPath().empty())
                             ImGui::TextDisabled("Load a map to populate assets.");
                         else
                             ImGui::TextDisabled("No resources of this type.");
+                    }
+                    if (isMapCategory && !items.empty()) {
+                        ImGui::Spacing();
+                        ImGui::TextDisabled("Double-click a map to import as editable scene.");
                     }
                 }
 
@@ -891,6 +1722,91 @@ void DeferredRenderer::RenderEditorShell() {
                 ImGui::EndTabItem();
             }
 
+            // ================================================================
+            // SCENES tab — project .ndscene list
+            // ================================================================
+            if (ImGui::BeginTabItem("Scenes")) {
+                static std::vector<std::string> cachedSceneFiles;
+                static bool scenesNeedRefresh = true;
+                static int selSceneItem = -1;
+
+                if (scenesNeedRefresh) {
+                    cachedSceneFiles.clear();
+                    std::error_code ec2;
+                    const std::string scenesRoot = SCENES_ROOT;
+                    if (!scenesRoot.empty() && std::filesystem::exists(scenesRoot, ec2)) {
+                        for (const auto& entry : std::filesystem::directory_iterator(scenesRoot, ec2)) {
+                            if (!entry.is_regular_file(ec2)) continue;
+                            if (entry.path().extension() == ".ndscene") {
+                                cachedSceneFiles.push_back(entry.path().string());
+                            }
+                        }
+                    }
+                    std::sort(cachedSceneFiles.begin(), cachedSceneFiles.end());
+                    scenesNeedRefresh = false;
+                }
+
+                const std::string& activeScenePath = activeSceneInfo.sourcePath;
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.43f,0.51f,1.0f));
+                ImGui::Text("Scenes in %s  —  %d files", SCENES_ROOT, static_cast<int>(cachedSceneFiles.size()));
+                ImGui::PopStyleColor();
+                ImGui::Spacing();
+
+                for (int i = 0; i < static_cast<int>(cachedSceneFiles.size()); ++i) {
+                    const std::string& sp = cachedSceneFiles[i];
+                    const std::string tail = [&]{ const size_t s = sp.find_last_of("/\\"); return s == std::string::npos ? sp : sp.substr(s+1); }();
+                    const bool isActive = (sp == activeScenePath);
+                    if (isActive) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.910f, 0.478f, 0.627f, 1.0f));
+                    }
+                    const std::string label = (isActive ? "\xe2\x97\x8f " : "  ") + tail + "##sc_" + std::to_string(i);
+                    if (ImGui::Selectable(label.c_str(), selSceneItem == i)) {
+                        selSceneItem = i;
+                    }
+                    if (isActive) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        selSceneItem = i;
+                        // Open directly — goes through dirty check
+                        if (scene_.IsSceneDirty()) {
+                            pendingSceneAction = PendingSceneAction::OpenScene;
+                            pendingActionPath = sp;
+                            unsavedChangesModalRequested = true;
+                        } else {
+                            if (scene_.OpenScene(sp)) {
+                                ResetEditorRuntimeState(false);
+                                hasWorkSceneAsset = false;
+                                ++workSceneRevision;
+                                MarkDirty();
+                            }
+                        }
+                    }
+                }
+                if (cachedSceneFiles.empty()) {
+                    ImGui::TextDisabled("No .ndscene files found in scenes root.");
+                }
+                ImGui::Spacing();
+                if (ImGui::Button("Refresh")) scenesNeedRefresh = true;
+                ImGui::SameLine();
+                if (selSceneItem >= 0 && selSceneItem < static_cast<int>(cachedSceneFiles.size())) {
+                    if (ImGui::Button("Open Selected")) {
+                        const std::string& sp = cachedSceneFiles[static_cast<size_t>(selSceneItem)];
+                        if (scene_.IsSceneDirty()) {
+                            pendingSceneAction = PendingSceneAction::OpenScene;
+                            pendingActionPath = sp;
+                            unsavedChangesModalRequested = true;
+                        } else {
+                            if (scene_.OpenScene(sp)) {
+                                ResetEditorRuntimeState(false);
+                                hasWorkSceneAsset = false;
+                                ++workSceneRevision;
+                                MarkDirty();
+                            }
+                        }
+                    }
+                }
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
     }
@@ -923,11 +1839,54 @@ void DeferredRenderer::RenderEditorShell() {
         ImGui::SameLine(0.0f, 6.0f);
         ImGui::TextUnformatted("N3 ENGINE");
         ImGui::SameLine(); ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::Text("%s%s",
+                    activeSceneInfo.name.empty() ? "Untitled Scene" : activeSceneInfo.name.c_str(),
+                    activeSceneInfo.dirty ? "*" : "");
+        ImGui::SameLine(); ImGui::TextDisabled("|");
+        if (mapDropLoadStage_ != MapDropLoadStage::Idle) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted(mapDropLoadStatus_.c_str());
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::ProgressBar(std::clamp(mapDropLoadProgress_, 0.0f, 1.0f), ImVec2(150.0f, 0.0f), "");
+            ImGui::SameLine(); ImGui::TextDisabled("|");
+        }
         ImGui::SameLine(); ImGui::Text("%.0f fps", ImGui::GetIO().Framerate);
         ImGui::SameLine(); ImGui::TextDisabled("|");
         ImGui::SameLine(); ImGui::Text("%d draws", lastFrameDrawCalls_);
         ImGui::SameLine(); ImGui::TextDisabled("|");
-        if (scene_.currentMapSourcePath_.empty()) {
+        // Mode badge
+        {
+            const bool isWork = (renderMode_ == RenderMode::Work);
+            const ImVec4 badgeColor = isWork
+                ? ImVec4(0.25f, 0.60f, 0.85f, 1.0f)   // blue for Work
+                : ImVec4(0.30f, 0.75f, 0.35f, 1.0f);   // green for Play
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, badgeColor);
+            ImGui::Text("[%s]", isWork ? "WORK" : "PLAY");
+            ImGui::PopStyleColor();
+            if (activePolicy_.dirtyRenderingEnabled) {
+                ImGui::SameLine(0.0f, 4.0f);
+                ImGui::TextDisabled(dirtyFrameSkippedLast_ ? "(idle)" : "(dirty)");
+            }
+        }
+        // Quality tier badge
+        {
+            const char* tierLabel[] = { "FULL", "REDUCED", "MIN" };
+            const ImVec4 tierColor[] = {
+                ImVec4(0.30f, 0.75f, 0.35f, 1.0f),  // green
+                ImVec4(0.85f, 0.70f, 0.20f, 1.0f),  // yellow
+                ImVec4(0.85f, 0.25f, 0.20f, 1.0f)    // red
+            };
+            int ti = static_cast<int>(budgetGovernor_.tier);
+            ImGui::SameLine(); ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, tierColor[ti]);
+            ImGui::Text("Q:%s", tierLabel[ti]);
+            ImGui::PopStyleColor();
+        }
+        ImGui::SameLine(); ImGui::TextDisabled("|");
+        if (scene_.GetCurrentMapPath().empty()) {
             ImGui::SameLine(); ImGui::TextDisabled("no map");
         } else {
             ImGui::SameLine(); ImGui::TextUnformatted("map loaded");
@@ -978,18 +1937,15 @@ void DeferredRenderer::RenderLookAtPanel() {
     // --- Scene stats ---
     ImGui::SeparatorText("Scene");
 
-    // Count visible (non-disabled) draws per list
+    // Count visible (non-disabled) draws per list — use pre-computed cache from ApplyDisabledDrawFlags()
     int solidTotal    = (int)solidDraws.size();
-    int solidVisible  = 0;
-    for (const auto& d : solidDraws) if (!d.disabled) ++solidVisible;
+    int solidVisible  = uiCachedSolidVisible_;
 
     int alphaTotal   = (int)alphaTestDraws.size();
-    int alphaVisible = 0;
-    for (const auto& d : alphaTestDraws) if (!d.disabled) ++alphaVisible;
+    int alphaVisible = uiCachedAlphaVisible_;
 
     int envTotal   = (int)environmentDraws.size();
-    int envVisible = 0;
-    for (const auto& d : environmentDraws) if (!d.disabled) ++envVisible;
+    int envVisible = uiCachedEnvVisible_;
 
     int envAlphaTotal   = (int)environmentAlphaDraws.size();
     int simpleLayerTotal = (int)simpleLayerDraws.size();
@@ -1255,21 +2211,80 @@ void DeferredRenderer::RenderLookAtPanel() {
 }
 
 
+void DeferredRenderer::RenderViewportOnlyImage() {
+    sceneViewportValid_ = false;
+    sceneViewportHovered_ = false;
+    sceneViewportFocused_ = false;
+
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    if (!mainViewport) return;
+
+    ImVec2 viewportSize = mainViewport->WorkSize;
+    if (viewportSize.x < 1.0f) viewportSize.x = 1.0f;
+    if (viewportSize.y < 1.0f) viewportSize.y = 1.0f;
+
+    GLuint finalTexture = 0;
+    if (lightingGraph) {
+        auto finalTextureInterface = lightingGraph->getTextureInterface("sceneColor");
+        if (finalTextureInterface) {
+            finalTexture = *(GLuint*)finalTextureInterface->GetNativeHandle();
+        }
+    }
+
+    if (finalTexture != 0) {
+        const ImVec2 p0 = mainViewport->WorkPos;
+        const ImVec2 p1(p0.x + viewportSize.x, p0.y + viewportSize.y);
+        ImDrawList* drawList = ImGui::GetBackgroundDrawList(const_cast<ImGuiViewport*>(mainViewport));
+        drawList->PushClipRect(p0, p1, true);
+        drawList->AddImage(
+            reinterpret_cast<void*>(static_cast<intptr_t>(finalTexture)),
+            p0,
+            p1,
+            ImVec2(0.0f, 1.0f),
+            ImVec2(1.0f, 0.0f));
+        drawList->PopClipRect();
+
+        sceneViewportX_ = p0.x;
+        sceneViewportY_ = p0.y;
+        sceneViewportW_ = std::max(0.0f, p1.x - p0.x);
+        sceneViewportH_ = std::max(0.0f, p1.y - p0.y);
+        sceneViewportValid_ = sceneViewportW_ > 1.0f && sceneViewportH_ > 1.0f;
+
+        const ImVec2 mousePos = ImGui::GetIO().MousePos;
+        sceneViewportHovered_ =
+            sceneViewportValid_ &&
+            mousePos.x >= sceneViewportX_ &&
+            mousePos.x <= (sceneViewportX_ + sceneViewportW_) &&
+            mousePos.y >= sceneViewportY_ &&
+            mousePos.y <= (sceneViewportY_ + sceneViewportH_);
+        sceneViewportFocused_ = sceneViewportValid_;
+    }
+}
+
+
 void DeferredRenderer::RenderImGui() {
     if (!imguiInitialized) return;
-    ValidateSelectionPointer();
+    if (!imguiViewportOnly_) {
+        ValidateSelectionPointer();
+    }
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    if (editorModeEnabled_) {
+    frameProfile_.panelUpdateHzEffective = panelEffectiveHz_;
+
+    if (imguiViewportOnly_) {
+        RenderViewportOnlyImage();
+    } else if (editorModeEnabled_) {
         RenderEditorShell();
     } else {
         RenderLookAtPanel();
     }
 
-    DrawVisibilityCellsDebug();
+    if (!imguiViewportOnly_) {
+        DrawVisibilityCellsDebug();
+    }
 
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

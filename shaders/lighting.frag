@@ -2,9 +2,9 @@
 in vec2 TexCoords;
 out vec4 FragColor;
 
-uniform sampler2D gPosition;
 uniform sampler2D gNormalDepthPacked;
 uniform sampler2D gPositionWS;
+uniform mat4 view;
 uniform sampler2DShadow shadowMapCascade0;
 uniform sampler2DShadow shadowMapCascade1;
 uniform sampler2DShadow shadowMapCascade2;
@@ -22,9 +22,9 @@ uniform int numCascades;
 uniform int DisableShadows;
 uniform int DisableViewDependentSpecular;
 
-const float specPower = 48.0;
+const float specPower = 32.0;
 const vec3 luminanceValue = vec3(0.299, 0.587, 0.114);
-const float exaggerateSpec = 0.9;
+const float exaggerateSpec = 1.8;
 
 vec4 EncodeHDR(vec4 rgba) {
     return rgba * vec4(0.5, 0.5, 0.5, 1.0);
@@ -131,20 +131,27 @@ void main() {
 
     vec3 normalWS = normalize(nd.rgb * 2.0 - 1.0);
     vec3 worldPos = texture(gPositionWS, TexCoords).xyz;
-    vec3 viewPos = texture(gPosition, TexCoords).xyz;
+    vec3 viewPos = (view * vec4(worldPos, 1.0)).xyz;
 
     vec3 L = normalize(LightDirWS);
     float NL = dot(normalWS, L);
 
     float shadow = (DisableShadows > 0)
         ? 1.0
-        : max(CalcShadowCascaded(worldPos, viewPos, normalWS, max(NL, 0.0)), 0.2);
+        : CalcShadowCascaded(worldPos, viewPos, normalWS, max(NL, 0.0));
 
+    // Nebula: spec luminance uses unshadowed diffuse (shadow composed separately)
+    vec3 fullDiff = AmbientColor;
+    fullDiff += LightColor * clamp(NL, 0.0, 1.0);
+    float backNL = clamp(-NL + BackLightOffset, 0.0, 1.0);
+    fullDiff += BackLightColor * backNL;
+
+    // Shadowed diffuse for RGB output
     vec3 diff = AmbientColor;
     diff += LightColor * clamp(NL, 0.0, 1.0) * shadow;
-    // Disable underside/back-light contribution to avoid fake upward light beams.
+    diff += BackLightColor * backNL;
 
-    float diffLuminance = dot(diff, luminanceValue) * exaggerateSpec;
+    float diffLuminance = dot(fullDiff, luminanceValue) * exaggerateSpec;
     float spec = 0.0;
     if (DisableViewDependentSpecular == 0) {
         vec3 V = normalize(CameraPos - worldPos);
@@ -155,7 +162,6 @@ void main() {
         float NLclamped = clamp(NL, 0.0, 1.0);
         spec = pow(NLclamped, specPower) * diffLuminance;
     }
-    spec = min(spec, 1.0);
 
     FragColor = EncodeHDR(vec4(diff, spec));
 }

@@ -9,11 +9,13 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <sstream>
 #include <unordered_set>
 #include "Animation/AnimationSystem.h"
 
 #include "Platform/NDEVcHeaders.h"
 #include "Assets/NDEVcStructure.h"
+#include "Core/VFS.h"
 
 namespace fs = std::filesystem;
 
@@ -82,7 +84,7 @@ inline bool FourCCEq(uint32_t v, const char tag[4]) {
            p[3] == static_cast<unsigned char>(tag[3]);
 }
 
-inline bool ReadBytes(std::ifstream& f, void* p, size_t n) {
+inline bool ReadBytes(std::istream& f, void* p, size_t n) {
     return static_cast<bool>(f.read(reinterpret_cast<char*>(p), n));
 }
 
@@ -322,6 +324,32 @@ std::string ResolveNax3Path(std::string src) {
     return path;
 }
 
+bool OpenBinaryStreamFromVfsOrDisk(const std::string& path,
+                                   std::ifstream& diskFile,
+                                   std::istringstream& vfsStream,
+                                   std::istream*& outStream) {
+    outStream = nullptr;
+    const NC::VFS::View vfsView = NC::VFS::Instance().Read(path);
+    if (vfsView.valid()) {
+        vfsStream = std::istringstream(
+            std::string(reinterpret_cast<const char*>(vfsView.data), vfsView.size),
+            std::ios::binary);
+        outStream = &vfsStream;
+        return true;
+    }
+
+    if (NC::VFS::Instance().IsMounted()) {
+        return false;
+    }
+
+    diskFile.open(path, std::ios::binary);
+    if (!diskFile) {
+        return false;
+    }
+    outStream = &diskFile;
+    return true;
+}
+
 bool LoadNACForClip(const std::string& naxPath, int clipIndex, N3Clip& clip, std::vector<glm::vec4>& outKeys, uint32_t& baseOut) {
     auto dir = fs::path(ResolveNax3Path(naxPath)).parent_path();
     auto base = fs::path(ResolveNax3Path(naxPath)).stem().string();
@@ -344,11 +372,15 @@ bool LoadNACForClip(const std::string& naxPath, int clipIndex, N3Clip& clip, std
     }
 
     for (const auto& p : candidates) {
-        std::ifstream f(p, std::ios::binary);
-        if (!f) continue;
+        std::ifstream diskFile;
+        std::istringstream vfsStream;
+        std::istream* stream = nullptr;
+        if (!OpenBinaryStreamFromVfsOrDisk(p, diskFile, vfsStream, stream) || !stream) {
+            continue;
+        }
 
         uint32_t magic = 0;
-        if (!ReadBytes(f, &magic, 4)) continue;
+        if (!ReadBytes(*stream, &magic, 4)) continue;
         if (!(FourCCEq(magic, "0CAN") || FourCCEq(magic, "CAN0"))) continue;
 
         baseOut = static_cast<uint32_t>(outKeys.size());
@@ -363,7 +395,7 @@ bool LoadNACForClip(const std::string& naxPath, int clipIndex, N3Clip& clip, std
                 glm::vec4 v(0, 0, 0, 1);
                 if (cv.curveType == 2) {
                     int16_t s[4];
-                    if (!ReadBytes(f, s, 8)) {
+                    if (!ReadBytes(*stream, s, 8)) {
                         outKeys.resize(baseOut);
                         return false;
                     }
@@ -373,7 +405,7 @@ bool LoadNACForClip(const std::string& naxPath, int clipIndex, N3Clip& clip, std
                     v.w = static_cast<float>(s[3]) * (1.0f / 32768.0f);
                 } else {
                     float fv[4];
-                    if (!ReadBytes(f, fv, 16)) {
+                    if (!ReadBytes(*stream, fv, 16)) {
                         outKeys.resize(baseOut);
                         return false;
                     }
@@ -396,7 +428,7 @@ bool LoadNACForClip(const std::string& naxPath, int clipIndex, N3Clip& clip, std
     return false;
 }
 
-bool LoadHAN0(std::ifstream& f, const std::string& path, N3File& out) {
+bool LoadHAN0(std::istream& f, const std::string& path, N3File& out) {
     int32_t numClips = 0;
     int32_t fileNumKeys = 0;
     if (!ReadBytes(f, &numClips, 4) || !ReadBytes(f, &fileNumKeys, 4)) return false;
@@ -488,19 +520,21 @@ bool LoadHAN0(std::ifstream& f, const std::string& path, N3File& out) {
 
 bool LoadNax3File(const std::string& source, N3File& out) {
     const std::string path = ResolveNax3Path(source);
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
+    std::ifstream diskFile;
+    std::istringstream vfsStream;
+    std::istream* stream = nullptr;
+    if (!OpenBinaryStreamFromVfsOrDisk(path, diskFile, vfsStream, stream) || !stream) {
         std::cerr << "[NAX3] open fail " << path << "\n";
         return false;
     }
 
     uint32_t magic = 0;
-    if (!ReadBytes(f, &magic, 4)) {
+    if (!ReadBytes(*stream, &magic, 4)) {
         std::cerr << "[NAX3] bad header " << path << "\n";
         return false;
     }
     if (FourCCEq(magic, "HAN0") || FourCCEq(magic, "0HAN")) {
-        return LoadHAN0(f, path, out);
+        return LoadHAN0(*stream, path, out);
     }
 
     std::cerr << "[NAX3] invalid magic 0x" << std::hex << magic << std::dec << " " << path << "\n";

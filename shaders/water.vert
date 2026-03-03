@@ -1,5 +1,9 @@
 #version 460 core
 
+#ifdef BINDLESS
+#extension GL_ARB_gpu_shader_int64 : require
+#endif
+
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in vec2 texcoord0;
@@ -14,8 +18,43 @@ uniform mat4 view;
 uniform mat4 model;
 uniform mat4 JointMatrices[128];
 uniform int UseSkinning;
+uniform int UseInstancing;
+
+layout(binding = 1, std430) readonly buffer ModelMatrixBuffer {
+    mat4 models[];
+};
+
+#ifdef BINDLESS
+
+struct WaterMaterialGPU {
+    uint64_t diffuseHandle;
+    uint64_t bumpHandle;
+    uint64_t emissiveHandle;
+    uint64_t cubeHandle;
+    float intensity0;
+    float emissiveIntensity;
+    float specularIntensity;
+    float bumpScale;
+    float uvScale;
+    float velocityX;
+    float velocityY;
+    uint flags;
+};
+
+layout(std430, binding = 2) readonly buffer WaterMaterialBuffer {
+    WaterMaterialGPU waterMaterials[];
+};
+
+layout(std430, binding = 3) readonly buffer WaterMaterialIndexBuffer {
+    uint waterMatIndices[];
+};
+
+flat out uint vMaterialID;
+uniform float time;
+#else
 uniform mat4 textureTransform0;
 uniform vec2 uvScale;
+#endif
 
 out vec2 sUV;
 out vec3 sWorldPos;
@@ -43,10 +82,12 @@ void main() {
         lb = mat3(m) * lb;
     }
 
-    vec4 wpos = model * lp;
+    mat4 modelMat = (UseInstancing > 0) ? models[gl_BaseInstance + gl_InstanceID] : model;
+
+    vec4 wpos = modelMat * lp;
     sWorldPos = wpos.xyz;
 
-    mat3 nM = transpose(inverse(mat3(model)));
+    mat3 nM = mat3(modelMat);
     vec3 N = normalize(nM * ln);
     vec3 T = normalize(nM * lt);
     T = normalize(T - N * dot(T, N));
@@ -58,8 +99,20 @@ void main() {
     sTangent = T;
     sBinormal = B;
 
+#ifdef BINDLESS
+    uint matIdx = waterMatIndices[gl_BaseInstance + gl_InstanceID];
+    vMaterialID = matIdx;
+    WaterMaterialGPU mat = waterMaterials[matIdx];
+    vec2 scaledUV = texcoord0 * mat.uvScale;
+    if ((mat.flags & 1u) != 0u) {
+        sUV = scaledUV + vec2(mat.velocityX, mat.velocityY) * time;
+    } else {
+        sUV = scaledUV;
+    }
+#else
     vec2 scaledUV = texcoord0 * uvScale;
     sUV = (textureTransform0 * vec4(scaledUV, 0.0, 1.0)).xy;
+#endif
 
     gl_Position = projection * view * wpos;
 }

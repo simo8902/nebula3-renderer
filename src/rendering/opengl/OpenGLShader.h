@@ -55,6 +55,12 @@ public:
     void SetVec4(const std::string& name, const glm::vec4& value) const override;
     void SetVec4(UniformID id, const glm::vec4& value) const override;
 
+    void SetInt64(const std::string& name, int64_t value) const override;
+    void SetInt64(UniformID id, int64_t value) const override;
+
+    void SetUint64(const std::string& name, uint64_t value) const override;
+    void SetUint64(UniformID id, uint64_t value) const override;
+
     void PrecacheUniform(UniformID id, const char* name) const override;
 
     void ReloadFromPath(const std::string& path);
@@ -70,6 +76,7 @@ private:
     std::string ReadFile(const std::string& path);
     void LoadSeparateShaders(const char* vertexPath, const char* fragmentPath);
     void LoadCombinedShader(const char* path);
+    void ValidateActiveUniforms() const;
 
     NDEVC::GL::GLProgHandle program_;
     bool isCombined_ = false;

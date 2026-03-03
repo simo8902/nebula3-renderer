@@ -480,6 +480,10 @@ void DrawBatchSystem::reset(bool invalidateStaticCache) {
         dynamicSolidDrawIndices_.clear();
         staticMatricesUploadedBySlot_.fill(false);
         staticIndirectUploadedBySlot_.fill(false);
+        materialIndexUploadedBySlot_.fill(false);
+        materialIndexStaticDirty_ = true;
+        staticVisibilityDirty_ = true;
+        bindlessPartitionSlotValid_.fill(false);
         modelMatrixUploadCursor_ = 0;
         transientModelMatrixUploadCursor_ = 0;
         perObjectUploadCursor_ = 0;
@@ -491,6 +495,7 @@ void DrawBatchSystem::reset(bool invalidateStaticCache) {
         transientModelMatrixSSBOCapacity_ = 0;
         initialMatrixUploadLogged = false;
         staticCacheValid_ = false;
+        cullResultCacheValid_ = false;
     }
 }
 
@@ -516,10 +521,15 @@ void DrawBatchSystem::invalidateStaticCache() {
     dynamicSolidDrawIndices_.clear();
     staticMatricesUploadedBySlot_.fill(false);
     staticIndirectUploadedBySlot_.fill(false);
+    materialIndexUploadedBySlot_.fill(false);
+    materialIndexStaticDirty_ = true;
+    staticVisibilityDirty_ = true;
+    bindlessPartitionSlotValid_.fill(false);
     modelMatrixUploadCursor_ = 0;
     indirectUploadCursor_ = 0;
     initialMatrixUploadLogged = false;
     staticCacheValid_ = false;
+    cullResultCacheValid_ = false;
 
     for (auto& [k, batch] : batches_) {
         batch.commands.clear();
@@ -534,7 +544,11 @@ void DrawBatchSystem::invalidateStaticCache() {
     decalParamsBuffer.clear();
 }
 
-void DrawBatchSystem::updateStaticVisibility(const std::vector<DrawCmd>& solidDraws) {
+void DrawBatchSystem::updateStaticVisibility(const std::vector<DrawCmd>& solidDraws,
+                                             const Camera::Frustum* frustum) {
+    if (!staticVisibilityDirty_) return;
+    staticVisibilityDirty_ = false;
+
     if (staticCmdInstanceOffsets_.size() != staticIndirectCommandsPacked_.size() ||
         staticCmdInstanceCounts_.size() != staticIndirectCommandsPacked_.size()) {
         return;
@@ -552,7 +566,9 @@ void DrawBatchSystem::updateStaticVisibility(const std::vector<DrawCmd>& solidDr
             for (size_t j = 0; j < clampedCount; ++j) {
                 const size_t di = staticCmdInstanceDrawIndices_[offset + j];
                 if (di < solidDraws.size() && !solidDraws[di].disabled) {
-                    ++visibleCount;
+                    if (!frustum || PassesFrustum(solidDraws[di], *frustum)) {
+                        ++visibleCount;
+                    }
                 }
             }
         }
@@ -566,11 +582,17 @@ void DrawBatchSystem::updateStaticVisibility(const std::vector<DrawCmd>& solidDr
     if (changed) {
         // Force re-upload of the static indirect buffer on next flush
         staticIndirectUploadedBySlot_.fill(false);
+        // Bindless partition layout is now stale (instanceCounts changed)
+        bindlessPartitionSlotValid_.fill(false);
     }
 }
 
 void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
                            const Camera::Frustum& frustum) {
+    if (cullResultCacheValid_ && staticCacheValid_ && !staticVisibilityDirty_ &&
+        std::memcmp(&frustum, &cullCachedFrustum_, sizeof(Camera::Frustum)) == 0) {
+        return;
+    }
     const bool allowStaticCache = UseStaticBatchCache();
     bool rebuildDynamicSolidIndices = false;
     uint64_t staticContentHash = staticCacheContentHash_;
@@ -869,20 +891,28 @@ void DrawBatchSystem::cull(const std::vector<DrawCmd>& solidDraws,
             }
         }
         staticIndirectUploadedBySlot_.fill(false);
+        materialIndexStaticDirty_ = true;
+        staticVisibilityDirty_ = true;
+        bindlessPartitionSlotValid_.fill(false);
     }
 
     if (allowStaticCache) {
-        updateStaticVisibility(solidDraws);
+        updateStaticVisibility(solidDraws, &frustum);
     }
 
     if (allowStaticCache && !buildingStaticBatches && !staticModelMatrices.empty()) {
         staticCacheValid_ = true;
     }
-
+    cullCachedFrustum_ = frustum;
+    cullResultCacheValid_ = true;
 }
 
 void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camera::Frustum& frustum,
                                     uint32_t shaderHash, int numTextures) {
+    if (cullResultCacheValid_ && staticCacheValid_ && !staticVisibilityDirty_ &&
+        std::memcmp(&frustum, &cullCachedFrustum_, sizeof(Camera::Frustum)) == 0) {
+        return;
+    }
     const bool allowStaticCache = UseStaticBatchCache();
     const int textureCount = std::clamp(numTextures, 0, 12);
     const uint64_t cacheSignature = MakeGenericStaticCacheSignature(shaderHash, textureCount);
@@ -1070,6 +1100,8 @@ void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camer
             }
         }
         staticIndirectUploadedBySlot_.fill(false);
+        materialIndexStaticDirty_ = true;
+        bindlessPartitionSlotValid_.fill(false);
     } else {
         staticMatrixCount = staticModelMatrices.size();
     }
@@ -1089,7 +1121,9 @@ void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camer
                 for (size_t j = 0; j < clampedCount; ++j) {
                     const size_t di = staticCmdInstanceDrawIndices_[offset + j];
                     if (di < draws.size() && !draws[di].disabled) {
-                        ++visibleCount;
+                        if (PassesFrustum(draws[di], frustum)) {
+                            ++visibleCount;
+                        }
                     }
                 }
             }
@@ -1102,6 +1136,7 @@ void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camer
         }
         if (changed) {
             staticIndirectUploadedBySlot_.fill(false);
+            bindlessPartitionSlotValid_.fill(false);
         }
     }
 
@@ -1203,6 +1238,9 @@ void DrawBatchSystem::cullGeneric(const std::vector<DrawCmd>& draws, const Camer
     if (allowStaticCache && !buildingStaticBatches && !staticModelMatrices.empty()) {
         staticCacheValid_ = true;
     }
+    staticVisibilityDirty_ = false;
+    cullCachedFrustum_ = frustum;
+    cullResultCacheValid_ = true;
 }
 
 void DrawBatchSystem::cullDecals(const std::vector<DrawCmd>& draws) {
@@ -1655,7 +1693,7 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
     {
         const size_t totalMatIdx = staticMaterialIndices.size() + materialIndices.size();
         if (totalMatIdx > 0) {
-            if (!materialIndexSSBO_) glGenBuffers(1, materialIndexSSBO_.put());
+            if (!materialIndexSSBO_) { glGenBuffers(1, materialIndexSSBO_.put()); materialIndexStaticDirty_ = true; }
             const size_t dataBytes = totalMatIdx * sizeof(uint32_t);
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialIndexSSBO_);
             if (dataBytes > materialIndexSSBOCapacity_) {
@@ -1665,11 +1703,13 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                              nullptr,
                              GL_STREAM_DRAW);
                 materialIndexSSBOCapacity_ = newCap;
+                materialIndexStaticDirty_ = true;
             }
-            if (!staticMaterialIndices.empty()) {
+            if (!staticMaterialIndices.empty() && materialIndexStaticDirty_) {
                 glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
                                 static_cast<GLsizeiptr>(staticMaterialIndices.size() * sizeof(uint32_t)),
                                 staticMaterialIndices.data());
+                materialIndexStaticDirty_ = false;
             }
             if (!materialIndices.empty()) {
                 const GLintptr dynOffset = static_cast<GLintptr>(staticMaterialIndices.size() * sizeof(uint32_t));
@@ -1751,6 +1791,7 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
     size_t& passIndirectCapacity = useStaticIndirect ? indirectBufferCapacity_ : transientIndirectBufferCapacity_;
     uint32_t& passIndirectCursor = useStaticIndirect ? indirectUploadCursor_ : transientIndirectUploadCursor_;
     void*& indirectMapped = useStaticIndirect ? indirectPersistent_ : transientIndirectPersistent_;
+    uint32_t indirectSlot = 0;
     if (totalPackedCommands > 0) {
         const size_t neededIndirectBytes = totalPackedCommands * sizeof(DrawCommand);
         if (neededIndirectBytes > passIndirectCapacity) {
@@ -1760,6 +1801,7 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                 passIndirectCapacity = newCap;
                 if (useStaticIndirect) {
                     staticIndirectUploadedBySlot_.fill(false);
+                    bindlessPartitionSlotValid_.fill(false);
                 }
             }
         } else {
@@ -1767,10 +1809,10 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
         }
 
         if (passIndirectCapacity > 0) {
-            const uint32_t slot = NextUploadSlot(passIndirectCursor);
-            indirectSlotBaseOffset = static_cast<size_t>(slot) * passIndirectCapacity;
+            indirectSlot = NextUploadSlot(passIndirectCursor);
+            indirectSlotBaseOffset = static_cast<size_t>(indirectSlot) * passIndirectCapacity;
             const size_t staticBytes = staticPackedCount * sizeof(DrawCommand);
-            if (useStaticIndirect && staticBytes > 0 && !staticIndirectUploadedBySlot_[slot]) {
+            if (useStaticIndirect && staticBytes > 0 && !staticIndirectUploadedBySlot_[indirectSlot]) {
                 if (indirectMapped) {
                     PersistentWrite(indirectMapped, indirectSlotBaseOffset,
                                     staticIndirectCommandsPacked_.data(), staticBytes);
@@ -1780,7 +1822,7 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                                           staticBytes,
                                           staticIndirectCommandsPacked_.data());
                 }
-                staticIndirectUploadedBySlot_[slot] = true;
+                staticIndirectUploadedBySlot_[indirectSlot] = true;
             }
 
             if (!dynamicPackedCommands_.empty()) {
@@ -1795,6 +1837,35 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                                           dynamicPackedCommands_.data());
                 }
             }
+        }
+
+        // Bindless fast-path: if this slot's partitioned layout is already cached
+        // and there are no dynamic objects, skip re-partition + re-upload entirely.
+        if (bindlessMode && passIndirectCapacity > 0 &&
+            dynamicPackedCommands_.empty() && useStaticIndirect &&
+            bindlessPartitionSlotValid_[indirectSlot]) {
+            glBindBuffer(GL_DRAW_INDIRECT_BUFFER, passIndirectBuffer);
+            const size_t decalCount   = bindlessSlotDecalCount_[indirectSlot];
+            const size_t noDecalCount = totalPackedCommands - decalCount;
+            size_t bpDrawCalls = 0, bpBatches = 0;
+            if (decalCount > 0) {
+                glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(indirectSlotBaseOffset)),
+                    static_cast<GLsizei>(decalCount), 0);
+                bpDrawCalls += decalCount; ++bpBatches;
+            }
+            if (noDecalCount > 0) {
+                const size_t noDecalOffset = indirectSlotBaseOffset + decalCount * sizeof(DrawCommand);
+                glStencilFunc(GL_ALWAYS, 0, 0xFF);
+                glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(noDecalOffset)),
+                    static_cast<GLsizei>(noDecalCount), 0);
+                bpDrawCalls += noDecalCount; ++bpBatches;
+            }
+            lastFlushMetrics_.batchCount   = bpBatches;
+            lastFlushMetrics_.commandCount = bpDrawCalls;
+            return;
         }
     }
 
@@ -1853,6 +1924,7 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                 if (AllocatePersistentBuffer(passIndirectBuffer, indirectMapped,
                                              GL_DRAW_INDIRECT_BUFFER, newCap)) {
                     passIndirectCapacity = newCap;
+                    bindlessPartitionSlotValid_.fill(false);
                 } else {
                     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, passIndirectBuffer);
                 }
@@ -1895,6 +1967,12 @@ void DrawBatchSystem::flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTex
                 totalDrawCalls += noDecalCmds.size();
             }
             activeBatchCount = (decalCmds.empty() ? 0 : 1) + (noDecalCmds.empty() ? 0 : 1);
+            // Save partition layout to per-slot cache when no dynamic objects
+            if (dynamicPackedCommands_.empty() && passIndirectCapacity > 0 &&
+                repartBytes <= passIndirectCapacity) {
+                bindlessPartitionSlotValid_[indirectSlot] = true;
+                bindlessSlotDecalCount_[indirectSlot]    = decalCmds.size();
+            }
         }
     } else {
 

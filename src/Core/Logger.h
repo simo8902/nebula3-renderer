@@ -5,11 +5,11 @@
 #define NDEVC_LOGGING_SYSTEM
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -31,17 +31,19 @@ namespace NC::LOGGING {
     inline std::string TimestampNow() {
         const auto now = std::chrono::system_clock::now();
         const auto tt = std::chrono::system_clock::to_time_t(now);
+        const int ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
         std::tm tmValue{};
 #if defined(_WIN32)
         localtime_s(&tmValue, &tt);
 #else
         localtime_r(&tt, &tmValue);
 #endif
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-        std::ostringstream oss;
-        oss << std::put_time(&tmValue, "%Y-%m-%d %H:%M:%S")
-            << "." << std::setw(3) << std::setfill('0') << ms.count();
-        return oss.str();
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+            tmValue.tm_year + 1900, tmValue.tm_mon + 1, tmValue.tm_mday,
+            tmValue.tm_hour, tmValue.tm_min, tmValue.tm_sec, ms);
+        return buf;
     }
 
     inline std::ofstream& LogFile() {

@@ -18,6 +18,7 @@
 #include "Rendering/OpenGL/OpenGLShaderManager.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -57,7 +58,15 @@ void DeferredRenderer::BuildVisibilityGrids() {
 
 
 void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum) {
-    if (!enableVisibilityGrid_) {
+    // Reset Phase 2 per-frame metrics
+    costControlAlphaReduced_ = 0;
+    costControlDecalReduced_ = 0;
+    costControlEnvAlphaReduced_ = 0;
+    costControlPostAlphaReduced_ = 0;
+    visCellsHighDetail_ = 0;
+    visCellsLowDetail_ = 0;
+
+    if (!enableVisibilityGrid_ || activePolicy_.forceFullSceneVisible) {
         // Only run revealAll once when transitioning from enabled → disabled
         if (!visGridRevealedAll_) {
             visResolveSkipped_ = false;
@@ -89,9 +98,23 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
             visibleCells_.clear();
             lastVisibleCells_.clear();
             visGridRevealedAll_ = true;
+            visFrustumCacheValid_ = false;
         } else {
             visResolveSkipped_ = true;
         }
+        // Apply cost control even when grid is disabled (distance-based alpha reduction)
+        const glm::vec3 camPos = camera_.getPosition();
+        ApplyDistanceCostControl(camPos);
+        return;
+    }
+
+    // Camera-static fast path: if frustum hasn't changed, visible cells are identical.
+    if (visFrustumCacheValid_ &&
+        std::memcmp(&frustum, &visCachedFrustum_, sizeof(Camera::Frustum)) == 0) {
+        visResolveSkipped_ = true;
+        // Apply cost control unconditionally — restore path needed even when aggression == 0
+        const glm::vec3 camPos = camera_.getPosition();
+        ApplyDistanceCostControl(camPos);
         return;
     }
 
@@ -108,16 +131,14 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
     if (!queryGrid) { visResolveSkipped_ = true; return; }
     visGridRevealedAll_ = false;
 
-    // Use the camera's ground look-at point (ray → Y=0 intersection) as the
-    // visibility centre. The camera eye is behind and above the visible area;
-    // using the eye XZ makes the range expand from behind the camera outward,
-    // which reads on-screen as "bottom to top". The look-at point is the centre
-    // of what the player actually sees.
+    // Phase 2: record total cell count for metrics
+    frameProfile_.visCellsTotal = queryGrid->GetTotalCellCount();
+
     const glm::vec3 camPos = camera_.getPosition();
     const glm::vec3 fwd    = camera_.getForward();
     glm::vec3 visCenter(camPos.x, 0.0f, camPos.z);
     if (fwd.y < -0.05f) {
-        float t = -camPos.y / fwd.y; // ray-plane Y=0
+        float t = -camPos.y / fwd.y;
         if (std::isfinite(t) && t >= 0.0f) {
             const float maxLookAhead = (visibleRange_ > 0.0f) ? visibleRange_ : 1200.0f;
             t = std::min(t, maxLookAhead);
@@ -126,20 +147,45 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
         }
     }
 
-    // Run the cell query every frame — it's cheap (few AABB frustum tests).
-    queryGrid->QueryVisibleCells(visCenter, frustum, visibleRange_, visibleCells_);
+    // Effective visible range includes governor draw-distance adjustment.
+    // When policy distance is unlimited (0), governor still imposes a ceiling
+    // by subtracting from a large default so overloaded frames still shed cost.
+    float effectiveVisRange = visibleRange_;
+    if (budgetGovernor_.drawDistAdjust > 0.0f) {
+        if (effectiveVisRange <= 0.0f) {
+            // Unlimited base: start from a large world-space default
+            effectiveVisRange = std::max(100.0f, 1400.0f - budgetGovernor_.drawDistAdjust);
+        } else {
+            effectiveVisRange = std::max(100.0f, effectiveVisRange - budgetGovernor_.drawDistAdjust);
+        }
+    }
 
-    // If the set of visible cells hasn't changed since the last frame, all
-    // per-draw disabled flags are still correct. Skip the expensive hash-set
-    // rebuild + 9x draw-list iteration (~5-6ms saved at 6095 draws).
+    queryGrid->QueryVisibleCells(visCenter, frustum, effectiveVisRange, visibleCells_);
+    frameProfile_.visCellsFrustum = static_cast<int>(visibleCells_.size());
+
+    // Phase 2: PVS filtering hook
+    if (activePolicy_.allowPVS && pvsProvider_ && pvsProvider_->IsAvailable()) {
+        std::vector<int> pvsFiltered;
+        pvsFiltered.reserve(visibleCells_.size());
+        pvsProvider_->FilterCells(visCenter, visibleCells_, pvsFiltered);
+        visibleCells_ = std::move(pvsFiltered);
+    }
+    frameProfile_.visCellsAfterPVS = static_cast<int>(visibleCells_.size());
+
+    // Phase 2: classify cells as high/low detail for metrics
+    ClassifyChunkDetail(visCenter);
+
     if (visibleCells_ == lastVisibleCells_) {
+        visCachedFrustum_ = frustum;
+        visFrustumCacheValid_ = true;
         visResolveSkipped_ = true;
+        ApplyDistanceCostControl(visCenter);
         return;
     }
+    visCachedFrustum_ = frustum;
+    visFrustumCacheValid_ = true;
     visResolveSkipped_ = false;
 
-    // Nebula-style sequence:
-    // OnCullBefore(frame) -> Clear camera links -> Perform visibility query -> Resolve draw visibility.
     visibilityStage_.OnCullBefore(++visibilityStageFrameIndex_);
     visibilityStage_.UpdateCameraLinks(
         visibleCells_,
@@ -165,6 +211,137 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
     visibilityStage_.ResolveDrawVisibility(refractionDraws);
     visibilityStage_.ResolveDrawVisibility(decalDraws);
     lastVisibleCells_ = visibleCells_;
+
+    // Phase 2: count visible objects after cell+PVS gate
+    {
+        int visibleCount = 0;
+        auto countEnabled = [&](const std::vector<DrawCmd>& draws) {
+            for (const DrawCmd& dc : draws) {
+                if (!dc.disabled) ++visibleCount;
+            }
+        };
+        countEnabled(solidDraws);
+        countEnabled(alphaTestDraws);
+        countEnabled(environmentDraws);
+        frameProfile_.visObjectsAfterGate = visibleCount;
+    }
+
+    // Phase 2: apply distance-based cost control for expensive categories
+    ApplyDistanceCostControl(visCenter);
+}
+
+// ---------------------------------------------------------------------------
+// ClassifyChunkDetail — tag visible cells as high/low detail for metrics
+// ---------------------------------------------------------------------------
+void DeferredRenderer::ClassifyChunkDetail(const glm::vec3& visCenter) {
+    const VisibilityGrid* grid = nullptr;
+    if (solidVisGrid_.IsBuilt()) grid = &solidVisGrid_;
+    if (!grid || visibleCells_.empty()) {
+        visCellsHighDetail_ = 0;
+        visCellsLowDetail_ = 0;
+        frameProfile_.visCellsHigh = 0;
+        frameProfile_.visCellsLow = 0;
+        return;
+    }
+
+    const float cellSizeX = grid->GetCellSizeX();
+    const float cellSizeZ = grid->GetCellSizeZ();
+    const float cellDiag  = std::sqrt(cellSizeX * cellSizeX + cellSizeZ * cellSizeZ);
+    // lodBiasAdjust from the governor shrinks the high-detail radius (each +0.5 bias = -1 chunk)
+    const float totalLodBias = activePolicy_.lodBias + budgetGovernor_.lodBiasAdjust;
+    const int effectiveHighDetailChunks = std::max(0,
+        activePolicy_.highDetailRadiusChunks - static_cast<int>(totalLodBias + 0.5f));
+    const float highRadius = static_cast<float>(effectiveHighDetailChunks) * cellDiag;
+    const auto& cells = grid->GetCells();
+
+    int highCount = 0;
+    int lowCount = 0;
+    for (int idx : visibleCells_) {
+        if (idx < 0 || idx >= static_cast<int>(cells.size())) continue;
+        const VisibilityCell& cell = cells[idx];
+        const float cx = (cell.minXZ.x + cell.maxXZ.x) * 0.5f;
+        const float cz = (cell.minXZ.y + cell.maxXZ.y) * 0.5f;
+        const float dx = cx - visCenter.x;
+        const float dz = cz - visCenter.z;
+        const float distXZ = std::sqrt(dx * dx + dz * dz);
+        if (distXZ <= highRadius) {
+            ++highCount;
+        } else {
+            ++lowCount;
+        }
+    }
+    visCellsHighDetail_ = highCount;
+    visCellsLowDetail_ = lowCount;
+    frameProfile_.visCellsHigh = highCount;
+    frameProfile_.visCellsLow = lowCount;
+}
+
+// ---------------------------------------------------------------------------
+// ApplyDistanceCostControl — suppress expensive transparent categories at distance
+// ---------------------------------------------------------------------------
+void DeferredRenderer::ApplyDistanceCostControl(const glm::vec3& visCenter) {
+    const float aggression = budgetGovernor_.alphaAggressiveness;
+    const float nearDist = activePolicy_.alphaReductionNearDist;
+    const float farDist  = activePolicy_.alphaReductionFarDist;
+
+    costControlAlphaReduced_ = 0;
+    costControlDecalReduced_ = 0;
+    costControlEnvAlphaReduced_ = 0;
+    costControlPostAlphaReduced_ = 0;
+
+    // Always restore previously cost-control-disabled draws first.
+    // This guarantees that when aggression drops to 0 the draws re-enable.
+    auto restoreCategory = [](std::vector<DrawCmd>& draws) {
+        for (DrawCmd& dc : draws) {
+            if (dc.costControlDisabled) {
+                dc.disabled          = false;
+                dc.costControlDisabled = false;
+            }
+        }
+    };
+    restoreCategory(alphaTestDraws);
+    restoreCategory(decalDraws);
+    restoreCategory(environmentAlphaDraws);
+    restoreCategory(postAlphaUnlitDraws);
+
+    if (aggression <= 0.0f || farDist <= nearDist) {
+        frameProfile_.alphaReduced     = 0;
+        frameProfile_.decalReduced     = 0;
+        frameProfile_.envAlphaReduced  = 0;
+        frameProfile_.postAlphaReduced = 0;
+        return;
+    }
+
+    const float invRange = 1.0f / (farDist - nearDist);
+    const float threshold = 1.0f - aggression;
+
+    auto reduceCategory = [&](std::vector<DrawCmd>& draws) -> int {
+        int reduced = 0;
+        for (DrawCmd& dc : draws) {
+            if (dc.disabled || dc.userDisabled) continue;
+            const glm::vec3 drawPos(dc.worldMatrix[3]);
+            const float dx = drawPos.x - visCenter.x;
+            const float dz = drawPos.z - visCenter.z;
+            const float distXZ = std::sqrt(dx * dx + dz * dz);
+            const float t = (distXZ - nearDist) * invRange;
+            if (t > threshold) {
+                dc.disabled          = true;
+                dc.costControlDisabled = true;
+                ++reduced;
+            }
+        }
+        return reduced;
+    };
+
+    costControlAlphaReduced_     = reduceCategory(alphaTestDraws);
+    costControlDecalReduced_     = reduceCategory(decalDraws);
+    costControlEnvAlphaReduced_  = reduceCategory(environmentAlphaDraws);
+    costControlPostAlphaReduced_ = reduceCategory(postAlphaUnlitDraws);
+
+    frameProfile_.alphaReduced     = costControlAlphaReduced_;
+    frameProfile_.decalReduced     = costControlDecalReduced_;
+    frameProfile_.envAlphaReduced  = costControlEnvAlphaReduced_;
+    frameProfile_.postAlphaReduced = costControlPostAlphaReduced_;
 }
 
 

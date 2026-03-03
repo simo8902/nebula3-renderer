@@ -5,17 +5,34 @@
 #include "Core/Errors.h"
 #include "Core/Logger.h"
 #include "Rendering/OpenGL/OpenGLShader.h"
+#include <cstdlib>
 #include <fstream>
 #include <system_error>
 
 namespace NDEVC::Graphics::OpenGL {
+namespace {
+
+std::string ResolveShaderBaseDir() {
+    const char* envBase = std::getenv("NDEVC_SOURCE_DIR");
+    if (envBase && envBase[0]) {
+        return std::string(envBase);
+    }
+    return std::string(SOURCE_DIR);
+}
+
+std::string BuildShaderPath(const std::string& shaderBaseDir, const char* fileName) {
+    return (std::filesystem::path(shaderBaseDir) / "shaders" / fileName).string();
+}
+
+} // namespace
 
 OpenGLShaderManager::OpenGLShaderManager() {
-    NC::LOGGING::Log("[GL_SHADER_MGR] ctor");
+    const std::string shaderBaseDir = ResolveShaderBaseDir();
+    NC::LOGGING::Log("[GL_SHADER_MGR] ctor shaderBaseDir=", shaderBaseDir);
 
-    auto CreateShader = [this](const std::string& name, const char* vert, const char* frag) {
+    auto CreateShader = [this](const std::string& name, const std::string& vert, const std::string& frag) {
         NC::LOGGING::Log("[GL_SHADER_MGR] CreateShader name=", name, " V=", vert, " F=", frag);
-        auto shader = std::make_shared<OpenGLShader>(vert, frag);
+        auto shader = std::make_shared<OpenGLShader>(vert.c_str(), frag.c_str());
         if (!shader->IsValid()) {
             throw NC::Errors::LoggedRuntimeError(name + " shader init failed");
         }
@@ -26,11 +43,11 @@ OpenGLShaderManager::OpenGLShaderManager() {
         NC::LOGGING::Log("[GL_SHADER_MGR] Shader ready name=", name, " program=", programId);
     };
 
-    auto CreateShaderWithDefines = [this](const std::string& name, const char* vert, const char* frag,
+    auto CreateShaderWithDefines = [this](const std::string& name, const std::string& vert, const std::string& frag,
                                           const std::string& vertDefines, const std::string& fragDefines) {
         NC::LOGGING::Log("[GL_SHADER_MGR] CreateShaderWithDefines name=", name, " V=", vert, " F=", frag,
                          " VDef=", vertDefines.size(), " FDef=", fragDefines.size());
-        auto shader = std::make_shared<OpenGLShader>(vert, frag, vertDefines, fragDefines);
+        auto shader = std::make_shared<OpenGLShader>(vert.c_str(), frag.c_str(), vertDefines, fragDefines);
         if (!shader->IsValid()) {
             throw NC::Errors::LoggedRuntimeError(name + " shader init failed");
         }
@@ -41,85 +58,124 @@ OpenGLShaderManager::OpenGLShaderManager() {
         NC::LOGGING::Log("[GL_SHADER_MGR] Shader ready name=", name, " program=", programId);
     };
 
-    CreateShader("NDEVCdeferred", SOURCE_DIR "/shaders/NDEVCdeferred.vert", SOURCE_DIR "/shaders/NDEVCdeferred.frag");
+    CreateShader("NDEVCdeferred",
+                 BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
+                 BuildShaderPath(shaderBaseDir, "NDEVCdeferred.frag"));
     CreateShaderWithDefines(
         "NDEVCdeferred_bindless",
-        SOURCE_DIR "/shaders/NDEVCdeferred.vert",
-        SOURCE_DIR "/shaders/NDEVCdeferred.frag",
+        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
+        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.frag"),
         "#define BINDLESS 1\n",
         "#define BINDLESS 1\n");
-    CreateShader("standard", SOURCE_DIR "/shaders/standard.vert", SOURCE_DIR "/shaders/standard.frag");
-    CreateShader("particle", SOURCE_DIR "/shaders/particle.vert", SOURCE_DIR "/shaders/particle.frag");
-    CreateShader("environment", SOURCE_DIR "/shaders/environment.vert", SOURCE_DIR "/shaders/environment.frag");
-    CreateShader("environmentAlpha", SOURCE_DIR "/shaders/environment.vert", SOURCE_DIR "/shaders/environment_alpha.frag");
+    CreateShader("NDEVCdeferred_alpha_depth",
+        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
+        BuildShaderPath(shaderBaseDir, "NDEVCdeferred_alpha_depth.frag"));
+    CreateShaderWithDefines(
+        "NDEVCdeferred_alpha_depth_bindless",
+        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
+        BuildShaderPath(shaderBaseDir, "NDEVCdeferred_alpha_depth.frag"),
+        "#define BINDLESS 1\n",
+        "#define BINDLESS 1\n");
+    CreateShader("standard",
+                 BuildShaderPath(shaderBaseDir, "standard.vert"),
+                 BuildShaderPath(shaderBaseDir, "standard.frag"));
+    CreateShader("particle",
+                 BuildShaderPath(shaderBaseDir, "particle.vert"),
+                 BuildShaderPath(shaderBaseDir, "particle.frag"));
+    CreateShader("environment",
+                 BuildShaderPath(shaderBaseDir, "environment.vert"),
+                 BuildShaderPath(shaderBaseDir, "environment.frag"));
+    CreateShader("environmentAlpha",
+                 BuildShaderPath(shaderBaseDir, "environment.vert"),
+                 BuildShaderPath(shaderBaseDir, "environment_alpha.frag"));
     CreateShaderWithDefines(
         "environmentAlpha_bindless",
-        SOURCE_DIR "/shaders/environment.vert",
-        SOURCE_DIR "/shaders/environment_alpha.frag",
+        BuildShaderPath(shaderBaseDir, "environment.vert"),
+        BuildShaderPath(shaderBaseDir, "environment_alpha.frag"),
         "#define BINDLESS 1\n",
         "#define BINDLESS 1\n");
     CreateShaderWithDefines(
         "simplelayer",
-        SOURCE_DIR "/shaders/simplelayer.vert",
-        SOURCE_DIR "/shaders/simplelayer.frag",
+        BuildShaderPath(shaderBaseDir, "simplelayer.vert"),
+        BuildShaderPath(shaderBaseDir, "simplelayer.frag"),
         "#define SKINNING_MODE 2\n#define PASS 1\n",
         "#define PASS 3\n");
     CreateShaderWithDefines(
         "simplelayer_gbuffer",
-        SOURCE_DIR "/shaders/simplelayer.vert",
-        SOURCE_DIR "/shaders/simplelayer.frag",
+        BuildShaderPath(shaderBaseDir, "simplelayer.vert"),
+        BuildShaderPath(shaderBaseDir, "simplelayer.frag"),
         "#define SKINNING_MODE 2\n#define PASS 2\n",
         "#define PASS 5\n");
     CreateShaderWithDefines(
         "simplelayer_gbuffer_clip",
-        SOURCE_DIR "/shaders/simplelayer.vert",
-        SOURCE_DIR "/shaders/simplelayer.frag",
+        BuildShaderPath(shaderBaseDir, "simplelayer.vert"),
+        BuildShaderPath(shaderBaseDir, "simplelayer.frag"),
         "#define SKINNING_MODE 2\n#define PASS 2\n",
         "#define PASS 4\n");
     CreateShaderWithDefines(
         "simplelayer_shadow",
-        SOURCE_DIR "/shaders/simplelayer.vert",
-        SOURCE_DIR "/shaders/simplelayer.frag",
+        BuildShaderPath(shaderBaseDir, "simplelayer.vert"),
+        BuildShaderPath(shaderBaseDir, "simplelayer.frag"),
         "#define SKINNING_MODE 2\n#define PASS 3\n",
         "#define PASS 6\n");
     CreateShaderWithDefines(
         "simplelayer_depth",
-        SOURCE_DIR "/shaders/simplelayer.vert",
-        SOURCE_DIR "/shaders/simplelayer.frag",
+        BuildShaderPath(shaderBaseDir, "simplelayer.vert"),
+        BuildShaderPath(shaderBaseDir, "simplelayer.frag"),
         "#define SKINNING_MODE 2\n#define PASS 4\n",
         "#define PASS 7\n");
-    CreateShader("postalphaunlit", SOURCE_DIR "/shaders/postalphaunlit.vert", SOURCE_DIR "/shaders/postalphaunlit.frag");
-    CreateShader("NDEVCdecal_mesh", SOURCE_DIR "/shaders/NDEVCdecal_mesh.vert", SOURCE_DIR "/shaders/NDEVCdecal_mesh.frag");
+    CreateShader("postalphaunlit",
+                 BuildShaderPath(shaderBaseDir, "postalphaunlit.vert"),
+                 BuildShaderPath(shaderBaseDir, "postalphaunlit.frag"));
+    CreateShader("NDEVCdecal_mesh",
+                 BuildShaderPath(shaderBaseDir, "NDEVCdecal_mesh.vert"),
+                 BuildShaderPath(shaderBaseDir, "NDEVCdecal_mesh.frag"));
     CreateShaderWithDefines(
         "NDEVCdecal_mesh_bindless",
-        SOURCE_DIR "/shaders/NDEVCdecal_mesh.vert",
-        SOURCE_DIR "/shaders/NDEVCdecal_mesh.frag",
+        BuildShaderPath(shaderBaseDir, "NDEVCdecal_mesh.vert"),
+        BuildShaderPath(shaderBaseDir, "NDEVCdecal_mesh.frag"),
         "#define BINDLESS 1\n",
         "#define BINDLESS 1\n");
-    CreateShader("refraction", SOURCE_DIR "/shaders/refraction.vert", SOURCE_DIR "/shaders/refraction.frag");
+    CreateShader("refraction",
+                 BuildShaderPath(shaderBaseDir, "refraction.vert"),
+                 BuildShaderPath(shaderBaseDir, "refraction.frag"));
     CreateShaderWithDefines(
         "refraction_bindless",
-        SOURCE_DIR "/shaders/refraction.vert",
-        SOURCE_DIR "/shaders/refraction.frag",
+        BuildShaderPath(shaderBaseDir, "refraction.vert"),
+        BuildShaderPath(shaderBaseDir, "refraction.frag"),
         "#define BINDLESS 1\n",
         "#define BINDLESS 1\n");
-    CreateShader("water", SOURCE_DIR "/shaders/water.vert", SOURCE_DIR "/shaders/water.frag");
+    CreateShader("water",
+                 BuildShaderPath(shaderBaseDir, "water.vert"),
+                 BuildShaderPath(shaderBaseDir, "water.frag"));
     CreateShaderWithDefines(
         "water_bindless",
-        SOURCE_DIR "/shaders/water.vert",
-        SOURCE_DIR "/shaders/water.frag",
+        BuildShaderPath(shaderBaseDir, "water.vert"),
+        BuildShaderPath(shaderBaseDir, "water.frag"),
         "#define BINDLESS 1\n",
         "#define BINDLESS 1\n");
-    CreateShader("lighting", SOURCE_DIR "/shaders/lighting.vert", SOURCE_DIR "/shaders/lighting.frag");
-    CreateShader("lightCompose", SOURCE_DIR "/shaders/lighting.vert", SOURCE_DIR "/shaders/lightCompose.frag");
-    CreateShader("lightComposition", SOURCE_DIR "/shaders/lighting.vert", SOURCE_DIR "/shaders/lightComposition.frag");
-    CreateShader("pointLight", SOURCE_DIR "/shaders/pointLight.vert", SOURCE_DIR "/shaders/pointLight.frag");
-    CreateShader("lightShadows", SOURCE_DIR "/shaders/lightShadows.vert", SOURCE_DIR "/shaders/lightShadows.frag");
-    CreateShader("blit", SOURCE_DIR "/shaders/blit.vert", SOURCE_DIR "/shaders/blit.frag");
+    CreateShader("lighting",
+                 BuildShaderPath(shaderBaseDir, "lighting.vert"),
+                 BuildShaderPath(shaderBaseDir, "lighting.frag"));
+    CreateShader("lightCompose",
+                 BuildShaderPath(shaderBaseDir, "lighting.vert"),
+                 BuildShaderPath(shaderBaseDir, "lightCompose.frag"));
+    CreateShader("lightComposition",
+                 BuildShaderPath(shaderBaseDir, "lighting.vert"),
+                 BuildShaderPath(shaderBaseDir, "lightComposition.frag"));
+    CreateShader("pointLight",
+                 BuildShaderPath(shaderBaseDir, "pointLight.vert"),
+                 BuildShaderPath(shaderBaseDir, "pointLight.frag"));
+    CreateShader("lightShadows",
+                 BuildShaderPath(shaderBaseDir, "lightShadows.vert"),
+                 BuildShaderPath(shaderBaseDir, "lightShadows.frag"));
+    CreateShader("blit",
+                 BuildShaderPath(shaderBaseDir, "blit.vert"),
+                 BuildShaderPath(shaderBaseDir, "blit.frag"));
 
     NC::LOGGING::Log("[GL_SHADER_MGR] initialized shaderCount=", shaders_.size());
 
-    std::filesystem::path shadersPath = SOURCE_DIR "/shaders/";
+    std::filesystem::path shadersPath = std::filesystem::path(shaderBaseDir) / "shaders";
     searchPaths_.emplace_back(shadersPath);
 }
 
@@ -148,6 +204,16 @@ void OpenGLShaderManager::ProcessPendingReloads() {
         std::lock_guard<std::mutex> lock(shaderMutex_);
         todo.swap(pendingReloads_);
     }
+    static bool loggedIdleOnce = false;
+    if (todo.empty()) {
+        if (!loggedIdleOnce) {
+            NC::LOGGING::Log("[GL_SHADER_MGR] ProcessPendingReloads count=0");
+            loggedIdleOnce = true;
+        }
+        return;
+    }
+
+    loggedIdleOnce = false;
     NC::LOGGING::Log("[GL_SHADER_MGR] ProcessPendingReloads count=", todo.size());
     for (auto& name : todo) ReloadShader(name);
 }
@@ -162,45 +228,68 @@ void OpenGLShaderManager::FileWatchLoop() {
 }
 
 void OpenGLShaderManager::UpdateFileMonitoring() {
-    std::lock_guard<std::mutex> lock(shaderMutex_);
+    struct WatchedShaderPath {
+        std::string name;
+        std::string path;
+    };
 
-    for (auto& [name, shader] : shaders_) {
-        auto glShader = std::dynamic_pointer_cast<OpenGLShader>(shader);
-        if (!glShader) continue;
-
-        auto checkFile = [&](const std::string& path) {
-            if (path.empty()) return;
-            std::error_code ec;
-            const std::filesystem::path fsPath(path);
-            if (!std::filesystem::exists(fsPath, ec)) {
-                if (ec) {
-                    NC::LOGGING::Error("[GL_SHADER_MGR] exists() failed path=", path, " err=", ec.message());
-                } else {
-                    NC::LOGGING::Error("[GL_SHADER_MGR] Shader file missing path=", path);
-                }
-                return;
+    std::vector<WatchedShaderPath> watchedPaths;
+    std::unordered_map<std::string, std::filesystem::file_time_type> timestampsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(shaderMutex_);
+        watchedPaths.reserve(shaders_.size() * 2);
+        for (const auto& [name, shader] : shaders_) {
+            auto glShader = std::dynamic_pointer_cast<OpenGLShader>(shader);
+            if (!glShader) continue;
+            const auto& paths = glShader->GetPaths();
+            if (!paths.vertex.empty()) {
+                watchedPaths.push_back({name, paths.vertex});
             }
+            if (!paths.fragment.empty()) {
+                watchedPaths.push_back({name, paths.fragment});
+            }
+        }
+        timestampsSnapshot = fileTimestamps_;
+    }
+
+    std::unordered_map<std::string, std::filesystem::file_time_type> changedTimestamps;
+    std::unordered_set<std::string> changedShaders;
+    for (const auto& watched : watchedPaths) {
+        std::error_code ec;
+        const std::filesystem::path fsPath(watched.path);
+        if (!std::filesystem::exists(fsPath, ec)) {
             if (ec) {
-                NC::LOGGING::Error("[GL_SHADER_MGR] exists() error path=", path, " err=", ec.message());
-                return;
+                NC::LOGGING::Error("[GL_SHADER_MGR] exists() failed path=", watched.path, " err=", ec.message());
+            } else {
+                NC::LOGGING::Error("[GL_SHADER_MGR] Shader file missing path=", watched.path);
             }
+            continue;
+        }
+        if (ec) {
+            NC::LOGGING::Error("[GL_SHADER_MGR] exists() error path=", watched.path, " err=", ec.message());
+            continue;
+        }
 
-            const auto ftime = std::filesystem::last_write_time(fsPath, ec);
-            if (ec) {
-                NC::LOGGING::Error("[GL_SHADER_MGR] last_write_time() failed path=", path, " err=", ec.message());
-                return;
-            }
+        const auto ftime = std::filesystem::last_write_time(fsPath, ec);
+        if (ec) {
+            NC::LOGGING::Error("[GL_SHADER_MGR] last_write_time() failed path=", watched.path, " err=", ec.message());
+            continue;
+        }
 
-            auto it = fileTimestamps_.find(path);
-            if (it == fileTimestamps_.end() || it->second != ftime) {
-                fileTimestamps_[path] = ftime;
-                pendingReloads_.insert(name);
-                NC::LOGGING::Log("[GL_SHADER_MGR] File changed name=", name, " path=", path);
-            }
-        };
+        auto snapshotIt = timestampsSnapshot.find(watched.path);
+        if (snapshotIt == timestampsSnapshot.end() || snapshotIt->second != ftime) {
+            changedTimestamps[watched.path] = ftime;
+            changedShaders.insert(watched.name);
+            NC::LOGGING::Log("[GL_SHADER_MGR] File changed name=", watched.name, " path=", watched.path);
+        }
+    }
 
-        checkFile(glShader->GetPaths().vertex);
-        checkFile(glShader->GetPaths().fragment);
+    if (!changedShaders.empty()) {
+        std::lock_guard<std::mutex> lock(shaderMutex_);
+        for (const auto& [path, ftime] : changedTimestamps) {
+            fileTimestamps_[path] = ftime;
+        }
+        pendingReloads_.insert(changedShaders.begin(), changedShaders.end());
     }
 }
 
@@ -348,7 +437,6 @@ void OpenGLShaderManager::ReloadShader(const std::string& name) {
 }
 
 void OpenGLShaderManager::HandleFileDrop(const std::vector<std::string>& paths) {
-    std::lock_guard<std::mutex> lock(shaderMutex_);
     NC::LOGGING::Log("[GL_SHADER_MGR] HandleFileDrop count=", paths.size());
     for(const auto& path : paths) {
         NC::LOGGING::Log("[GL_SHADER_MGR] HandleFileDrop path=", path);

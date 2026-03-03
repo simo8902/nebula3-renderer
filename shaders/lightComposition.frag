@@ -4,9 +4,10 @@ out vec4 FragColor;
 
 uniform sampler2D lightBufferTex;
 uniform sampler2D gAlbedoSpec;
-uniform sampler2D gPositionVS;
+uniform sampler2D gDepthTex;
 uniform sampler2D gEmissiveTex;
 uniform sampler2D gNormalDepthPacked;
+uniform mat4 invProjection;
 uniform int DisableLighting;
 uniform int DisableFog;
 uniform vec4 fogColor;
@@ -14,10 +15,6 @@ uniform vec4 fogDistances;
 
 vec4 DecodeHDR(vec4 rgba) {
     return rgba * vec4(2.0, 2.0, 2.0, 1.0);
-}
-
-vec3 ACESFilm(vec3 x) {
-    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
 vec4 psLightMaterial(vec4 lightValues, vec4 diffColor, vec3 emsvColor,
@@ -29,9 +26,17 @@ float emsvIntensity, vec3 specColor, float specIntensity) {
     vec3 normedColor = normalize(lightValues.rgb + vec3(0.0001));
     float maxColor = max(max(normedColor.x, normedColor.y), normedColor.z);
     normedColor /= maxColor;
-    float spec = min(lightValues.a, 1.0);
+    float spec = lightValues.a;
     color.rgb += specColor * specIntensity * spec * normedColor;
     return color;
+}
+
+vec3 reconstructViewPosFromDepth(vec2 uv, float depthSample) {
+    vec2 ndcXY = uv * 2.0 - 1.0;
+    float ndcZ = depthSample * 2.0 - 1.0;
+    vec4 clipPos = vec4(ndcXY, ndcZ, 1.0);
+    vec4 viewPos = invProjection * clipPos;
+    return viewPos.xyz / max(abs(viewPos.w), 1e-6);
 }
 
 void main() {
@@ -47,10 +52,11 @@ void main() {
     vec3 albedo = albedoSpec.rgb;
     float specInt = albedoSpec.a;
 
-    // AO path disabled: keep lighting unaffected by gPositionVS.a payload.
+    // AO path disabled.
     float ao = 1.0;
     vec3 emsvColor = texture(gEmissiveTex, TexCoords).rgb;
-    vec3 viewPos = texture(gPositionVS, TexCoords).xyz;
+    float depthSample = texture(gDepthTex, TexCoords).r;
+    vec3 viewPos = reconstructViewPosFromDepth(TexCoords, depthSample);
 
     lightValues.rgb *= ao;
 
@@ -63,17 +69,11 @@ void main() {
         vec3(specInt), 1.0);
     }
 
-    // Force fog fully disabled for diagnosis: no camera-distance greying.
+    if (DisableFog == 0) {
+        float fogRange = max(fogDistances.y - fogDistances.x, 0.0001);
+        float fogFactor = clamp((fogDistances.y - abs(viewPos.z)) / fogRange, fogColor.w, 1.0);
+        oColor.rgb = mix(fogColor.rgb, oColor.rgb, fogFactor);
+    }
 
-    vec3 color = oColor.rgb;
-    color *= 0.96;
-    color = ACESFilm(color);
-    color = pow(color, vec3(1.0/2.2));
-
-    color *= vec3(1.06, 1.00, 0.92);
-    float luma = dot(color, vec3(0.299, 0.587, 0.114));
-    color = mix(vec3(luma), color, 1.04);
-    color = (color - 0.5) * 1.03 + 0.5;
-
-    FragColor = vec4(clamp(color, 0.0, 1.0), oColor.a);
+    FragColor = oColor;
 }

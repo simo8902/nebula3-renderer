@@ -15,7 +15,12 @@ uniform mat4 view;
 uniform mat4 model;
 uniform mat4 JointMatrices[128];
 uniform int UseSkinning;
+uniform int UseInstancing;
 uniform mat4 textureTransform0;
+
+layout(binding = 1, std430) readonly buffer ModelMatrixBuffer {
+    mat4 models[];
+};
 
 out vec2 sUV;
 out vec4 sColor;
@@ -34,7 +39,8 @@ void main() {
         lp = m * lp;
     }
 
-    vec4 wpos = model * lp;
+    mat4 modelMat = (UseInstancing > 0) ? models[gl_BaseInstance + gl_InstanceID] : model;
+    vec4 wpos = modelMat * lp;
     sUV = (textureTransform0 * vec4(texcoord0, 0.0, 1.0)).xy;
     sColor = color;
     gl_Position = projection * view * wpos;

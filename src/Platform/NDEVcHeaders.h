@@ -77,6 +77,11 @@ inline std::string ResolveAssetRoot(const char* envName,
         if (std::filesystem::exists(envRoot, ec) && std::filesystem::is_directory(envRoot, ec)) {
             return NormalizeRoot(envRoot);
         }
+        // In package/VFS mode the path is virtual — no real directory exists on disk.
+        // Trust the env var so path construction produces strings the VFS normalizer can strip.
+        if (!ReadEnvString("NDEVC_PACKAGE_PATH").empty()) {
+            return NormalizeRoot(envRoot);
+        }
         std::cerr << "[PATH][ERROR] Invalid " << envName << "='" << envPath << "' (directory not found)\n";
     }
 
@@ -132,6 +137,11 @@ inline const std::string& GetTexturesRoot() {
         "NDEVC_TEXTURES_ROOT", {"assets/textures", "textures", "bin/textures"});
     return value;
 }
+inline const std::string& GetScenesRoot() {
+    static const std::string value = ResolveAssetRoot(
+        "NDEVC_SCENES_ROOT", {"assets/scenes", "scenes", "bin/scenes"});
+    return value;
+}
 } // namespace NDEVC::Paths
 
 #define MODELS_ROOT (NDEVC::Paths::GetModelsRoot())
@@ -139,4 +149,5 @@ inline const std::string& GetTexturesRoot() {
 #define MAP_ROOT (NDEVC::Paths::GetMapsRoot())
 #define ANIMS_ROOT (NDEVC::Paths::GetAnimsRoot())
 #define TEXTURES_ROOT (NDEVC::Paths::GetTexturesRoot())
+#define SCENES_ROOT (NDEVC::Paths::GetScenesRoot())
 #endif

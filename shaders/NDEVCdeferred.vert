@@ -12,7 +12,6 @@ layout(location = 7) in vec3 binormal;
 uniform mat4  projection;
 uniform mat4  view;
 uniform mat4  model;
-uniform mat3  normalMatrix;       // CPU: transpose(inverse(mat3(view * model))) — replaces GPU inversion + gives view-space like original imv
 uniform mat4x3 JointMatrices[72]; // mat4x3 matches original float4x3, no wasted w row
 uniform int   UseSkinning;
 uniform int   UseInstancing;
@@ -21,6 +20,13 @@ uniform mat4  textureTransform0;
 layout(binding = 1, std430) readonly buffer ModelMatrixBuffer {
     mat4 models[];
 };
+
+#ifdef BINDLESS
+layout(std430, binding = 3) readonly buffer MaterialIndexBuffer {
+    uint matIndices[];
+};
+flat out uint vMaterialID;
+#endif
 
 out vec3 sWorldPos;
 out vec3 sViewPos;
@@ -31,7 +37,11 @@ out vec3 sNormal;
 out vec3 sBinormal;
 
 void main() {
-    mat4 modelMat = (UseInstancing > 0) ? models[gl_BaseInstance] : model;
+    mat4 modelMat = (UseInstancing > 0) ? models[gl_BaseInstance + gl_InstanceID] : model;
+
+#ifdef BINDLESS
+    vMaterialID = matIndices[gl_BaseInstance + gl_InstanceID];
+#endif
 
     vec4 lp = vec4(position, 1.0);
     vec3 ln = normal;
@@ -64,11 +74,18 @@ void main() {
     sWorldPos = wpos.xyz;
     sViewPos  = (view * wpos).xyz;
 
-    // normalMatrix is view-space normal matrix (matches original imv)
-    // no Gram-Schmidt — original doesn't do it, just transform + normalize
-    sTangent  = normalize(normalMatrix * lt);
-    sNormal   = normalize(normalMatrix * ln);
-    sBinormal = normalize(normalMatrix * lb);
+    // World-space TBN (matches environment.vert)
+    mat3 nM = mat3(modelMat);
+    vec3 N = normalize(nM * ln);
+    vec3 T = normalize(nM * lt);
+    T = normalize(T - N * dot(T, N));
+    vec3 Borig = normalize(nM * lb);
+    float handed = sign(dot(cross(N, T), Borig));
+    vec3 B = normalize(cross(N, T)) * handed;
+
+    sTangent  = T;
+    sNormal   = N;
+    sBinormal = B;
 
     sUV  = (textureTransform0 * vec4(texcoord0, 0.0, 1.0)).xy;
     sUV1 = (textureTransform0 * vec4(texcoord1, 0.0, 1.0)).xy;

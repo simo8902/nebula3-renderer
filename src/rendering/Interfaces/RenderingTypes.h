@@ -26,7 +26,8 @@ enum class BufferType {
     Vertex,
     Index,
     Uniform,
-    Indirect
+    Indirect,
+    Storage
 };
 
 enum class TextureType {

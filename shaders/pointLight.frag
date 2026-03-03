@@ -37,8 +37,7 @@ void main() {
     vec3 lightDir = lp.xyz - surfacePos;
     float dist = length(lightDir);
     float lightRange = max(lp.w, 0.001);
-    float invRangeSq = 1.0 / (lightRange * lightRange);
-    float att = clamp(1.0 - dist * invRangeSq, 0.0, 1.0);
+    float att = clamp(1.0 - dist / lightRange, 0.0, 1.0);
     att *= att;
     if (att < 0.004) discard;
 

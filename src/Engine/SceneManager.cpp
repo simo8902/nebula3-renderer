@@ -14,11 +14,16 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <random>
+#include <sstream>
 #include <unordered_set>
 
 namespace {
@@ -59,6 +64,18 @@ std::string ToLower(std::string value) {
 bool ContainsNoCase(const std::string& haystack, const std::string& needle) {
     if (needle.empty()) return true;
     return ToLower(haystack).find(ToLower(needle)) != std::string::npos;
+}
+
+void InsertIfNotEmpty(std::unordered_set<std::string>& values, const std::string& value) {
+    if (!value.empty()) {
+        values.insert(value);
+    }
+}
+
+std::vector<std::string> SortedStrings(std::unordered_set<std::string>& values) {
+    std::vector<std::string> out(values.begin(), values.end());
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 float GetFloatParam(const std::unordered_map<std::string, float>& values,
@@ -417,6 +434,50 @@ double NowSeconds() {
     using Clock = std::chrono::steady_clock;
     return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
 }
+
+std::string Trim(std::string value) {
+    const auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(),
+        [&](unsigned char c) { return !isSpace(c); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(),
+        [&](unsigned char c) { return !isSpace(c); }).base(), value.end());
+    return value;
+}
+
+bool ParseVec3(const std::string& value, glm::vec3& out) {
+    std::istringstream is(value);
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    if (!(is >> x >> y >> z)) {
+        return false;
+    }
+    out = glm::vec3(x, y, z);
+    return true;
+}
+
+bool ParseQuat(const std::string& value, glm::quat& out) {
+    std::istringstream is(value);
+    float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
+    if (!(is >> x >> y >> z >> w)) {
+        return false;
+    }
+    out = glm::quat(w, x, y, z);
+    return true;
+}
+
+std::string GenerateSceneGuid() {
+    static std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<uint64_t> dist;
+    const uint64_t a = dist(rng);
+    const uint64_t b = dist(rng);
+    std::ostringstream os;
+    os << std::hex << std::setfill('0')
+       << std::setw(8) << static_cast<uint32_t>(a >> 32) << "-"
+       << std::setw(4) << static_cast<uint16_t>(a >> 16) << "-"
+       << std::setw(4) << static_cast<uint16_t>(a) << "-"
+       << std::setw(4) << static_cast<uint16_t>(b >> 48) << "-"
+       << std::setw(12) << (b & 0x0000FFFFFFFFFFFFull);
+    return os.str();
+}
 }
 
 // ── Parity lifecycle diagnostics (Nebula 1:1 mapping) ──────────────────
@@ -633,7 +694,455 @@ void SceneManager::Initialize(NDEVC::Graphics::IGraphicsDevice* device,
                               NDEVC::Graphics::IShaderManager* shaderMgr) {
     device_ = device;
     shaderMgr_ = shaderMgr;
+    if (activeSceneGuid_.empty()) {
+        activeSceneGuid_ = GenerateSceneGuid();
+    }
     NC::LOGGING::Log("[SCENE] Initialize device=", (device_ ? 1 : 0), " shaderMgr=", (shaderMgr_ ? 1 : 0));
+}
+
+SceneManager::AuthoredEntity* SceneManager::FindAuthoredEntity(SceneEntityId id) {
+    for (auto& entity : authoredEntities_) {
+        if (entity.id == id) {
+            return &entity;
+        }
+    }
+    return nullptr;
+}
+
+const SceneManager::AuthoredEntity* SceneManager::FindAuthoredEntity(SceneEntityId id) const {
+    for (const auto& entity : authoredEntities_) {
+        if (entity.id == id) {
+            return &entity;
+        }
+    }
+    return nullptr;
+}
+
+std::string SceneManager::BuildDefaultEntityName(const std::string& preferredBase) const {
+    const std::string base = preferredBase.empty() ? "GameObject" : preferredBase;
+    if (std::none_of(authoredEntities_.begin(), authoredEntities_.end(),
+        [&](const AuthoredEntity& entity) { return entity.name == base; })) {
+        return base;
+    }
+    for (int i = 1; i < 1000000; ++i) {
+        const std::string candidate = base + " " + std::to_string(i);
+        const bool exists = std::any_of(authoredEntities_.begin(), authoredEntities_.end(),
+            [&](const AuthoredEntity& entity) { return entity.name == candidate; });
+        if (!exists) {
+            return candidate;
+        }
+    }
+    return base + "_overflow";
+}
+
+std::string SceneManager::EnsureScenePathHasExtension(const std::string& path) const {
+    if (path.empty()) {
+        return {};
+    }
+    std::filesystem::path normalized(path);
+    if (!normalized.has_extension()) {
+        normalized += ".ndscene";
+    }
+    return normalized.string();
+}
+
+void SceneManager::MarkSceneDirty() {
+    if (!suppressSceneDirty_) {
+        activeSceneDirty_ = true;
+    }
+}
+
+SceneManager::SceneAssetInfo SceneManager::GetActiveSceneInfo() const {
+    SceneAssetInfo info;
+    info.guid = activeSceneGuid_;
+    info.name = activeSceneName_;
+    info.sourcePath = activeScenePath_;
+    info.mapPath = currentMapSourcePath_;
+    info.dirty = activeSceneDirty_;
+    info.entityCount = authoredEntities_.size();
+    return info;
+}
+
+void SceneManager::CreateScene(const std::string& sceneName) {
+    suppressSceneDirty_ = true;
+    Clear();
+    authoredEntities_.clear();
+    nextSceneEntityId_ = 1;
+    activeSceneGuid_ = GenerateSceneGuid();
+    activeSceneName_ = sceneName.empty() ? "Untitled Scene" : sceneName;
+    activeScenePath_.clear();
+    suppressSceneDirty_ = false;
+    activeSceneDirty_ = false;
+}
+
+bool SceneManager::SaveSceneToPath(const std::string& path) {
+    const std::string normalizedPath = EnsureScenePathHasExtension(path);
+    if (normalizedPath.empty()) {
+        NC::LOGGING::Error("[SCENE] SaveScene failed: empty output path");
+        return false;
+    }
+
+    std::filesystem::path fsPath(normalizedPath);
+    std::error_code ec;
+    if (fsPath.has_parent_path()) {
+        std::filesystem::create_directories(fsPath.parent_path(), ec);
+        if (ec) {
+            NC::LOGGING::Error("[SCENE] SaveScene failed creating directories path=", normalizedPath,
+                               " err=", ec.message());
+            return false;
+        }
+    }
+
+    std::ofstream out(fsPath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        NC::LOGGING::Error("[SCENE] SaveScene failed opening file path=", normalizedPath);
+        return false;
+    }
+    if (activeSceneGuid_.empty()) {
+        activeSceneGuid_ = GenerateSceneGuid();
+    }
+
+    auto sanitize = [](std::string value) {
+        std::replace(value.begin(), value.end(), '\r', ' ');
+        std::replace(value.begin(), value.end(), '\n', ' ');
+        return value;
+    };
+
+    // Try to save paths relative to the scene file directory for portability
+    std::filesystem::path sceneDir = fsPath.parent_path();
+    auto makeRelative = [&](const std::string& absPath) -> std::string {
+        if (absPath.empty()) return absPath;
+        std::error_code ec2;
+        auto rel = std::filesystem::relative(std::filesystem::path(absPath), sceneDir, ec2);
+        if (!ec2 && !rel.empty() && rel.string().rfind("..", 0) != 0) {
+            return rel.string();
+        }
+        return absPath;
+    };
+
+    out << "NDSCENE1\n";
+    out << "guid=" << sanitize(activeSceneGuid_) << "\n";
+    out << "name=" << sanitize(activeSceneName_) << "\n";
+    out << "map_path=" << sanitize(makeRelative(currentMapSourcePath_)) << "\n";
+    out << "source_map=" << sanitize(makeRelative(currentMapSourcePath_)) << "\n";
+    out << "entity_count=" << authoredEntities_.size() << "\n";
+    for (const AuthoredEntity& entity : authoredEntities_) {
+        out << "entity_begin\n";
+        out << "id=" << entity.id << "\n";
+        out << "parent_id=" << entity.parentId << "\n";
+        out << "name=" << sanitize(entity.name) << "\n";
+        out << "model_path=" << sanitize(makeRelative(entity.modelPath)) << "\n";
+        out << "pos=" << entity.position.x << " " << entity.position.y << " " << entity.position.z << "\n";
+        out << "rot=" << entity.rotation.x << " " << entity.rotation.y << " "
+            << entity.rotation.z << " " << entity.rotation.w << "\n";
+        out << "scale=" << entity.scale.x << " " << entity.scale.y << " " << entity.scale.z << "\n";
+        out << "enabled=" << (entity.enabled ? 1 : 0) << "\n";
+        out << "entity_end\n";
+    }
+    out.flush();
+    if (!out.good()) {
+        NC::LOGGING::Error("[SCENE] SaveScene failed writing file path=", normalizedPath);
+        return false;
+    }
+
+    activeScenePath_ = normalizedPath;
+    if (activeSceneName_.empty()) {
+        activeSceneName_ = std::filesystem::path(normalizedPath).stem().string();
+    }
+    activeSceneDirty_ = false;
+    return true;
+}
+
+bool SceneManager::SaveScene() {
+    if (activeScenePath_.empty()) {
+        NC::LOGGING::Warning("[SCENE] SaveScene called without a scene path");
+        return false;
+    }
+    return SaveSceneToPath(activeScenePath_);
+}
+
+bool SceneManager::SaveScene(const std::string& path) {
+    return SaveSceneAs(path);
+}
+
+bool SceneManager::SaveSceneAs(const std::string& path) {
+    const std::string normalizedPath = EnsureScenePathHasExtension(path);
+    if (normalizedPath.empty()) {
+        NC::LOGGING::Warning("[SCENE] SaveSceneAs called with empty path");
+        return false;
+    }
+    activeScenePath_ = normalizedPath;
+    activeSceneName_ = std::filesystem::path(normalizedPath).stem().string();
+    return SaveSceneToPath(normalizedPath);
+}
+
+SceneManager::SceneEntityId SceneManager::CreateEntity(const std::string& name,
+                                                       const glm::vec3& pos,
+                                                       const glm::quat& rot,
+                                                       const glm::vec3& scale) {
+    AuthoredEntity entity;
+    entity.id = nextSceneEntityId_++;
+    entity.name = BuildDefaultEntityName(name.empty() ? "GameObject" : name);
+    entity.position = pos;
+    entity.rotation = rot;
+    entity.scale = scale;
+    authoredEntities_.push_back(std::move(entity));
+    MarkSceneDirty();
+    return authoredEntities_.back().id;
+}
+
+SceneManager::SceneEntityId SceneManager::CreateModelEntity(const std::string& modelPath,
+                                                            const glm::vec3& pos,
+                                                            const glm::quat& rot,
+                                                            const glm::vec3& scale,
+                                                            const std::string& name) {
+    AuthoredEntity entity;
+    entity.id = nextSceneEntityId_++;
+    entity.modelPath = modelPath;
+    std::string baseName = name;
+    if (baseName.empty()) {
+        baseName = modelPath.empty() ? "Model" : std::filesystem::path(modelPath).stem().string();
+    }
+    entity.name = BuildDefaultEntityName(baseName);
+    entity.position = pos;
+    entity.rotation = rot;
+    entity.scale = scale;
+    if (!entity.modelPath.empty()) {
+        if (ModelInstance* instance = appendN3WTransform(entity.modelPath, pos, rot, scale)) {
+            entity.runtimeOwner = static_cast<void*>(instance);
+        } else {
+            NC::LOGGING::Warning("[SCENE] CreateModelEntity failed to materialize runtime model path=", entity.modelPath);
+        }
+    }
+    authoredEntities_.push_back(std::move(entity));
+    MarkSceneDirty();
+    return authoredEntities_.back().id;
+}
+
+bool SceneManager::DestroyEntity(SceneEntityId id) {
+    for (auto it = authoredEntities_.begin(); it != authoredEntities_.end(); ++it) {
+        if (it->id != id) {
+            continue;
+        }
+        if (it->runtimeOwner) {
+            UnloadInstanceByOwner(it->runtimeOwner);
+        }
+        authoredEntities_.erase(it);
+        MarkSceneDirty();
+        return true;
+    }
+    return false;
+}
+
+bool SceneManager::SetEntityTransform(SceneEntityId id,
+                                      const glm::vec3& pos,
+                                      const glm::quat& rot,
+                                      const glm::vec3& scale) {
+    AuthoredEntity* entity = FindAuthoredEntity(id);
+    if (!entity) {
+        return false;
+    }
+    entity->position = pos;
+    entity->rotation = rot;
+    entity->scale = scale;
+
+    if (entity->runtimeOwner) {
+        for (const auto& instance : instances) {
+            if (!instance || static_cast<void*>(instance.get()) != entity->runtimeOwner) {
+                continue;
+            }
+            instance->setTransform(pos, rot, scale);
+            const glm::mat4 transform = instance->getTransform();
+            instanceTransformCache_[entity->runtimeOwner] = transform;
+            movedInstanceOwners_.insert(entity->runtimeOwner);
+            transformsStable_ = false;
+            drawListsDirty_ = true;
+            break;
+        }
+    } else if (!entity->modelPath.empty()) {
+        if (ModelInstance* instance = appendN3WTransform(entity->modelPath, pos, rot, scale)) {
+            entity->runtimeOwner = static_cast<void*>(instance);
+        }
+    }
+
+    MarkSceneDirty();
+    return true;
+}
+
+bool SceneManager::SetEntityName(SceneEntityId id, const std::string& name) {
+    AuthoredEntity* entity = FindAuthoredEntity(id);
+    if (!entity) {
+        return false;
+    }
+    if (name.empty()) {
+        return false;
+    }
+    entity->name = name;
+    MarkSceneDirty();
+    return true;
+}
+
+void SceneManager::ClearAuthoredRuntimeOwners() {
+    for (AuthoredEntity& entity : authoredEntities_) {
+        entity.runtimeOwner = nullptr;
+    }
+}
+
+void SceneManager::RebindAuthoredRuntimeOwners() {
+    for (AuthoredEntity& entity : authoredEntities_) {
+        entity.runtimeOwner = nullptr;
+        if (entity.modelPath.empty()) {
+            continue;
+        }
+        ModelInstance* instance = appendN3WTransform(entity.modelPath, entity.position, entity.rotation, entity.scale);
+        entity.runtimeOwner = instance ? static_cast<void*>(instance) : nullptr;
+    }
+}
+
+bool SceneManager::OpenScene(const std::string& path) {
+    const std::string normalizedPath = EnsureScenePathHasExtension(path);
+    if (normalizedPath.empty()) {
+        NC::LOGGING::Error("[SCENE] OpenScene failed: empty path");
+        return false;
+    }
+
+    std::ifstream in(normalizedPath, std::ios::binary);
+    if (!in.is_open()) {
+        NC::LOGGING::Error("[SCENE] OpenScene failed opening path=", normalizedPath);
+        return false;
+    }
+
+    std::string line;
+    if (!std::getline(in, line) || Trim(line) != "NDSCENE1") {
+        NC::LOGGING::Error("[SCENE] OpenScene invalid header path=", normalizedPath);
+        return false;
+    }
+
+    // Resolve relative paths from the scene file's directory
+    const std::filesystem::path sceneDir = std::filesystem::path(normalizedPath).parent_path();
+    auto resolveRelative = [&](const std::string& p) -> std::string {
+        if (p.empty()) return p;
+        std::filesystem::path fp(p);
+        if (fp.is_relative()) {
+            std::error_code ec2;
+            auto abs = std::filesystem::weakly_canonical(sceneDir / fp, ec2);
+            if (!ec2) return abs.string();
+        }
+        return p;
+    };
+
+    std::string loadedGuid;
+    std::string loadedName;
+    std::string loadedMapPath;
+    std::vector<AuthoredEntity> loadedEntities;
+    uint64_t maxEntityId = 0;
+
+    auto readKv = [](const std::string& src, std::string& key, std::string& value) -> bool {
+        const size_t eq = src.find('=');
+        if (eq == std::string::npos) {
+            return false;
+        }
+        key = Trim(src.substr(0, eq));
+        value = Trim(src.substr(eq + 1));
+        return !key.empty();
+    };
+
+    while (std::getline(in, line)) {
+        line = Trim(line);
+        if (line.empty()) {
+            continue;
+        }
+        if (line == "entity_begin") {
+            AuthoredEntity entity;
+            entity.id = 0;
+            entity.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            entity.scale = glm::vec3(1.0f);
+            while (std::getline(in, line)) {
+                line = Trim(line);
+                if (line == "entity_end") {
+                    break;
+                }
+                std::string key;
+                std::string value;
+                if (!readKv(line, key, value)) {
+                    continue;
+                }
+                if (key == "id") {
+                    entity.id = static_cast<SceneEntityId>(std::strtoull(value.c_str(), nullptr, 10));
+                } else if (key == "parent_id") {
+                    entity.parentId = static_cast<SceneEntityId>(std::strtoull(value.c_str(), nullptr, 10));
+                } else if (key == "name") {
+                    entity.name = value;
+                } else if (key == "model_path") {
+                    entity.modelPath = resolveRelative(value);
+                } else if (key == "pos") {
+                    ParseVec3(value, entity.position);
+                } else if (key == "rot") {
+                    ParseQuat(value, entity.rotation);
+                } else if (key == "scale") {
+                    ParseVec3(value, entity.scale);
+                } else if (key == "enabled") {
+                    entity.enabled = (value != "0");
+                }
+            }
+            if (entity.id == 0) {
+                entity.id = ++maxEntityId;
+            }
+            if (entity.id > maxEntityId) {
+                maxEntityId = entity.id;
+            }
+            if (entity.name.empty()) {
+                entity.name = "Entity";
+            }
+            loadedEntities.push_back(std::move(entity));
+            continue;
+        }
+
+        std::string key;
+        std::string value;
+        if (!readKv(line, key, value)) {
+            continue;
+        }
+        if (key == "guid") {
+            loadedGuid = value;
+        } else if (key == "name") {
+            loadedName = value;
+        } else if (key == "map_path" || key == "source_map") {
+            if (loadedMapPath.empty()) {
+                loadedMapPath = resolveRelative(value);
+            }
+        }
+    }
+
+    suppressSceneDirty_ = true;
+    Clear();
+    authoredEntities_ = std::move(loadedEntities);
+    nextSceneEntityId_ = std::max<uint64_t>(1, maxEntityId + 1);
+    activeSceneGuid_ = loadedGuid.empty() ? GenerateSceneGuid() : loadedGuid;
+    activeSceneName_ = loadedName.empty() ? std::filesystem::path(normalizedPath).stem().string() : loadedName;
+    activeScenePath_ = normalizedPath;
+    currentMapSourcePath_ = loadedMapPath;
+
+    if (!authoredEntities_.empty()) {
+        // Authored entities present (imported scene): rebind runtime owners
+        RebindAuthoredRuntimeOwners();
+    } else if (!loadedMapPath.empty()) {
+        // Legacy/preview scene: no authored entities, load map as runtime
+        MapLoader loader;
+        std::unique_ptr<MapData> loadedMap = loader.load_map(loadedMapPath);
+        if (!loadedMap) {
+            NC::LOGGING::Warning("[SCENE] OpenScene map load failed path=", loadedMapPath);
+        } else {
+            LoadMap(loadedMap.get(), loadedMapPath);
+        }
+    }
+    suppressSceneDirty_ = false;
+    activeSceneDirty_ = false;
+    return true;
+}
+
+bool SceneManager::SetActiveScene(const std::string& path) {
+    return OpenScene(path);
 }
 
 void SceneManager::AppendModel(const std::string& path, const glm::vec3& pos,
@@ -642,11 +1151,142 @@ void SceneManager::AppendModel(const std::string& path, const glm::vec3& pos,
                      " pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
                      " rot=(", rot.x, ",", rot.y, ",", rot.z, ",", rot.w, ")",
                      " scale=(", scale.x, ",", scale.y, ",", scale.z, ")");
-    appendN3WTransform(path, pos, rot, scale);
+    CreateModelEntity(path, pos, rot, scale);
+}
+
+SceneManager::SceneEntityId SceneManager::FindEntityIdByRuntimeOwner(void* owner) const {
+    if (!owner) return 0;
+    for (const AuthoredEntity& entity : authoredEntities_) {
+        if (entity.runtimeOwner == owner) {
+            return entity.id;
+        }
+    }
+    return 0;
+}
+
+void SceneManager::ImportMapAsEditableScene(const MapData* map, const std::string& sourcePath) {
+    if (!map) {
+        NC::LOGGING::Warning("[SCENE] ImportMapAsEditableScene called with null map");
+        return;
+    }
+    NC::LOGGING::Log("[SCENE] ImportMapAsEditableScene begin instances=", map->instances.size(),
+                     " groups=", map->groups.size(), " path=", sourcePath);
+
+    suppressSceneDirty_ = true;
+    Clear();
+    authoredEntities_.clear();
+    nextSceneEntityId_ = 1;
+    currentMapSourcePath_ = sourcePath;
+
+    if (!sourcePath.empty()) {
+        activeSceneName_ = std::filesystem::path(sourcePath).stem().string();
+        if (activeSceneName_.empty()) activeSceneName_ = "Imported Scene";
+    } else {
+        activeSceneName_ = "Imported Scene";
+    }
+    activeScenePath_.clear();
+    activeSceneGuid_ = GenerateSceneGuid();
+
+    // Build group entities (empty GameObjects as hierarchy containers)
+    std::vector<SceneEntityId> groupEntityIds(map->groups.size(), 0);
+    for (size_t gi = 0; gi < map->groups.size(); ++gi) {
+        const Group& grp = map->groups[gi];
+        std::string grpName = (grp.name_id < map->string_table.size() &&
+                               !map->string_table[grp.name_id].empty())
+                              ? map->string_table[grp.name_id]
+                              : ("Group_" + std::to_string(gi));
+        AuthoredEntity grpEntity;
+        grpEntity.id = nextSceneEntityId_++;
+        grpEntity.name = grpName;
+        grpEntity.parentId = 0;
+        authoredEntities_.push_back(std::move(grpEntity));
+        groupEntityIds[gi] = authoredEntities_.back().id;
+    }
+    // Second pass: wire group->group parent relationships
+    for (size_t gi = 0; gi < map->groups.size(); ++gi) {
+        const Group& grp = map->groups[gi];
+        if (grp.parent_group_index >= 0 &&
+            static_cast<size_t>(grp.parent_group_index) < groupEntityIds.size()) {
+            AuthoredEntity* entity = FindAuthoredEntity(groupEntityIds[gi]);
+            if (entity) {
+                entity->parentId = groupEntityIds[static_cast<size_t>(grp.parent_group_index)];
+            }
+        }
+    }
+
+    // Build instance entities (one per map instance)
+    size_t skipped = 0;
+    for (size_t instIdx = 0; instIdx < map->instances.size(); ++instIdx) {
+        const Instance& inst = map->instances[instIdx];
+        if (inst.templ_index < 0 ||
+            static_cast<size_t>(inst.templ_index) >= map->templates.size()) {
+            ++skipped;
+            continue;
+        }
+        const Template& tmpl = map->templates[inst.templ_index];
+        if (tmpl.gfx_res_id >= map->string_table.size()) {
+            ++skipped;
+            continue;
+        }
+        const std::string& mapModelId = map->string_table[tmpl.gfx_res_id];
+        const std::string modelPath = ResolveModelPath(mapModelId);
+        if (modelPath.empty()) {
+            ++skipped;
+            continue;
+        }
+
+        std::string entityName;
+        if (inst.dg_name_index < map->string_table.size() &&
+            !map->string_table[inst.dg_name_index].empty()) {
+            entityName = map->string_table[inst.dg_name_index];
+        } else {
+            entityName = std::filesystem::path(modelPath).stem().string()
+                         + "_" + std::to_string(instIdx);
+        }
+
+        const glm::vec3 pos(inst.pos.x, inst.pos.y, inst.pos.z);
+        const glm::quat rot(inst.rot.w, inst.rot.x, inst.rot.y, inst.rot.z);
+        const glm::vec3 scale = inst.use_scaling
+            ? glm::vec3(inst.scale.x, inst.scale.y, inst.scale.z)
+            : glm::vec3(1.0f);
+
+        // Directly push entity (bypassing uniqueness scan for bulk-import performance)
+        AuthoredEntity entity;
+        entity.id = nextSceneEntityId_++;
+        entity.name = entityName;
+        entity.modelPath = modelPath;
+        entity.position = pos;
+        entity.rotation = rot;
+        entity.scale = scale;
+        entity.enabled = true;
+        entity.parentId = (inst.group_index >= 0 &&
+                           static_cast<size_t>(inst.group_index) < groupEntityIds.size())
+                          ? groupEntityIds[static_cast<size_t>(inst.group_index)]
+                          : 0;
+        if (ModelInstance* instance = appendN3WTransform(modelPath, pos, rot, scale)) {
+            entity.runtimeOwner = static_cast<void*>(instance);
+        }
+        authoredEntities_.push_back(std::move(entity));
+    }
+
+    suppressSceneDirty_ = false;
+    activeSceneDirty_ = true;
+    NC::LOGGING::Log("[SCENE] ImportMapAsEditableScene done entities=", authoredEntities_.size(),
+                     " skipped=", skipped);
 }
 
 void SceneManager::LoadMap(const MapData* map) {
+    LoadMap(map, currentMapSourcePath_);
+}
+
+void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
     NC::LOGGING::Log("[SCENE] LoadMap begin ptr=", (map ? 1 : 0));
+    if (currentMapSourcePath_ != sourcePath) {
+        currentMapSourcePath_ = sourcePath;
+        if (!authoredEntities_.empty() || !activeScenePath_.empty()) {
+            MarkSceneDirty();
+        }
+    }
 
     // ── Parity: reset counters, advance map-load sequence ──
     parityCounters_.reset();
@@ -679,11 +1319,11 @@ void SceneManager::LoadMap(const MapData* map) {
     transformsStable_ = false;
     runtimeEntities_.clear();
     pendingEntityCount_ = 0;
+    ClearAuthoredRuntimeOwners();
 
     if (!map) {
         ownedCurrentMap_.reset();
         currentMap = nullptr;
-        currentMapSourcePath_.clear();
         drawListsDirty_ = true;
         NC::LOGGING::Warning("[SCENE] LoadMap cleared current map (null input)");
         return;
@@ -794,6 +1434,7 @@ void SceneManager::LoadMap(const MapData* map) {
     }
 
     drawListsDirty_ = true;
+    RebindAuthoredRuntimeOwners();
 
     // ── Parity: count valid renderables (draws with mesh) ──
     auto countValid = [](const std::vector<DrawCmd>& draws) -> int {
@@ -836,12 +1477,13 @@ void SceneManager::ReloadMap() {
         NC::LOGGING::Error("[SCENE] ReloadMap failed path=", currentMapSourcePath_);
         return;
     }
-    LoadMap(reloaded.get());
+    LoadMap(reloaded.get(), currentMapSourcePath_);
     NC::LOGGING::Log("[SCENE] ReloadMap end path=", currentMapSourcePath_);
 }
 
 void SceneManager::Clear() {
     NC::LOGGING::Log("[SCENE] Clear begin");
+    ClearAuthoredRuntimeOwners();
     instances.clear();
     particleNodes.clear();
     animatorInstances.clear();
@@ -1026,6 +1668,128 @@ void SceneManager::PrepareDrawLists(
                      " postAlpha=", postAlphaUnlitDraws.size(),
                      " water=", waterDraws.size(),
                      " animated=", animatedDraws.size());
+}
+
+SceneManager::ExportSceneSnapshot SceneManager::BuildExportSceneSnapshot(bool includeUnloadedDependencies) const {
+    ExportSceneSnapshot snapshot;
+    snapshot.sceneGuid = activeSceneGuid_;
+    snapshot.sceneName = activeSceneName_;
+    snapshot.mapPath = currentMapSourcePath_;
+    if (currentMap) {
+        snapshot.mapInfo = currentMap->info;
+    }
+
+    if (!activeSceneName_.empty()) {
+        snapshot.mapName = activeSceneName_;
+    } else if (!snapshot.mapPath.empty()) {
+        snapshot.mapName = std::filesystem::path(snapshot.mapPath).stem().string();
+    } else if (currentMap) {
+        snapshot.mapName = "LoadedScene";
+    }
+
+    std::unordered_set<std::string> modelSet;
+    std::unordered_set<std::string> meshSet;
+    std::unordered_set<std::string> animSet;
+    std::unordered_set<std::string> textureSet;
+    std::unordered_set<std::string> shaderSet;
+
+    for (const auto& [modelPath, refCount] : loadedModelRefCountByPath_) {
+        if (refCount > 0) {
+            InsertIfNotEmpty(modelSet, modelPath);
+        }
+    }
+    for (const auto& [_, meshPath] : loadedMeshByModelPath_) {
+        InsertIfNotEmpty(meshSet, meshPath);
+    }
+
+    snapshot.entities.reserve(authoredEntities_.size());
+    for (const AuthoredEntity& src : authoredEntities_) {
+        ExportSceneEntity entity;
+        entity.name = src.name;
+        entity.templateName = src.modelPath.empty()
+            ? "Empty"
+            : std::filesystem::path(src.modelPath).stem().string();
+        entity.position = src.position;
+        entity.rotation = glm::vec4(src.rotation.x, src.rotation.y, src.rotation.z, src.rotation.w);
+        entity.scale = src.scale;
+        entity.isStatic = true;
+        entity.isAlpha = false;
+        entity.isDecal = false;
+        snapshot.entities.push_back(std::move(entity));
+        InsertIfNotEmpty(modelSet, src.modelPath);
+    }
+
+    if (includeUnloadedDependencies && currentMap) {
+        for (const Instance& inst : currentMap->instances) {
+            if (inst.templ_index < 0 || static_cast<size_t>(inst.templ_index) >= currentMap->templates.size()) {
+                continue;
+            }
+            const Template& tmpl = currentMap->templates[inst.templ_index];
+            if (tmpl.gfx_res_id >= currentMap->string_table.size()) {
+                continue;
+            }
+            const std::string& mapModelId = currentMap->string_table[tmpl.gfx_res_id];
+            const std::string resolvedModelPath = ResolveModelPath(mapModelId);
+            InsertIfNotEmpty(modelSet, resolvedModelPath);
+        }
+    }
+
+    if (includeUnloadedDependencies) {
+        size_t scannedModelCount = 0;
+        size_t failedModelCount = 0;
+        for (const std::string& modelPath : modelSet) {
+            if (modelPath.empty()) continue;
+            Reporter rep;
+            rep.currentFile = modelPath;
+            Options opt;
+            opt.n3filepath = modelPath;
+            const auto model = ModelServer::instance().loadModel(modelPath, rep, opt);
+            if (!model) {
+                ++failedModelCount;
+                NC::LOGGING::Warning("[SCENE][EXPORT] Failed to resolve model dependencies path=", modelPath);
+                continue;
+            }
+            ++scannedModelCount;
+            for (const Node* node : model->getNodes()) {
+                if (!node) continue;
+                InsertIfNotEmpty(meshSet, node->mesh_ressource_id);
+                InsertIfNotEmpty(animSet, node->animation_resource);
+                InsertIfNotEmpty(shaderSet, node->shader);
+                for (const auto& [_, texPath] : node->shader_params_texture) {
+                    InsertIfNotEmpty(textureSet, texPath);
+                }
+            }
+        }
+        NC::LOGGING::Log("[SCENE][EXPORT] Deep snapshot models=", modelSet.size(),
+                         " scanned=", scannedModelCount,
+                         " failed=", failedModelCount,
+                         " meshes=", meshSet.size(),
+                         " anims=", animSet.size(),
+                         " textures=", textureSet.size(),
+                         " shaders=", shaderSet.size());
+    } else {
+        for (const auto& instance : instances) {
+            if (!instance) continue;
+            const auto model = instance->getModel();
+            if (!model) continue;
+            for (const Node* node : model->getNodes()) {
+                if (!node) continue;
+                InsertIfNotEmpty(meshSet, node->mesh_ressource_id);
+                InsertIfNotEmpty(animSet, node->animation_resource);
+                InsertIfNotEmpty(shaderSet, node->shader);
+                for (const auto& [_, texPath] : node->shader_params_texture) {
+                    InsertIfNotEmpty(textureSet, texPath);
+                }
+            }
+        }
+    }
+
+    snapshot.loadedModelPaths = SortedStrings(modelSet);
+    snapshot.loadedMeshPaths = SortedStrings(meshSet);
+    snapshot.loadedAnimPaths = SortedStrings(animSet);
+    snapshot.loadedTexturePaths = SortedStrings(textureSet);
+    snapshot.loadedShaderNames = SortedStrings(shaderSet);
+    return snapshot;
 }
 
 // Propagates runtime transform changes into scene draw worldMatrix/rootMatrix.
@@ -1864,6 +2628,11 @@ void SceneManager::UnloadInstanceByOwner(void* owner) {
     instanceMeshResourceByOwner_.erase(owner);
     instanceTransformCache_.erase(owner);
     movedInstanceOwners_.erase(owner);
+    for (AuthoredEntity& entity : authoredEntities_) {
+        if (entity.runtimeOwner == owner) {
+            entity.runtimeOwner = nullptr;
+        }
+    }
     {
         auto recIt = runtimeEntities_.find(owner);
         if (recIt != runtimeEntities_.end()) {

@@ -30,7 +30,7 @@ static constexpr UniformID U_FOG_DISTANCES = NDEVC::Graphics::IShader::MakeUnifo
 static constexpr UniformID U_FOG_COLOR = NDEVC::Graphics::IShader::MakeUniformID("fogColor");
 static constexpr UniformID U_HDR_SCALE = NDEVC::Graphics::IShader::MakeUniformID("hdrScale");
 static constexpr UniformID U_PARTICLE_TEXTURE = NDEVC::Graphics::IShader::MakeUniformID("particleTexture");
-static constexpr UniformID U_GPOSITION_VS = NDEVC::Graphics::IShader::MakeUniformID("gPositionVS");
+static constexpr UniformID U_GPOSITION_WS_TEX = NDEVC::Graphics::IShader::MakeUniformID("gPositionWSTex");
 
 
 GLParticleRenderer::GLParticleRenderer() = default;
@@ -81,7 +81,7 @@ void GLParticleRenderer::Setup(NDEVC::Graphics::IShaderManager* sharedShaderMana
     particleShader->PrecacheUniform(U_FOG_COLOR, "fogColor");
     particleShader->PrecacheUniform(U_HDR_SCALE, "hdrScale");
     particleShader->PrecacheUniform(U_PARTICLE_TEXTURE, "particleTexture");
-    particleShader->PrecacheUniform(U_GPOSITION_VS, "gPositionVS");
+    particleShader->PrecacheUniform(U_GPOSITION_WS_TEX, "gPositionWSTex");
 
     glGenSamplers(1, sampler.put());
     // Particle textures are often authored without full mip chains.
@@ -211,7 +211,7 @@ void GLParticleRenderer::EndAttach() {
 void GLParticleRenderer::Render(const glm::mat4& viewProj, const glm::mat4& view, const glm::mat4& invView,
                                  const glm::vec3& eyePos, const glm::vec2& fogDistances, const glm::vec4& fogColor,
                                  const glm::mat4& emitterTransform, uint32_t numParticles, uint32_t baseInstance,
-                                 GLuint texture, GLuint gPositionVSTex, const glm::vec2& invViewport,
+                                 GLuint texture, GLuint gPositionWSTex, const glm::vec2& invViewport,
                                  int numAnimPhases, float animFramesPerSecond, float time,
                                  bool billboard, int colorMode,
                                  float intensity0, float emissiveIntensity) {
@@ -249,7 +249,7 @@ void GLParticleRenderer::Render(const glm::mat4& viewProj, const glm::mat4& view
     glBindSampler(0, sampler);
 
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gPositionVSTex);
+    glBindTexture(GL_TEXTURE_2D, gPositionWSTex);
     glBindSampler(1, 0);
 
     particleShader->SetMat4(U_VIEW_PROJ, viewProj);
@@ -269,7 +269,7 @@ void GLParticleRenderer::Render(const glm::mat4& viewProj, const glm::mat4& view
     particleShader->SetVec4(U_FOG_COLOR, fogColor);
     particleShader->SetFloat(U_HDR_SCALE, 1.0f);
     particleShader->SetInt(U_PARTICLE_TEXTURE, 0);
-    particleShader->SetInt(U_GPOSITION_VS, 1);
+    particleShader->SetInt(U_GPOSITION_WS_TEX, 1);
 
     glEnable(GL_BLEND);
     glEnable(GL_DEPTH_TEST);

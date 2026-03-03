@@ -35,7 +35,7 @@ namespace Particles {
         virtual void UpdateVertexStreams() = 0;
         virtual void Render(const glm::mat4& viewProj, const glm::mat4& view, const glm::mat4& invView,
                             const glm::vec3& eyePos, const glm::vec2& fogDistances, const glm::vec4& fogColor,
-                            uint32_t gPositionVSTex, const glm::vec2& invViewport,
+                            uint32_t gPositionWSTex, const glm::vec2& invViewport,
                             int numAnimPhases, float animFramesPerSecond, float time, int colorMode,
                             float intensity0, float emissiveIntensity) = 0;
 

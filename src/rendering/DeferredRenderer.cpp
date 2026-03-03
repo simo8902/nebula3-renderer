@@ -18,6 +18,7 @@
 #include "Rendering/OpenGL/OpenGLShaderManager.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,7 @@
 #include "Assets/Map/MapHeader.h"
 #include "Assets/Particles/ParticleServer.h"
 #include "Core/Logger.h"
+#include "Core/VFS.h"
 #include "gtx/norm.hpp"
 
 static const glm::vec3 kLightDirToSun = glm::normalize(glm::vec3(0.0f, 0.5f, -0.8f));
@@ -150,6 +152,23 @@ std::string ReadEnvString(const char* name) {
 #endif
 }
 
+bool MountPackageFromEnvironment() {
+    if (NC::VFS::Instance().IsMounted()) {
+        NC::LOGGING::Log("[DEFERRED][PACKAGE] VFS mounted, assets served in-memory");
+        return true;
+    }
+    // Dev mode: no package present, assets loaded from disk via env-var paths.
+    return false;
+}
+
+bool IsMapFilePath(const std::string& path) {
+    if (path.empty()) return false;
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return ext == ".map";
+}
+
 constexpr const char* StartupBaseMapName() {
     return "a0006_grimford_hub.map";
 }
@@ -177,17 +196,38 @@ std::string ResolveStartupMapPath() {
     };
 
     const std::string envPath = ReadEnvString("NDEVC_STARTUP_MAP");
+    if (envPath.empty()) {
+        NC::LOGGING::Log("[DEFERRED][INIT] Startup map autoload disabled (NDEVC_STARTUP_MAP empty)");
+        return {};
+    }
     if (!envPath.empty()) {
         const fs::path envFsPath(envPath);
-        if (fileExists(envFsPath)) {
-            if (envFsPath.filename() == baseMapName) {
-                return envFsPath.string();
-            }
-            NC::LOGGING::Error("[Init] NDEVC_STARTUP_MAP must point to ", baseMapName,
-                               " (or a directory containing it): ", envPath);
+        // Accept the path if it exists on disk OR is served by the in-memory VFS.
+        if (fileExists(envFsPath) || NC::VFS::Instance().Exists(envPath)) {
+            return envFsPath.string();
         }
         if (const std::string dirChoice = baseMapFromDirectory(envFsPath); !dirChoice.empty()) {
             return dirChoice;
+        }
+        auto firstMapFromDirectory = [&](const fs::path& dirPath) -> std::string {
+            std::error_code ec;
+            if (!fs::exists(dirPath, ec) || !fs::is_directory(dirPath, ec)) {
+                return {};
+            }
+            std::vector<fs::path> maps;
+            for (const auto& entry : fs::directory_iterator(dirPath, ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file()) continue;
+                if (entry.path().extension() == ".map") {
+                    maps.push_back(entry.path());
+                }
+            }
+            if (maps.empty()) return {};
+            std::sort(maps.begin(), maps.end());
+            return maps.front().string();
+        };
+        if (const std::string dirAnyMap = firstMapFromDirectory(envFsPath); !dirAnyMap.empty()) {
+            return dirAnyMap;
         }
         const std::array<fs::path, 2> envSubdirs = {
             envFsPath / "maps",
@@ -197,38 +237,13 @@ std::string ResolveStartupMapPath() {
             if (const std::string dirChoice = baseMapFromDirectory(subdir); !dirChoice.empty()) {
                 return dirChoice;
             }
+            if (const std::string dirAnyMap = firstMapFromDirectory(subdir); !dirAnyMap.empty()) {
+                return dirAnyMap;
+            }
         }
-        NC::LOGGING::Error("[Init] NDEVC_STARTUP_MAP not found/usable for ", baseMapName,
-                           ": ", envPath);
+        NC::LOGGING::Error("[Init] NDEVC_STARTUP_MAP not found/usable: ", envPath);
+        return {};
     }
-
-    const std::array<fs::path, 7> fileCandidates = {
-        fs::path(SOURCE_DIR) / "bin" / baseMapName,
-        fs::path(SOURCE_DIR) / "bin" / "maps" / baseMapName,
-        fs::path(SOURCE_DIR) / "maps" / baseMapName,
-        fs::path("bin") / baseMapName,
-        fs::path("bin") / "maps" / baseMapName,
-        fs::path("maps") / baseMapName,
-        fs::path(MAP_ROOT) / baseMapName
-    };
-    for (const auto& p : fileCandidates) {
-        if (fileExists(p)) return p.string();
-    }
-
-    const std::array<fs::path, 5> dirCandidates = {
-        fs::path(SOURCE_DIR) / "bin" / "maps",
-        fs::path(SOURCE_DIR) / "maps",
-        fs::path("bin") / "maps",
-        fs::path("maps"),
-        fs::path(MAP_ROOT)
-    };
-    for (const auto& d : dirCandidates) {
-        if (const std::string chosen = baseMapFromDirectory(d); !chosen.empty()) {
-            return chosen;
-        }
-    }
-
-    NC::LOGGING::Error("[Init] Required startup base map not found: ", baseMapName);
     return {};
 }
 
@@ -413,6 +428,16 @@ void DeferredRenderer::initGLFW() {
             }
             this->camera_.processMouseScroll(static_cast<float>(scrollY));
         });
+        glfwSetDropCallback(glfwWin, [](GLFWwindow* w, int count, const char** paths) {
+            auto* self = static_cast<DeferredRenderer*>(glfwGetWindowUserPointer(w));
+            if (!self || count <= 0 || !paths) return;
+            self->pendingDroppedPaths_.reserve(self->pendingDroppedPaths_.size() + static_cast<size_t>(count));
+            for (int i = 0; i < count; ++i) {
+                if (paths[i] && paths[i][0] != '\0') {
+                    self->pendingDroppedPaths_.emplace_back(paths[i]);
+                }
+            }
+        });
         glfwSetCursorPosCallback(glfwWin, [](GLFWwindow* w, double x, double y) {
             static double lastX = x;
             static double lastY = y;
@@ -483,7 +508,11 @@ void DeferredRenderer::initGLFW() {
 
     if (optRenderLOG) std::cout << "[Init] Window framebuffer: alpha bits requested\n";
     if (optRenderLOG) std::cout << "[Init] Clear color set to opaque black (RGBA: 0,0,0,1)\n";
-    if (optRenderLOG) std::cout << "[Init] VSync enabled (swap interval = 1)\n";
+    if (optRenderLOG) {
+        const std::string vsyncEnv = ReadEnvString("NDEVC_VSYNC");
+        const int swapInterval = vsyncEnv.empty() ? 0 : std::atoi(vsyncEnv.c_str());
+        std::cout << "[Init] VSync swap interval = " << swapInterval << "\n";
+    }
 
     try {
         shaderManager = std::make_unique<NDEVC::Graphics::OpenGL::OpenGLShaderManager>();
@@ -981,6 +1010,7 @@ void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm:
 
         shadowCastersDirty_ = false;
         shadowCasterCacheHit_ = false;
+        shadowGroupCacheValid_ = false;
     } else {
         shadowCasterCacheHit_ = true;
         const float vr0 = viewMatrix[0][2], vr1 = viewMatrix[1][2],
@@ -1172,8 +1202,16 @@ void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm:
             auto tGroupStart = std::chrono::steady_clock::now();
             shadowMatrices_.clear();
             shadowCommands_.clear();
-            shadowMatrices_.reserve(shadowCasters_.size());
+
+            const bool groupCacheHit = shadowGroupCacheValid_ &&
+                                       shadowCasterCacheHit_ &&
+                                       shadowGroupCacheViewMatrix_ == viewMatrix;
             int triangleCount = 0;
+            if (groupCacheHit) {
+                shadowMatrices_ = shadowGroupCachedMatrices_[cascade];
+                shadowCommands_ = shadowGroupCachedCommands_[cascade];
+            } else {
+            shadowMatrices_.reserve(shadowCasters_.size());
 
             for (const auto& grp : solidShadowGeomGroups_) {
                 const uint32_t firstMat = static_cast<uint32_t>(shadowMatrices_.size());
@@ -1197,6 +1235,9 @@ void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm:
                     triangleCount += static_cast<int>(grp.indexCount / 3) * inRange;
                 }
             }
+            shadowGroupCachedMatrices_[cascade] = shadowMatrices_;
+            shadowGroupCachedCommands_[cascade] = shadowCommands_;
+            } // end !groupCacheHit
             frameProfile_.shadowGroup += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - tGroupStart).count();
 
@@ -1456,6 +1497,10 @@ void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm:
         }
     }
 
+    // Update shadow group cache for next frame if any cascade computed new grouping
+    shadowGroupCacheViewMatrix_ = viewMatrix;
+    shadowGroupCacheValid_      = true;
+
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, width, height);
@@ -1481,6 +1526,8 @@ void DeferredRenderer::Initialize() {
     shutdownComplete_ = false;
     viewportDisabled_ = ReadEnvToggle("NDEVC_DISABLE_VIEWPORT");
     logInitStep("start");
+    MountPackageFromEnvironment();
+    logInitStep("MountPackageFromEnvironment");
     InstallNax3Provider();
     logInitStep("InstallNax3Provider");
     initGLFW();
@@ -1504,7 +1551,7 @@ void DeferredRenderer::Initialize() {
     if (!viewportDisabled_) {
         const std::string startupMapPath = ResolveStartupMapPath();
         if (startupMapPath.empty()) {
-            NC::LOGGING::Warning("[DEFERRED][INIT] No startup map found. Required map=", StartupBaseMapName());
+            NC::LOGGING::Log("[DEFERRED][INIT] Starting with empty scene (no startup map)");
         } else if (optRenderLOG) {
             std::cout << "[Init] Startup map: " << startupMapPath << "\n";
         }
@@ -1525,8 +1572,7 @@ void DeferredRenderer::Initialize() {
         } else {
             if (optRenderLOG) std::cout << "Map loaded: " << startupMap->instances.size() << " instances\n";
             NC::LOGGING::Log("[DEFERRED][INIT] Map loaded instances=", startupMap->instances.size());
-            scene_.LoadMap(startupMap);
-            scene_.currentMapSourcePath_ = startupMapPath;
+            scene_.LoadMap(startupMap, startupMapPath);
             logInitStep("SceneManager::LoadMap");
         }
 
@@ -1597,6 +1643,9 @@ void DeferredRenderer::Initialize() {
             camera_.setPosition(glm::vec3(info.center.x,
                                           info.center.y + elevation,
                                           info.center.z + elevation * 0.7f));
+        } else {
+            camera_.setPosition(glm::vec3(0.0f, 0.0f, 5.0f));
+            camera_.lookAt(glm::vec3(0.0f, 0.0f, 0.0f));
         }
 
         rebuildAnimatedDrawLists();
@@ -1616,6 +1665,35 @@ void DeferredRenderer::Initialize() {
     }
     WriteWebSnapshot("initialize");
     logInitStep("WriteWebSnapshot");
+
+    // ── Initial Work/Play mode policy ────────────────────────────────────
+    {
+        RenderMode initialMode = RenderMode::Work;
+#if defined(_WIN32)
+        char* modeVal = nullptr;
+        size_t modeLen = 0;
+        if (_dupenv_s(&modeVal, &modeLen, "NDEVC_RENDER_MODE") == 0 && modeVal) {
+            if (std::string(modeVal) == "play" || std::string(modeVal) == "Play") {
+                initialMode = RenderMode::Play;
+            }
+            std::free(modeVal);
+        }
+#else
+        const char* modeVal = std::getenv("NDEVC_RENDER_MODE");
+        if (modeVal && (std::string(modeVal) == "play" || std::string(modeVal) == "Play")) {
+            initialMode = RenderMode::Play;
+        }
+#endif
+        renderMode_ = initialMode;
+        FramePolicy policy = BuildPolicy(initialMode);
+        // Preserve ImGui init-time editor config — docking/theme can't change post-init.
+        policy.editorLayoutEnabled = editorModeEnabled_;
+        policy.viewportOnlyUI      = imguiViewportOnly_;
+        ApplyPolicy(policy);
+        LogPolicySnapshot("STARTUP");
+    }
+    logInitStep("ApplyPolicy");
+
     NC::LOGGING::Log("[DEFERRED] Initialize end");
 }
 
@@ -2042,9 +2120,182 @@ void DeferredRenderer::PollEvents() {
     if (window_) {
         window_->PollEvents();
     }
+    HandleDroppedPaths();
     if (inputSystem_) {
         inputSystem_->Update();
     }
+}
+
+void DeferredRenderer::HandleDroppedPaths() {
+    if (pendingDroppedPaths_.empty()) {
+        return;
+    }
+
+    std::vector<std::string> droppedPaths;
+    droppedPaths.swap(pendingDroppedPaths_);
+
+    std::vector<std::string> shaderDropPaths;
+    std::string mapDropPath;
+    for (const std::string& path : droppedPaths) {
+        if (IsMapFilePath(path)) {
+            if (mapDropPath.empty()) {
+                mapDropPath = path;
+            }
+        } else {
+            shaderDropPaths.push_back(path);
+        }
+    }
+
+    if (!shaderDropPaths.empty() && shaderManager) {
+        shaderManager->HandleFileDrop(shaderDropPaths);
+    }
+
+    if (mapDropPath.empty()) {
+        return;
+    }
+
+    QueueDroppedMapLoad(mapDropPath);
+}
+
+void DeferredRenderer::QueueDroppedMapLoad(const std::string& mapDropPath) {
+    mapDropLoadStage_ = MapDropLoadStage::Queued;
+    mapDropLoadPath_ = mapDropPath;
+    mapDropLoadedMap_.reset();
+    mapDropLoadStartSec_ = glfwGetTime();
+    mapDropLoadFileSec_ = 0.0;
+    mapDropLoadApplySec_ = 0.0;
+    mapDropLoadTotalSec_ = 0.0;
+    mapDropLoadDisplayUntilSec_ = 0.0;
+    mapDropLoadProgress_ = 0.02f;
+    mapDropLoadStatus_ = std::string("Loading map: ") + mapDropPath;
+    MarkDirty();
+}
+
+bool DeferredRenderer::ProcessPendingDroppedMapLoad(double currentFrame) {
+    if (mapDropLoadStage_ == MapDropLoadStage::Idle) {
+        return false;
+    }
+
+    auto presentProgressFrame = [&]() {
+        if (window_) {
+            RenderImGui();
+            window_->SwapBuffers();
+        }
+        lastFrameDrawCalls_ = 0;
+    };
+
+    if (mapDropLoadStage_ == MapDropLoadStage::Queued) {
+        mapDropLoadProgress_ = 0.08f;
+        mapDropLoadStatus_ = "Preparing map load...";
+        mapDropLoadStage_ = MapDropLoadStage::LoadFile;
+        presentProgressFrame();
+        return true;
+    }
+
+    if (mapDropLoadStage_ == MapDropLoadStage::LoadFile) {
+        mapDropLoadStatus_ = "Reading map file...";
+        const double t0 = glfwGetTime();
+        MapLoader loader;
+        mapDropLoadedMap_ = loader.load_map(mapDropLoadPath_);
+        mapDropLoadFileSec_ = glfwGetTime() - t0;
+
+        if (!mapDropLoadedMap_) {
+            mapDropLoadTotalSec_ = glfwGetTime() - mapDropLoadStartSec_;
+            mapDropLoadProgress_ = 0.0f;
+            char failedMsg[96] = {};
+            std::snprintf(failedMsg, sizeof(failedMsg), "Map load failed (%.2fs)", mapDropLoadTotalSec_);
+            mapDropLoadStatus_ = failedMsg;
+            mapDropLoadDisplayUntilSec_ = currentFrame + 2.5;
+            mapDropLoadStage_ = MapDropLoadStage::Failed;
+            NC::LOGGING::Error("[SCENE] Dropped map load failed path=", mapDropLoadPath_);
+            presentProgressFrame();
+            return true;
+        }
+
+        mapDropLoadProgress_ = 0.58f;
+        mapDropLoadStatus_ = "Building scene data...";
+        mapDropLoadStage_ = MapDropLoadStage::ApplyScene;
+        presentProgressFrame();
+        return true;
+    }
+
+    if (mapDropLoadStage_ == MapDropLoadStage::ApplyScene) {
+        const double t0 = glfwGetTime();
+        const MapData* droppedMapPtr = mapDropLoadedMap_.get();
+        scene_.ImportMapAsEditableScene(droppedMapPtr, mapDropLoadPath_);
+
+        ClearDisabledDraws();
+        InvalidateSelection();
+        visFrustumCacheValid_ = false;
+        visGridRevealedAll_ = false;
+        visibilityStage_.Reset();
+        visibilityStageFrameIndex_ = 0;
+        visibleCells_.clear();
+        lastVisibleCells_.clear();
+        slGBufCacheValid_ = false;
+        slViewProjCacheValid_ = false;
+        shadowGroupCacheValid_ = false;
+        shadowCastersDirty_ = true;
+
+        if (droppedMapPtr && !droppedMapPtr->instances.empty()) {
+            glm::vec3 minPos(std::numeric_limits<float>::max());
+            glm::vec3 maxPos(std::numeric_limits<float>::lowest());
+            for (const auto& inst : droppedMapPtr->instances) {
+                minPos.x = std::min(minPos.x, inst.pos.x);
+                minPos.y = std::min(minPos.y, inst.pos.y);
+                minPos.z = std::min(minPos.z, inst.pos.z);
+                maxPos.x = std::max(maxPos.x, inst.pos.x);
+                maxPos.y = std::max(maxPos.y, inst.pos.y);
+                maxPos.z = std::max(maxPos.z, inst.pos.z);
+            }
+            const glm::vec3 center = 0.5f * (minPos + maxPos);
+            const float halfDiag = 0.5f * glm::length(glm::vec2(maxPos.x - minPos.x, maxPos.z - minPos.z));
+            const float elevation = std::max(halfDiag * 1.6f, 200.0f);
+            camera_.setPosition(glm::vec3(center.x, center.y + elevation, center.z + elevation * 0.7f));
+            camera_.lookAt(center);
+        } else if (droppedMapPtr) {
+            const MapInfo& info = droppedMapPtr->info;
+            const float halfDiag = glm::length(glm::vec2(info.extents.x, info.extents.z));
+            const float elevation = std::max(halfDiag * 1.2f, 200.0f);
+            const glm::vec3 center(info.center.x, info.center.y, info.center.z);
+            camera_.setPosition(glm::vec3(center.x, center.y + elevation, center.z + elevation * 0.7f));
+            camera_.lookAt(center);
+        }
+
+        mapDropLoadApplySec_ = glfwGetTime() - t0;
+        mapDropLoadTotalSec_ = glfwGetTime() - mapDropLoadStartSec_;
+        mapDropLoadProgress_ = 1.0f;
+        char loadedMsg[128] = {};
+        std::snprintf(loadedMsg, sizeof(loadedMsg), "Map loaded %.2fs (file %.2fs + scene %.2fs)",
+                      mapDropLoadTotalSec_, mapDropLoadFileSec_, mapDropLoadApplySec_);
+        mapDropLoadStatus_ = loadedMsg;
+        mapDropLoadDisplayUntilSec_ = currentFrame + 2.0;
+        mapDropLoadStage_ = MapDropLoadStage::Complete;
+        MarkDirty();
+        NC::LOGGING::Log("[SCENE] Dropped map loaded path=", mapDropLoadPath_,
+                         " instances=", droppedMapPtr ? droppedMapPtr->instances.size() : 0,
+                         " loadSec=", mapDropLoadTotalSec_,
+                         " fileSec=", mapDropLoadFileSec_,
+                         " applySec=", mapDropLoadApplySec_);
+        mapDropLoadedMap_.reset();
+        presentProgressFrame();
+        return true;
+    }
+
+    if (mapDropLoadStage_ == MapDropLoadStage::Complete ||
+        mapDropLoadStage_ == MapDropLoadStage::Failed) {
+        if (currentFrame >= mapDropLoadDisplayUntilSec_) {
+            mapDropLoadStage_ = MapDropLoadStage::Idle;
+            mapDropLoadPath_.clear();
+            mapDropLoadStatus_.clear();
+            mapDropLoadProgress_ = 0.0f;
+            return false;
+        }
+        presentProgressFrame();
+        return true;
+    }
+
+    return false;
 }
 
 void DeferredRenderer::RenderSingleFrame() {

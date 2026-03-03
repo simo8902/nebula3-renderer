@@ -182,6 +182,8 @@ private:
     uint32_t indirectUploadCursor_ = 0;
     uint32_t transientIndirectUploadCursor_ = 0;
     std::array<bool, kUploadRingSize> staticIndirectUploadedBySlot_{};
+    std::array<bool, kUploadRingSize> materialIndexUploadedBySlot_{};
+    bool materialIndexStaticDirty_ = true;
     std::vector<DrawCommand> staticIndirectCommandsPacked_;
     std::unordered_map<BatchKey, size_t, BatchKeyHash> staticIndirectOffsets_;
     // Parallel to staticIndirectCommandsPacked_: representative source draw index for each command.
@@ -204,7 +206,21 @@ private:
 public:
     // Update instanceCount in static indirect commands based on DrawCmd::disabled flags.
     // Much cheaper than invalidateStaticCache() — no matrix/batch rebuild, just toggles.
-    void updateStaticVisibility(const std::vector<DrawCmd>& solidDraws);
+    void updateStaticVisibility(const std::vector<DrawCmd>& solidDraws,
+                                const Camera::Frustum* frustum = nullptr);
+
+    void InvalidateCullCache() { cullResultCacheValid_ = false; }
+
+    // Mark that disabled flags on static draws may have changed; updateStaticVisibility
+    // will re-evaluate them on next cull(). Call when the visibility grid resolves dirty.
+    void MarkStaticVisibilityDirty() { staticVisibilityDirty_ = true; }
+
+private:
+    bool staticVisibilityDirty_ = true;
+    bool cullResultCacheValid_ = false;
+    Camera::Frustum cullCachedFrustum_{};
+    std::array<bool,   kUploadRingSize> bindlessPartitionSlotValid_{};
+    std::array<size_t, kUploadRingSize> bindlessSlotDecalCount_{};
 };
 
 #endif

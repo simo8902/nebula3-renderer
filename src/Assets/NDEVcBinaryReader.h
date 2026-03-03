@@ -5,18 +5,43 @@
 #define NDEVC_NDEVCBINARYREADER_H
 
 #include "Platform/NDEVcHeaders.h"
+#include "Core/Logger.h"
+#include "Core/VFS.h"
+#include <sstream>
 
 class NDEVcBinaryReader {
 public:
     NDEVcBinaryReader(const std::string& filepath, bool swapBytes = false)
-        : file(filepath, std::ios::binary), swapDataBytes(swapBytes) {}
+        : swapDataBytes(swapBytes) {
+        // Check VFS first — serves bytes directly from the memory-mapped NDPK.
+        const NC::VFS::View vfsView = NC::VFS::Instance().Read(filepath);
+        if (vfsView.valid()) {
+            vfsStream_ = std::istringstream(
+                std::string(reinterpret_cast<const char*>(vfsView.data), vfsView.size),
+                std::ios::binary);
+            stream_  = &vfsStream_;
+            openOk_  = true;
+            return;
+        }
+        // When a package is mounted, assets must come from VFS — no disk fallback.
+        if (NC::VFS::Instance().IsMounted()) {
+            NC::LOGGING::Error("[VFS] Asset not found in package: ", filepath);
+            openOk_ = false;
+            return;
+        }
+        // Dev mode: fall back to disk.
+        diskFile_.open(filepath, std::ios::binary);
+        openOk_ = diskFile_.is_open();
+        stream_  = &diskFile_;
+    }
 
-    ~NDEVcBinaryReader() { if (file.is_open()) file.close(); }
+    ~NDEVcBinaryReader() {
+        if (diskFile_.is_open()) diskFile_.close();
+    }
 
-    bool isOpen() const { return file.is_open() && !file.fail(); }
-    bool eof() const { return file.eof(); }
+    bool isOpen() const { return openOk_ && stream_ && !stream_->fail(); }
+    bool eof()    const { return !stream_ || stream_->eof(); }
 
-    // Allow changing byte swap mode after construction (needed after reading magic)
     void setSwapBytes(bool swap) { swapDataBytes = swap; }
 
     bool readBool(bool& out) { return read(&out, sizeof(bool)); }
@@ -62,28 +87,30 @@ public:
 
     bool readRawData(void* ptr, size_t bytes) { return read(ptr, bytes); }
 
-    std::streampos tell() { return file.tellg(); }
-    void seek(std::streampos pos) { file.seekg(pos); }
-    void seekRel(std::streamoff off) { file.seekg(off, std::ios::cur); }
-    void seekEnd() { file.seekg(0, std::ios::end); }
+    std::streampos tell() { return stream_ ? stream_->tellg() : std::streampos(-1); }
+    void seek(std::streampos pos) { if (stream_) { stream_->clear(); stream_->seekg(pos); } }
+    void seekRel(std::streamoff off) { if (stream_) { stream_->clear(); stream_->seekg(off, std::ios::cur); } }
+    void seekEnd() { if (stream_) { stream_->clear(); stream_->seekg(0, std::ios::end); } }
 
 private:
-    std::ifstream file;
+    std::istream*     stream_  = nullptr;
+    std::ifstream     diskFile_;
+    std::istringstream vfsStream_;
     bool swapDataBytes;
+    bool openOk_ = false;
 
     bool read(void* ptr, size_t bytes) {
-        return (bool)file.read((char*)ptr, bytes);
+        if (!stream_) return false;
+        return (bool)stream_->read(static_cast<char*>(ptr), static_cast<std::streamsize>(bytes));
     }
 
     uint16_t swap16(uint16_t v) {
         return swapDataBytes ? ((v >> 8) | (v << 8)) : v;
     }
-
     uint32_t swap32(uint32_t v) {
         if (!swapDataBytes) return v;
         return ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v & 0xff0000) >> 8) | ((v >> 24) & 0xff);
     }
-
     uint64_t swap64(uint64_t v) {
         if (!swapDataBytes) return v;
         return ((uint64_t)swap32(v & 0xffffffff) << 32) | swap32((v >> 32) & 0xffffffff);

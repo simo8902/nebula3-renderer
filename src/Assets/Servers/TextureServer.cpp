@@ -3,6 +3,7 @@
 
 #include "Assets/Servers/TextureServer.h"
 #include "Core/Logger.h"
+#include "Core/VFS.h"
 #if defined(NDEVC_HAS_DIRECTXTEX) && NDEVC_HAS_DIRECTXTEX
 #include "DirectXTex/DirectXTex.h"
 #endif
@@ -92,37 +93,58 @@ GLuint TextureServer::LoadDDS(const std::string &path) {
 
     DirectX::ScratchImage image;
     DirectX::TexMetadata meta;
-    HRESULT hr = DirectX::LoadFromDDSFile(
-        std::wstring(norm.begin(), norm.end()).c_str(),
-        DirectX::DDS_FLAGS_NONE,
-        &meta, image
-    );
-    if (FAILED(hr)) {
+    HRESULT hr = E_FAIL;
+
+    // VFS first — serve directly from the memory-mapped NDPK blob.
+    const NC::VFS::View vfsView = NC::VFS::Instance().Read(norm);
+    if (vfsView.valid()) {
+        hr = DirectX::LoadFromDDSMemory(vfsView.data, vfsView.size,
+                                        DirectX::DDS_FLAGS_NONE, &meta, image);
+        if (FAILED(hr)) {
+            hr = DirectX::LoadFromDDSMemory(vfsView.data, vfsView.size,
+                                            DirectX::DDS_FLAGS_LEGACY_DWORD |
+                                            DirectX::DDS_FLAGS_NO_LEGACY_EXPANSION,
+                                            &meta, image);
+        }
+    } else {
+        // When a package is mounted, assets must come from VFS — no disk fallback.
+        if (NC::VFS::Instance().IsMounted()) {
+            NC::LOGGING::Error("[TEX] Asset not found in package: ", norm);
+            gTexHasTransparency[path] = false;
+            return 0;
+        }
         hr = DirectX::LoadFromDDSFile(
             std::wstring(norm.begin(), norm.end()).c_str(),
-            DirectX::DDS_FLAGS_LEGACY_DWORD | DirectX::DDS_FLAGS_NO_LEGACY_EXPANSION,
+            DirectX::DDS_FLAGS_NONE,
             &meta, image
         );
-    }
-    if (FAILED(hr)) {
-        std::ifstream f(norm, std::ios::binary | std::ios::ate);
-        if (!f) {
-            NC::LOGGING::Error("[TEX] Failed to open for memory load: ", norm);
-            return 0;
-        }
-        std::streamsize sz = f.tellg();
-        f.seekg(0, std::ios::beg);
-        std::vector<uint8_t> bytes(sz);
-        if (!f.read(reinterpret_cast<char*>(bytes.data()), sz)) {
-            NC::LOGGING::Error("[TEX] Failed to read bytes for memory load: ", norm);
-            return 0;
-        }
-        hr = DirectX::LoadFromDDSMemory(bytes.data(), bytes.size(),
-            DirectX::DDS_FLAGS_NONE, &meta, image);
         if (FAILED(hr)) {
-            hr = DirectX::LoadFromDDSMemory(bytes.data(), bytes.size(),
+            hr = DirectX::LoadFromDDSFile(
+                std::wstring(norm.begin(), norm.end()).c_str(),
                 DirectX::DDS_FLAGS_LEGACY_DWORD | DirectX::DDS_FLAGS_NO_LEGACY_EXPANSION,
-                &meta, image);
+                &meta, image
+            );
+        }
+        if (FAILED(hr)) {
+            std::ifstream f(norm, std::ios::binary | std::ios::ate);
+            if (!f) {
+                NC::LOGGING::Error("[TEX] Failed to open for memory load: ", norm);
+                return 0;
+            }
+            std::streamsize sz = f.tellg();
+            f.seekg(0, std::ios::beg);
+            std::vector<uint8_t> bytes(sz);
+            if (!f.read(reinterpret_cast<char*>(bytes.data()), sz)) {
+                NC::LOGGING::Error("[TEX] Failed to read bytes for memory load: ", norm);
+                return 0;
+            }
+            hr = DirectX::LoadFromDDSMemory(bytes.data(), bytes.size(),
+                DirectX::DDS_FLAGS_NONE, &meta, image);
+            if (FAILED(hr)) {
+                hr = DirectX::LoadFromDDSMemory(bytes.data(), bytes.size(),
+                    DirectX::DDS_FLAGS_LEGACY_DWORD | DirectX::DDS_FLAGS_NO_LEGACY_EXPANSION,
+                    &meta, image);
+            }
         }
     }
     if (FAILED(hr)) {

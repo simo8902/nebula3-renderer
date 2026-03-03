@@ -31,6 +31,7 @@ layout(location=1) out vec4 gNormalDepthPacked;
 layout(location=2) out vec4 gAlbedoSpec;
 layout(location=3) out vec4 gPositionWS;
 layout(location=4) out vec4 gEmissive;
+layout(location=5) out vec4 gNormalDepthEncoded_out;
 
 void main() {
     const float MipBias = -0.5;
@@ -56,34 +57,23 @@ void main() {
     tNormal.z = sqrt(max(0.0, 1.0 - dot(tNormal.xy, tNormal.xy)));
     vec3 worldSpaceNormal = (isFlatNormal > 0) ? N : normalize(mat3(T, B, N) * tNormal);
 
-    vec3 envColor = vec3(0.0);
+    // Nebula environment reflection: simple cubemap + lerp
+    vec3 envDiffColor = diffColor.rgb;
     if (DisableViewDependentReflection == 0) {
-        vec3 viewVec = vWorldPos - eyePos;
-        // Reduce vertical camera sensitivity without hard clamping.
-        viewVec.y *= 0.25;
-        vec3 I = normalize(viewVec);
-        vec3 envDir = reflect(I, worldSpaceNormal);
-        float gloss = clamp(specColor.r, 0.0, 1.0);
-        float roughness = clamp(1.0 - gloss, 0.1, 1.0);
-        float envMip = mix(0.25, 3.5, roughness * roughness);
-        envColor = textureLod(CubeMap0, envDir, envMip).rgb;
+        vec3 worldViewVec = normalize(vWorldPos - eyePos);
+        vec3 envDir = reflect(worldViewVec, worldSpaceNormal);
+        vec3 envColor = texture(CubeMap0, envDir).rgb;
+        envDiffColor = mix(diffColor.rgb, envColor, Intensity0 * specColor.a);
     }
 
-    float reflMask = specColor.r;
-    float envFactor = (DisableViewDependentReflection == 0)
-        ? clamp(Intensity0 * reflMask * 1.35, 0.0, 1.0)
-        : 0.0;
     float specIntensity = clamp(specColor.r * MatSpecularIntensity, 0.0, 1.0);
     float specPowerPacked = clamp(MatSpecularPower / 255.0, 0.0, 1.0);
     vec3 emsvColor = texture(EmsvMap0, vUV, MipBias).rgb * MatEmissiveIntensity;
-    vec3 V = normalize(eyePos - vWorldPos);
-    float ndv = clamp(dot(worldSpaceNormal, V), 0.0, 1.0);
-    float fresnel = 0.25 + 0.75 * pow(1.0 - ndv, 4.0);
-    vec3 envContribution = envColor * envFactor * fresnel;
 
     gPositionVS = vec4(vViewPos, 1.0);
     gPositionWS = vec4(vWorldPos, (ReceivesDecals > 0) ? 1.0 : 0.0);
     gNormalDepthPacked = vec4(worldSpaceNormal * 0.5 + 0.5, specPowerPacked);
-    gAlbedoSpec = vec4(diffColor.rgb, specIntensity);
-    gEmissive = vec4(emsvColor + envContribution, 0.0);
+    gAlbedoSpec = vec4(envDiffColor, specIntensity);
+    gEmissive = vec4(emsvColor, 0.0);
+    gNormalDepthEncoded_out = vec4(0.0);
 }

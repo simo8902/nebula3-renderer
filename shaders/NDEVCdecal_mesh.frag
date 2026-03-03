@@ -1,4 +1,8 @@
 #version 460 core
+#ifdef BINDLESS
+#extension GL_ARB_bindless_texture : require
+#extension GL_ARB_gpu_shader_int64 : require
+#endif
 
 // 0 Normal rendering
 // 1 Show world position (red=X, green=Z, blue=Y)
@@ -9,10 +13,30 @@
 // 6 Show diffuse UV fractional part (to see tiling pattern)
 #define DEBUG_MODE 0
 
-uniform sampler2D gPositionWS;
-uniform sampler2D gNormalDepthPacked;
+#ifdef BINDLESS
+struct DecalMaterialGPU {
+    uint64_t diffuseHandle;
+    uint64_t emissiveHandle;
+    float    decalScale;
+    uint     decalDiffuseMode;
+    float    pad0;
+    float    pad1;
+};
+
+layout(std430, binding = 4) readonly buffer DecalMaterialBuffer {
+    DecalMaterialGPU decalMaterials[];
+};
+
+flat in uint vMaterialID;
+#else
 uniform sampler2D DiffMap0;
 uniform sampler2D EmsvMap0;
+uniform float DecalScale;
+uniform int DecalDiffuseMode;
+#endif
+
+uniform sampler2D gPositionWS;
+uniform sampler2D gNormalDepthPacked;
 
 layout(std430, binding = 1) readonly buffer ModelMatrices {
     mat4 modelMatrices[];
@@ -23,8 +47,6 @@ layout(std430, binding = 3) readonly buffer DecalParams {
 };
 
 uniform vec2 screenSize;
-uniform float DecalScale;
-uniform int DecalDiffuseMode;
 
 flat in uint vInstanceID;
 
@@ -50,7 +72,7 @@ void main() {
     vec4 existingNormalDepth = texture(gNormalDepthPacked, uv);
     vec3 surfaceNormal = normalize(existingNormalDepth.rgb * 2.0 - 1.0);
 
-    if (surfaceNormal.y < 0.5) discard;
+    if (surfaceNormal.y < -0.25) discard;
 
     mat4 invModel = inverse(model);
     vec4 local = invModel * vec4(worldPos, 1.0);
@@ -82,11 +104,22 @@ void main() {
     maskUV.y = 1.0 - maskUV.y;
     maskUV = clamp(maskUV, 0.0, 1.0);
 
+#ifdef BINDLESS
+    DecalMaterialGPU mat = decalMaterials[vMaterialID];
+    sampler2D diffSampler = sampler2D(mat.diffuseHandle);
+    sampler2D emsvSampler = sampler2D(mat.emissiveHandle);
+    float dScale = mat.decalScale;
+    int dMode = int(mat.decalDiffuseMode);
+#else
+    float dScale = DecalScale;
+    int dMode = DecalDiffuseMode;
+#endif
+
     vec2 diffuseUV = maskUV;
-    if (DecalDiffuseMode != 0) {
+    if (dMode != 0) {
         diffuseUV = worldPos.xz;
-        if (DecalScale > 0.001) {
-            diffuseUV *= DecalScale;
+        if (dScale > 0.001) {
+            diffuseUV *= dScale;
         }
     }
 
@@ -102,11 +135,19 @@ void main() {
     outAlbedoSpec = vec4(diffuseVis, 0.0, 1.0);
     return;
 #elif DEBUG_MODE == 4
+#ifdef BINDLESS
+    float maskVis = texture(emsvSampler, maskUV).r;
+#else
     float maskVis = texture(EmsvMap0, maskUV).r;
+#endif
     outAlbedoSpec = vec4(vec3(maskVis), 1.0);
     return;
 #elif DEBUG_MODE == 5
+#ifdef BINDLESS
+    vec3 diffVis = texture(diffSampler, diffuseUV).rgb;
+#else
     vec3 diffVis = texture(DiffMap0, diffuseUV).rgb;
+#endif
     outAlbedoSpec = vec4(diffVis, 1.0);
     return;
 #elif DEBUG_MODE == 6
@@ -114,8 +155,14 @@ void main() {
     outAlbedoSpec = vec4(uvFract, 0.0, 1.0);
     return;
 #endif
+
+#ifdef BINDLESS
+    vec3 decalAlbedo = texture(diffSampler, diffuseUV).rgb;
+    float mask = texture(emsvSampler, maskUV).r;
+#else
     vec3 decalAlbedo = texture(DiffMap0, diffuseUV).rgb;
     float mask = texture(EmsvMap0, maskUV).r;
+#endif
 
     // Softer edge fade for more natural blending
     vec2 fadeXZ = min(localNorm.xz, 1.0 - localNorm.xz);

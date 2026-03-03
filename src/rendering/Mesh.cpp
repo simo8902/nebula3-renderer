@@ -2,9 +2,12 @@
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
 #include "Rendering/Mesh.h"
+#include "Core/Logger.h"
+#include "Core/VFS.h"
 
 #include "glad/glad.h"
 #include "GLFW/glfw3.h"
+#include <sstream>
 
 void Mesh::SetupVAO(Mesh& out) {
     if (out.vao == 0) glGenVertexArrays(1, out.vao.put());
@@ -38,20 +41,45 @@ void Mesh::SetupVAO(Mesh& out) {
 }
 
 bool Mesh::LoadNVX2(const std::string& path, Mesh& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "[NVX2] cannot open " << path << " "; return false; }
+    std::ifstream diskFile;
+    std::istringstream vfsStream;
+    std::istream* stream = nullptr;
 
-    char magic[4]; f.read(magic, 4); if (!f)return false;
+    const NC::VFS::View vfsView = NC::VFS::Instance().Read(path);
+    if (vfsView.valid()) {
+        vfsStream = std::istringstream(
+            std::string(reinterpret_cast<const char*>(vfsView.data), vfsView.size),
+            std::ios::binary);
+        stream = &vfsStream;
+    } else {
+        if (NC::VFS::Instance().IsMounted()) {
+            NC::LOGGING::Error("[MESH] Asset not found in package: ", path);
+            return false;
+        }
+        diskFile.open(path, std::ios::binary);
+        if (!diskFile) {
+            std::cerr << "[NVX2] cannot open " << path << " ";
+            return false;
+        }
+        stream = &diskFile;
+    }
+
+    char magic[4];
+    stream->read(magic, 4);
+    if (!(*stream)) return false;
     uint32_t numGroups, numVertices, vertexWidthFloats, numTrianglesOrIndices, numEdges, compMask;
-    f.read((char*)&numGroups, 4);
-    f.read((char*)&numVertices, 4);
-    f.read((char*)&vertexWidthFloats, 4);
-    f.read((char*)&numTrianglesOrIndices, 4);
-    f.read((char*)&numEdges, 4);
-    f.read((char*)&compMask, 4);
+    stream->read((char*)&numGroups, 4);
+    stream->read((char*)&numVertices, 4);
+    stream->read((char*)&vertexWidthFloats, 4);
+    stream->read((char*)&numTrianglesOrIndices, 4);
+    stream->read((char*)&numEdges, 4);
+    stream->read((char*)&compMask, 4);
 
     out.groups.assign(numGroups, {});
-    if (numGroups) { f.read((char*)out.groups.data(), numGroups * sizeof(Nvx2Group)); if (!f)return false; }
+    if (numGroups) {
+        stream->read((char*)out.groups.data(), numGroups * sizeof(Nvx2Group));
+        if (!(*stream)) return false;
+    }
 
     const uint32_t stride = vertexWidthFloats * 4;
     std::unordered_map<uint32_t, int> offsets;
@@ -70,7 +98,10 @@ bool Mesh::LoadNVX2(const std::string& path, Mesh& out) {
     add(JIndices, 16); add(JIndicesUB4, 4);
 
     std::vector<uint8_t> vbuf(size_t(numVertices) * stride);
-    if (!vbuf.empty()) { f.read((char*)vbuf.data(), vbuf.size()); if (!f)return false; }
+    if (!vbuf.empty()) {
+        stream->read((char*)vbuf.data(), vbuf.size());
+        if (!(*stream)) return false;
+    }
 
     out.verts.assign(numVertices, {});
     for (uint32_t i = 0; i < numVertices; i++) {
@@ -129,17 +160,21 @@ bool Mesh::LoadNVX2(const std::string& path, Mesh& out) {
 
     out.idx.clear();
     if (expectedIndexCount) {
-        std::streampos pos = f.tellg(); f.seekg(0, std::ios::end);
-        size_t remain = size_t(f.tellg() - pos); f.seekg(pos);
+        const std::streampos pos = stream->tellg();
+        stream->seekg(0, std::ios::end);
+        const size_t remain = static_cast<size_t>(stream->tellg() - pos);
+        stream->seekg(pos);
         size_t need16 = size_t(expectedIndexCount) * 2, need32 = size_t(expectedIndexCount) * 4;
         if ((remain >= need32 && remain % 4 == 0 && numVertices >= 65536) || remain == need32) {
             std::vector<uint32_t> tmp(expectedIndexCount);
-            f.read((char*)tmp.data(), need32); if (!f)return false;
+            stream->read((char*)tmp.data(), need32);
+            if (!(*stream)) return false;
             out.idx = std::move(tmp);
         }
         else {
             std::vector<uint16_t> tmp(expectedIndexCount);
-            f.read((char*)tmp.data(), need16); if (!f)return false;
+            stream->read((char*)tmp.data(), need16);
+            if (!(*stream)) return false;
             out.idx.resize(expectedIndexCount);
             for (uint32_t i = 0; i < expectedIndexCount; i++) out.idx[i] = tmp[i];
         }

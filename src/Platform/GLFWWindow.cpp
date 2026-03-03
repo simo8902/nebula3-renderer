@@ -57,7 +57,25 @@ GLFWWindow::GLFWWindow(const std::string& title, int width, int height)
     g_windowMap[handle_] = this;
 
     glfwMakeContextCurrent(handle_);
-    glfwSwapInterval(0);
+
+    {
+        int swapInterval = 0;
+        char* value = nullptr;
+        size_t len = 0;
+        if (_dupenv_s(&value, &len, "NDEVC_VSYNC") == 0 && value != nullptr) {
+            swapInterval = atoi(value);
+            std::free(value);
+        }
+        glfwSwapInterval(swapInterval);
+        std::cout << "[WINDOW] glfwSwapInterval=" << swapInterval
+                  << (swapInterval == 0 ? " (VSync OFF)"
+                      : swapInterval == 1 ? " (VSync ON — capped to monitor Hz)"
+                                          : " (adaptive VSync)") << "\n";
+        if (swapInterval == 0 && monitor == nullptr) {
+            std::cout << "[WINDOW] NOTE: windowed + VSync OFF is still DWM-capped on Windows. "
+                         "Set NDEVC_FULLSCREEN_EXCLUSIVE=1 for truly uncapped FPS.\n";
+        }
+    }
 }
 
 GLFWWindow::~GLFWWindow() {

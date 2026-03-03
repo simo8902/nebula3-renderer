@@ -160,7 +160,6 @@ void FrameGraph::execute() {
                 }
             }
             if (pass->execute) pass->execute();
-            device_->BindFramebuffer(nullptr);
             continue;
         }
 
@@ -176,9 +175,9 @@ void FrameGraph::execute() {
         }
 
         if (pass->execute) pass->execute();
-
-        device_->BindFramebuffer(nullptr);
     }
+    // Restore default framebuffer once after all passes (ImGui renders to FBO 0).
+    device_->BindFramebuffer(nullptr);
 }
 
 std::shared_ptr<ITexture> FrameGraph::getTextureInterface(const std::string& name) const {

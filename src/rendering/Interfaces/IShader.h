@@ -54,6 +54,12 @@ public:
     virtual void SetVec4(const std::string& name, const glm::vec4& value) const = 0;
     virtual void SetVec4(UniformID id, const glm::vec4& value) const = 0;
 
+    virtual void SetInt64(const std::string& name, int64_t value) const = 0;
+    virtual void SetInt64(UniformID id, int64_t value) const = 0;
+
+    virtual void SetUint64(const std::string& name, uint64_t value) const = 0;
+    virtual void SetUint64(UniformID id, uint64_t value) const = 0;
+
     virtual void PrecacheUniform(UniformID id, const char* name) const = 0;
 };
 

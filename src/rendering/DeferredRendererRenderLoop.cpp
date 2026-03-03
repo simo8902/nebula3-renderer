@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <thread>
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include "Rendering/DrawBatchSystem.h"
@@ -61,6 +62,28 @@ bool ReadEnvToggle(const char* name) {
 #endif
 }
 
+uint64_t ReadEnvUint64(const char* name, uint64_t fallbackValue) {
+    if (!name || !name[0]) return fallbackValue;
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || value == nullptr) {
+        return fallbackValue;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    const bool ok = (end != value && end && *end == '\0');
+    std::free(value);
+    return ok ? static_cast<uint64_t>(parsed) : fallbackValue;
+#else
+    const char* value = std::getenv(name);
+    if (!value || !value[0]) return fallbackValue;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return (end != value && end && *end == '\0') ? static_cast<uint64_t>(parsed) : fallbackValue;
+#endif
+}
+
 bool ParticlesDisabled() {
     static const bool disabled = ReadEnvToggle("NDEVC_DISABLE_PARTICLES");
     return disabled;
@@ -90,6 +113,17 @@ bool NoPresentWhenViewportDisabled() {
     static const bool enabled = ReadEnvToggle("NDEVC_NO_PRESENT_WHEN_VIEWPORT_DISABLED");
     return enabled;
 }
+
+bool FrameFenceWaitEnabled() {
+    static const bool enabled = !ReadEnvToggle("NDEVC_DISABLE_FRAME_FENCE_WAIT");
+    return enabled;
+}
+
+uint64_t FrameFenceWaitBudgetNs() {
+    static const uint64_t budgetNs = ReadEnvUint64("NDEVC_FRAME_FENCE_WAIT_NS", 1000000ull);
+    return budgetNs;
+}
+
 
 uint64_t HashMatrix4(const glm::mat4& matrix) {
     uint64_t hash = 0x6f3d9b6f3d9b6f3dull;
@@ -276,6 +310,7 @@ extern bool gEnableGLErrorChecking;
 using UniformID = NDEVC::Graphics::IShader::UniformID;
 static constexpr UniformID U_PROJECTION = NDEVC::Graphics::IShader::MakeUniformID("projection");
 static constexpr UniformID U_VIEW = NDEVC::Graphics::IShader::MakeUniformID("view");
+static constexpr UniformID U_INV_PROJECTION = NDEVC::Graphics::IShader::MakeUniformID("invProjection");
 static constexpr UniformID U_MODEL = NDEVC::Graphics::IShader::MakeUniformID("model");
 static constexpr UniformID U_TEXTURE_TRANSFORM0 = NDEVC::Graphics::IShader::MakeUniformID("textureTransform0");
 static constexpr UniformID U_MAT_EMISSIVE_INTENSITY = NDEVC::Graphics::IShader::MakeUniformID("MatEmissiveIntensity");
@@ -296,7 +331,6 @@ static constexpr UniformID U_CAMERA_POS = NDEVC::Graphics::IShader::MakeUniformI
 static constexpr UniformID U_LIGHT_DIR_WS = NDEVC::Graphics::IShader::MakeUniformID("LightDirWS");
 static constexpr UniformID U_LIGHT_COLOR = NDEVC::Graphics::IShader::MakeUniformID("LightColor");
 static constexpr UniformID U_AMBIENT_COLOR = NDEVC::Graphics::IShader::MakeUniformID("AmbientColor");
-static constexpr UniformID U_GPOSITION = NDEVC::Graphics::IShader::MakeUniformID("gPosition");
 static constexpr UniformID U_GNORMAL_DEPTH_PACKED = NDEVC::Graphics::IShader::MakeUniformID("gNormalDepthPacked");
 static constexpr UniformID U_GPOSITION_WS = NDEVC::Graphics::IShader::MakeUniformID("gPositionWS");
 static constexpr UniformID U_SHADOW_MAP_CASCADE0 = NDEVC::Graphics::IShader::MakeUniformID("shadowMapCascade0");
@@ -382,6 +416,17 @@ static bool IsParticlePassDisabled() {
     return disabled;
 }
 
+static bool IsAlphaDepthPrepassEnabled() {
+    static const bool enabled = []() {
+        const bool forceDisable = ReadEnvToggle("NDEVC_DISABLE_ALPHA_DEPTH_PREPASS");
+        const bool explicitEnable = ReadEnvToggle("NDEVC_ENABLE_ALPHA_DEPTH_PREPASS");
+        if (forceDisable) return false;
+        if (explicitEnable) return true;
+        return true;
+    }();
+    return enabled;
+}
+
 #define kDisableShadowPass (IsShadowPassDisabled())
 #define kDisableShadows (IsShadowsDisabled())
 #define kDisableLighting (IsLightingDisabled())
@@ -396,6 +441,7 @@ static bool IsParticlePassDisabled() {
 #define kDisableWaterPass (IsWaterPassDisabled())
 #define kDisablePostAlphaUnlitPass (IsPostAlphaUnlitPassDisabled())
 #define kDisableParticlePass (IsParticlePassDisabled())
+#define kEnableAlphaDepthPrepass (IsAlphaDepthPrepassEnabled())
 static constexpr bool kDisableFog = false;
 static constexpr bool kDisableViewDependentSpecular = false;
 static constexpr bool kDisableViewDependentReflections = false;
@@ -408,6 +454,17 @@ static bool IsRefractionPassDisabled() {
 }
 
 #define kDisableRefractionPass (IsRefractionPassDisabled())
+
+static bool IsSLPassDisabled() {
+    static const bool disabled = ReadEnvToggle("NDEVC_DISABLE_SL_PASS");
+    return disabled;
+}
+static bool IsEnvPassDisabled() {
+    static const bool disabled = ReadEnvToggle("NDEVC_DISABLE_ENV_PASS");
+    return disabled;
+}
+#define kDisableSLPass (IsSLPassDisabled())
+#define kDisableEnvPass (IsEnvPassDisabled())
 static const bool kLogShaderCompat = ReadEnvToggle("NDEVC_LOG_SHADER_COMPAT");
 static const bool kForceNonInstancedNormalMatrixPath =
     ReadEnvToggle("NDEVC_FORCE_NON_INSTANCED_NORMAL_MATRIX");
@@ -653,15 +710,15 @@ void DeferredRenderer::setupRenderPasses()
     shadowGraph = std::make_unique<FrameGraph>(device_.get(), SHADOW_WIDTH, SHADOW_HEIGHT);
 
     geometryGraph = std::make_unique<FrameGraph>(device_.get(), width, height);
-    // Keep view-space position at 32-bit float for soft-particle depth stability.
-    geometryGraph->declareResource("gPositionVS", Format::RGBA32F);
+    const bool useCompactGBuffer = !ReadEnvToggle("NDEVC_DISABLE_COMPACT_GBUFFER");
+    NC::LOGGING::Log("[GBuffer] Compact mode=", useCompactGBuffer ? "ON" : "OFF",
+                     " (disable via NDEVC_DISABLE_COMPACT_GBUFFER=1)");
+    geometryGraph->declareResource("gPositionVS", useCompactGBuffer ? Format::RGBA16F : Format::RGBA32F);
     geometryGraph->declareResource("gNormalDepthPacked", Format::RGBA16F);
     geometryGraph->declareResource("gNormalDepthCompat", Format::RGBA16F);
     geometryGraph->declareResource("gNormalDepthEncoded", Format::RGBA16F);
     geometryGraph->declareResource("gAlbedoSpec", Format::RGBA8_UNORM);
-    // World-space position is used directly for shadow lookups; keep full precision
-    // to avoid quantization shimmer on large world coordinates.
-    geometryGraph->declareResource("gPositionWS", Format::RGBA32F);
+    geometryGraph->declareResource("gPositionWS", useCompactGBuffer ? Format::RGBA16F : Format::RGBA32F);
     geometryGraph->declareResource("gEmissive", Format::RGBA16F);
     geometryGraph->declareResource("gDepth", Format::D24_UNORM_S8_UINT, true);
 
@@ -695,7 +752,7 @@ shadowPass.cullFace = true;
 shadowPass.clearDepth = false;
 shadowPass.externalFBO = true;
 shadowPass.shouldSkip = [this]() {
-    return solidDraws.empty() && simpleLayerDraws.empty();
+    return kDisableShadowPass || (solidDraws.empty() && simpleLayerDraws.empty());
 };
 shadowPass.execute = [this]() {
     if (kDisableShadowPass) {
@@ -752,9 +809,15 @@ shadowGraph->compile();
         std::cout << "[GEOMETRY] FBO=" << fbo << " Viewport=" << vp[2] << "x" << vp[3] << "\n";
     }
 
-    glStencilFunc(GL_ALWAYS, 1, 0xFF);
-    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-    glStencilMask(0xFF);
+    {
+        static bool sStencilSetupDone = false;
+        if (!sStencilSetupDone) {
+            sStencilSetupDone = true;
+            glStencilFunc(GL_ALWAYS, 1, 0xFF);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            glStencilMask(0xFF);
+        }
+    }
 
     const bool bindlessAvailable = TextureServer::sBindlessSupported && materialSSBO_.valid();
     auto standardShader = shaderManager->GetShader("standard");
@@ -817,12 +880,13 @@ shadowGraph->compile();
     }
     deferredPackedCompatReady_ = !deferredShaderUsesPackedGBuffer_;
 
-    constexpr GLsizei kGeometryDrawBufferCount = 6;
-    constexpr GLenum kStandardGBufferDrawBuffers[kGeometryDrawBufferCount] = {
-        GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_COLOR_ATTACHMENT5
+    constexpr GLsizei kStandardGBufferDrawBufferCount = 5;
+    constexpr GLenum kStandardGBufferDrawBuffers[kStandardGBufferDrawBufferCount] = {
+        GL_NONE, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4
     };
-    constexpr GLenum kPackedDeferredDrawBuffers[kGeometryDrawBufferCount] = {
-        GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_NONE, GL_NONE
+    constexpr GLsizei kPackedDeferredDrawBufferCount = 4;
+    constexpr GLenum kPackedDeferredDrawBuffers[kPackedDeferredDrawBufferCount] = {
+        GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4
     };
     auto setGeometryDrawBufferLayout = [&](bool packedDeferredLayout) {
         static GLint cachedMaxDrawBuffers = -1;
@@ -832,20 +896,29 @@ shadowGraph->compile();
                 cachedMaxDrawBuffers = 1;
             }
         }
-
-        GLsizei drawBufferCount = static_cast<GLsizei>(cachedMaxDrawBuffers);
-        if (drawBufferCount > kGeometryDrawBufferCount) {
-            drawBufferCount = kGeometryDrawBufferCount;
+        static GLuint sCachedDBProgram = 0;
+        static bool sCachedPackedLayout = false;
+        static bool sCachedLayoutSet = false;
+        if (sCachedDBProgram != deferredProgram) {
+            sCachedDBProgram = deferredProgram;
+            sCachedLayoutSet = false;
         }
-
+        if (sCachedLayoutSet && sCachedPackedLayout == packedDeferredLayout) return;
+        sCachedPackedLayout = packedDeferredLayout;
+        sCachedLayoutSet = true;
+        const GLenum* drawBuffers = packedDeferredLayout ? kPackedDeferredDrawBuffers : kStandardGBufferDrawBuffers;
+        const GLsizei desiredCount = packedDeferredLayout ? kPackedDeferredDrawBufferCount : kStandardGBufferDrawBufferCount;
+        GLsizei drawBufferCount = desiredCount;
+        if (drawBufferCount > static_cast<GLsizei>(cachedMaxDrawBuffers)) {
+            drawBufferCount = static_cast<GLsizei>(cachedMaxDrawBuffers);
+        }
         static bool warnedDrawBufferClamp = false;
-        if (drawBufferCount < kGeometryDrawBufferCount && !warnedDrawBufferClamp) {
+        if (drawBufferCount < desiredCount && !warnedDrawBufferClamp) {
             std::cerr << "[GEOMETRY] GL_MAX_DRAW_BUFFERS=" << cachedMaxDrawBuffers
                       << "; clamping geometry MRT draw buffers to " << drawBufferCount << ".\n";
             warnedDrawBufferClamp = true;
         }
-
-        glDrawBuffers(drawBufferCount, packedDeferredLayout ? kPackedDeferredDrawBuffers : kStandardGBufferDrawBuffers);
+        glDrawBuffers(drawBufferCount, drawBuffers);
     };
 
     shader->PrecacheUniform(U_PROJECTION, "projection");
@@ -870,47 +943,62 @@ shadowGraph->compile();
     }
 
     shader->Use();
-    shader->SetMat4(U_PROJECTION, camera_.getProjectionMatrix());
-    shader->SetMat4(U_VIEW, camera_.getViewMatrix());
-    shader->SetMat4(U_TEXTURE_TRANSFORM0, glm::mat4(1.0f));
-    shader->SetInt(U_USE_SKINNING, 0);
-    shader->SetInt(U_USE_INSTANCING, 1);
-    if (!useBindlessGeometry) {
-        shader->SetFloat(U_MAT_EMISSIVE_INTENSITY, 0.0f);
-        shader->SetFloat(U_MAT_SPECULAR_INTENSITY, 0.0f);
-        shader->SetFloat(U_MAT_SPECULAR_POWER, 32.0f);
-        shader->SetInt(U_ALPHA_TEST, 0);
-        shader->SetFloat(U_ALPHA_CUTOFF, 0.5f);
-        shader->SetInt(U_DIFF_MAP0, 0);
-        shader->SetInt(U_SPEC_MAP0, 1);
-        shader->SetInt(U_BUMP_MAP0, 2);
-        shader->SetInt(U_EMSV_MAP0, 3);
-        shader->SetInt("diffMapSampler", 0);
-        shader->SetInt("specMapSampler", 1);
-        shader->SetInt("bumpMapSampler", 2);
-        shader->SetInt("emsvSampler", 3);
-        shader->SetInt(U_TWO_SIDED, 0);
-        shader->SetInt(U_IS_FLAT_NORMAL, 0);
-        shader->SetVec4("fogDistances", glm::vec4(180.0f, 520.0f, 0.0f, 0.0f));
-        shader->SetVec4("fogColor", glm::vec4(0.61f, 0.58f, 0.52f, 0.0f));
-        shader->SetVec4("heightFogColor", glm::vec4(0.61f, 0.58f, 0.52f, 100000.0f));
-        shader->SetVec4("pixelSize", glm::vec4(
-            1.0f / static_cast<float>(std::max(width, 1)),
-            1.0f / static_cast<float>(std::max(height, 1)),
-            0.0f,
-            0.0f));
-        shader->SetFloat("encodefactor", 1.0f);
-        shader->SetFloat("alphaBlendFactor", 1.0f);
-        shader->SetFloat("mayaAnimableAlpha", 1.0f);
-        shader->SetFloat("AlphaClipRef", 128.0f);
-        shader->SetVec4("customColor2", glm::vec4(0.0f));
-    }
-    if (depthScaleLoc >= 0) {
-        glUniform1f(depthScaleLoc, 1.0f);
-    }
-    if (normalMatrixLoc >= 0) {
-        const glm::mat3 viewOnlyNormalMatrix = glm::transpose(glm::inverse(glm::mat3(camera_.getViewMatrix())));
-        glUniformMatrix3fv(normalMatrixLoc, 1, GL_FALSE, &viewOnlyNormalMatrix[0][0]);
+    {
+        static GLuint sCachedGeomProgram = 0;
+        static glm::mat4 sCachedGeomProj(0.0f), sCachedGeomView(0.0f);
+        const bool progChanged = (sCachedGeomProgram != deferredProgram);
+        if (progChanged) sCachedGeomProgram = deferredProgram;
+        const glm::mat4 curProj = camera_.getProjectionMatrix();
+        const glm::mat4 curView = camera_.getViewMatrix();
+        if (progChanged || curProj != sCachedGeomProj) {
+            shader->SetMat4(U_PROJECTION, curProj);
+            sCachedGeomProj = curProj;
+        }
+        if (progChanged || curView != sCachedGeomView) {
+            shader->SetMat4(U_VIEW, curView);
+            sCachedGeomView = curView;
+        }
+        if (progChanged) {
+            shader->SetMat4(U_TEXTURE_TRANSFORM0, glm::mat4(1.0f));
+            shader->SetInt(U_USE_SKINNING, 0);
+            shader->SetInt(U_USE_INSTANCING, 1);
+            if (!useBindlessGeometry) {
+                shader->SetFloat(U_MAT_EMISSIVE_INTENSITY, 0.0f);
+                shader->SetFloat(U_MAT_SPECULAR_INTENSITY, 0.0f);
+                shader->SetFloat(U_MAT_SPECULAR_POWER, 32.0f);
+                shader->SetInt(U_ALPHA_TEST, 0);
+                shader->SetFloat(U_ALPHA_CUTOFF, 0.5f);
+                shader->SetInt(U_DIFF_MAP0, 0);
+                shader->SetInt(U_SPEC_MAP0, 1);
+                shader->SetInt(U_BUMP_MAP0, 2);
+                shader->SetInt(U_EMSV_MAP0, 3);
+                shader->SetInt("diffMapSampler", 0);
+                shader->SetInt("specMapSampler", 1);
+                shader->SetInt("bumpMapSampler", 2);
+                shader->SetInt("emsvSampler", 3);
+                shader->SetInt(U_TWO_SIDED, 0);
+                shader->SetInt(U_IS_FLAT_NORMAL, 0);
+                shader->SetVec4("fogDistances", glm::vec4(180.0f, 520.0f, 0.0f, 0.0f));
+                shader->SetVec4("fogColor", glm::vec4(0.61f, 0.58f, 0.52f, 0.0f));
+                shader->SetVec4("heightFogColor", glm::vec4(0.61f, 0.58f, 0.52f, 100000.0f));
+                shader->SetVec4("pixelSize", glm::vec4(
+                    1.0f / static_cast<float>(std::max(width, 1)),
+                    1.0f / static_cast<float>(std::max(height, 1)),
+                    0.0f, 0.0f));
+                shader->SetFloat("encodefactor", 1.0f);
+                shader->SetFloat("alphaBlendFactor", 1.0f);
+                shader->SetFloat("mayaAnimableAlpha", 1.0f);
+                shader->SetFloat("AlphaClipRef", 128.0f);
+                shader->SetVec4("customColor2", glm::vec4(0.0f));
+            }
+        }
+        if (depthScaleLoc >= 0 && progChanged) {
+            glUniform1f(depthScaleLoc, 1.0f);
+        }
+        if (normalMatrixLoc >= 0 && (progChanged || curView != sCachedGeomView)) {
+            const glm::mat3 viewOnlyNormalMatrix = glm::transpose(glm::inverse(glm::mat3(curView)));
+            glUniformMatrix3fv(normalMatrixLoc, 1, GL_FALSE, &viewOnlyNormalMatrix[0][0]);
+        }
     }
 
     setGeometryDrawBufferLayout(deferredShaderUsesPackedGBuffer_);
@@ -928,9 +1016,12 @@ shadowGraph->compile();
     const bool disableFaceCulling = FaceCullingDisabled();
     UpdateVisibilityThisFrame(frustum);
     if (!visResolveSkipped_) {
-        alphaTestBatchSystem_.updateStaticVisibility(alphaTestDraws);
-        environmentBatchSystem_.updateStaticVisibility(environmentDraws);
-        environmentAlphaBatchSystem_.updateStaticVisibility(environmentAlphaDraws);
+        alphaTestBatchSystem_.MarkStaticVisibilityDirty();
+        alphaTestBatchSystem_.updateStaticVisibility(alphaTestDraws, &frustum);
+        environmentBatchSystem_.MarkStaticVisibilityDirty();
+        environmentBatchSystem_.updateStaticVisibility(environmentDraws, &frustum);
+        environmentAlphaBatchSystem_.MarkStaticVisibilityDirty();
+        environmentAlphaBatchSystem_.updateStaticVisibility(environmentAlphaDraws, &frustum);
     }
     auto isDrawVisible = [&](const DrawCmd& dc, const Camera::Frustum& fr, bool keepStaticVisible) -> bool {
         return PassesFrustumCulling(dc, fr, disableFrustumCulling, keepStaticVisible);
@@ -990,15 +1081,33 @@ shadowGraph->compile();
         ForceNonBatchedGeometry() ||
         (deferredShaderHasNormalMatrixUniform_ && kForceNonInstancedNormalMatrixPath);
 
-    if (disableFaceCulling) {
-        glDisable(GL_CULL_FACE);
-    } else {
-        glEnable(GL_CULL_FACE);
-        glCullFace(GL_BACK);
+    {
+        static int sCachedCullMode = -1; // -1=unset, 0=disabled, 1=enabled
+        const int wantCull = disableFaceCulling ? 0 : 1;
+        if (sCachedCullMode != wantCull) {
+            sCachedCullMode = wantCull;
+            if (disableFaceCulling) {
+                glDisable(GL_CULL_FACE);
+            } else {
+                glEnable(GL_CULL_FACE);
+                glCullFace(GL_BACK);
+            }
+        }
     }
 
     frameProfile_.geomSetup = gMs(tGeomSetup);
 
+    constexpr int kGpuGeomSolidPhase = 0;
+    constexpr int kGpuGeomAlphaPhase = 1;
+    constexpr int kGpuGeomSimpleLayerPhase = 2;
+    constexpr int kGpuGeomEnvironmentPhase = 3;
+    auto markGeomGpuTimestamp = [&](int phase, bool begin) {
+        if (!gpuQueriesInit_) return;
+        const int idx = phase * 2 + (begin ? 0 : 1);
+        glQueryCounter(gpuGeomTsDB_[gpuQueryBufWrite_][idx], GL_TIMESTAMP);
+    };
+
+    markGeomGpuTimestamp(kGpuGeomSolidPhase, true);
     if (useNonInstancedNormalMatrixPath) {
         auto t0 = GClock::now();
         shader->SetInt(U_USE_INSTANCING, 0);
@@ -1012,6 +1121,7 @@ shadowGraph->compile();
         if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Solid draws (non-instanced normalMatrix path): ", renderedSolid);
     } else {
         { auto t0 = GClock::now();
+        if (!visResolveSkipped_) solidBatchSystem_.MarkStaticVisibilityDirty();
         solidBatchSystem_.cull(solidDraws, frustum);
         frameProfile_.geomSolidCull = gMs(t0); }
         if (optRenderLOG) std::cout << "[GEOMETRY] Solid draws: " << solidDraws.size() << "\n";
@@ -1081,7 +1191,9 @@ shadowGraph->compile();
 
     frameDrawCalls_ += solidAnimOverlayDrawCount;
     if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Solid animated overlays: ", solidAnimOverlayDrawCount);
+    markGeomGpuTimestamp(kGpuGeomSolidPhase, false);
 
+    markGeomGpuTimestamp(kGpuGeomAlphaPhase, true);
     if (!alphaTestDraws.empty()) {
         if (useNonInstancedNormalMatrixPath) {
             auto t0 = GClock::now();
@@ -1097,14 +1209,77 @@ shadowGraph->compile();
             if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Alpha test draws (non-instanced normalMatrix path): ", renderedAlpha);
             shader->SetInt(U_ALPHA_TEST, 0);
         } else {
+            { auto t0 = GClock::now();
+            alphaTestBatchSystem_.cullGeneric(alphaTestDraws, frameFrustum_, 1, 5);
+            frameProfile_.geomAlphaCull = gMs(t0); }
+
+            bool ranAlphaDepthPrepass = false;
+            if (kEnableAlphaDepthPrepass) {
+                auto alphaDepthStd = shaderManager->GetShader("NDEVCdeferred_alpha_depth");
+                auto alphaDepthBindless = shaderManager->GetShader("NDEVCdeferred_alpha_depth_bindless");
+                decltype(alphaDepthStd) alphaDepthShader = alphaDepthStd;
+                bool useBindlessAlphaDepth = false;
+
+                if (useBindlessGeometry && materialSSBO_.valid()) {
+                    if (alphaDepthBindless) {
+                        alphaDepthShader = alphaDepthBindless;
+                        useBindlessAlphaDepth = true;
+                    } else {
+                        static bool warnedMissingBindlessDepth = false;
+                        if (!warnedMissingBindlessDepth) {
+                            NC::LOGGING::Warning("[GEOMETRY] Alpha depth prepass bindless shader missing; skipping prepass in bindless mode.");
+                            warnedMissingBindlessDepth = true;
+                        }
+                        alphaDepthShader.reset();
+                    }
+                }
+
+                if (alphaDepthShader) {
+                    const GLuint alphaDepthProgram = alphaDepthShader->GetNativeHandle()
+                        ? *reinterpret_cast<GLuint*>(alphaDepthShader->GetNativeHandle())
+                        : 0;
+
+                    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                    glDepthMask(GL_TRUE);
+                    glDepthFunc(GL_LEQUAL);
+                    glStencilMask(0x00);
+
+                    alphaDepthShader->Use();
+                    alphaDepthShader->SetMat4(U_PROJECTION, camera_.getProjectionMatrix());
+                    alphaDepthShader->SetMat4(U_VIEW, camera_.getViewMatrix());
+                    alphaDepthShader->SetMat4(U_TEXTURE_TRANSFORM0, glm::mat4(1.0f));
+                    alphaDepthShader->SetInt(U_USE_SKINNING, 0);
+                    alphaDepthShader->SetInt(U_USE_INSTANCING, 1);
+
+                    if (!useBindlessAlphaDepth) {
+                        alphaDepthShader->SetInt(U_DIFF_MAP0, 0);
+                        alphaDepthShader->SetInt(U_ALPHA_TEST, 1);
+                        alphaDepthShader->SetFloat(U_ALPHA_CUTOFF, 0.5f);
+                        alphaDepthShader->SetFloat("alphaBlendFactor", 1.0f);
+                        alphaDepthShader->SetFloat("mayaAnimableAlpha", 1.0f);
+                        alphaDepthShader->SetFloat("AlphaClipRef", 128.0f);
+                    } else {
+                        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, materialSSBO_);
+                    }
+
+                    MegaBuffer::instance().bind();
+                    alphaTestBatchSystem_.flush(samplerRepeat_abstracted.get(), 5, alphaDepthProgram, useBindlessAlphaDepth);
+                    ranAlphaDepthPrepass = true;
+
+                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                    glStencilMask(0xFF);
+                }
+            }
+
+            shader->Use();
             if (!useBindlessGeometry) {
                 shader->SetInt(U_ALPHA_TEST, 1);
             }
             shader->SetInt(U_USE_INSTANCING, 1);
-
-            { auto t0 = GClock::now();
-            alphaTestBatchSystem_.cullGeneric(alphaTestDraws, frameFrustum_, 1, 5);
-            frameProfile_.geomAlphaCull = gMs(t0); }
+            if (ranAlphaDepthPrepass) {
+                glDepthFunc(GL_EQUAL);
+                glDepthMask(GL_FALSE);
+            }
 
             MegaBuffer::instance().bind();
             if (useBindlessGeometry && materialSSBO_.valid()) {
@@ -1117,8 +1292,13 @@ shadowGraph->compile();
             const int alphaTestBatches = static_cast<int>(alphaTestBatchSystem_.activeBatches().size());
             frameDrawCalls_ += alphaTestBatches;
             if (optRenderLOG) NC::LOGGING::Log("[GEOMETRY] Alpha test draws (batched): batches=", alphaTestBatches, " objs=", alphaTestDraws.size());
+            if (ranAlphaDepthPrepass) {
+                glDepthFunc(GL_LESS);
+                glDepthMask(GL_TRUE);
+            }
         }
     }
+    markGeomGpuTimestamp(kGpuGeomAlphaPhase, false);
 
     // Non-deferred shaders use the standard G-buffer location mapping.
     setGeometryDrawBufferLayout(false);
@@ -1126,7 +1306,8 @@ shadowGraph->compile();
     // Non-deferred shaders use the standard G-buffer location mapping.
     setGeometryDrawBufferLayout(false);
 
-    if (!simpleLayerDraws.empty()) {
+    markGeomGpuTimestamp(kGpuGeomSimpleLayerPhase, true);
+    if (!kDisableSLPass && !simpleLayerDraws.empty()) {
         auto tSL = GClock::now();
         auto slGBufferShader     = shaderManager->GetShader("simplelayer_gbuffer");
         auto slGBufferClipShader = shaderManager->GetShader("simplelayer_gbuffer_clip");
@@ -1156,6 +1337,12 @@ shadowGraph->compile();
             };
             // Use a thread-local temp vector to avoid repeated allocation
             static thread_local std::vector<SlEntry> slEntries;
+
+            // Skip vis loop entirely when camera is static and SL cache is still valid
+            const bool slFullSkip = slGBufCacheValid_ && slViewProjCacheValid_ &&
+                (viewProj == slCachedViewProj_) && !slGBufGroups_.empty();
+
+            if (!slFullSkip) {
             slEntries.clear();
 
             auto tSLVis = GClock::now();
@@ -1210,8 +1397,20 @@ shadowGraph->compile();
             }
             frameProfile_.geomSLVis = gMs(tSLVis);
             frameProfile_.geomSLVisibleCount = static_cast<int>(slEntries.size());
+            } else {
+                frameProfile_.geomSLVis = 0.0f;
+                frameProfile_.geomSLVisibleCount = static_cast<int>(slEntries.size());
+            }
 
-            if (!slEntries.empty()) {
+            if (!slEntries.empty() || slFullSkip) {
+                if (slFullSkip) {
+                    // Camera static: skip vis hash + cache rebuild, rebind cached SSBOs
+                    frameProfile_.slCacheHit = 1;
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, slGBufWorldMatSSBO_);
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, slGBufInvWorldSSBO_);
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, slGBufTilingSSBO_);
+                    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slGBufIndirectBuffer_);
+                } else {
                 // Compute visibility hash (draw identity + transform state)
                 uint64_t visHash = slEntries.size();
                 for (const auto& e : slEntries)
@@ -1380,13 +1579,18 @@ shadowGraph->compile();
 
                 slGBufVisHash_ = visHash;
                 slGBufCacheValid_ = true;
+                slCachedViewProj_ = viewProj;
+                slViewProjCacheValid_ = true;
                 } else {
                     // Cache hit: re-bind existing SSBOs (skip sort+group+upload)
                     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, slGBufWorldMatSSBO_);
                     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, slGBufInvWorldSSBO_);
                     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, slGBufTilingSSBO_);
                     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slGBufIndirectBuffer_);
+                    slCachedViewProj_ = viewProj;
+                    slViewProjCacheValid_ = true;
                 }
+                } // end !slFullSkip
 
                 // Always report group count (valid on both cache hit and miss)
                 frameProfile_.geomSLGroupCount = static_cast<int>(slGBufGroups_.size());
@@ -1486,9 +1690,11 @@ shadowGraph->compile();
         }
         frameProfile_.geomSL = gMs(tSL);
     }
+    markGeomGpuTimestamp(kGpuGeomSimpleLayerPhase, false);
 
+        markGeomGpuTimestamp(kGpuGeomEnvironmentPhase, true);
         auto tEnv = GClock::now();
-        if (!environmentDraws.empty()) {
+        if (!kDisableEnvPass && !environmentDraws.empty()) {
             if (device_) {
                 device_->ApplyRenderState((disableFaceCulling ? cachedEnvStateNoCull_ : cachedEnvState_).get());
             } else {
@@ -1667,6 +1873,7 @@ shadowGraph->compile();
             checkGLError("After environment (geometry pass)");
         }
         frameProfile_.geomEnv = gMs(tEnv);
+        markGeomGpuTimestamp(kGpuGeomEnvironmentPhase, false);
 
     setGeometryDrawBufferLayout(false);
     if (optRenderLOG) std::cout << "[GEOMETRY] Complete\n";
@@ -1783,7 +1990,7 @@ geometryGraph->compile();
         }
     };
     decalPass.shouldSkip = [this, hasDeferredGeometryInputs]() {
-        return decalDraws.empty() || !hasDeferredGeometryInputs();
+        return kDisableDecalPass || decalDraws.empty() || !hasDeferredGeometryInputs();
     };
     decalPass.execute = [this]() {
         if (kDisableDecalPass) {
@@ -1951,13 +2158,12 @@ geometryGraph->compile();
         }
         if (optRenderLOG) std::cout << "[LIGHTING] Begin lighting pass\n";
         clearError("Lighting::PassStart");
-        GLuint gPosVS = GetFrameGraphTexture(geometryGraph, "gPositionVS");
         GLuint gNormalDepth = deferredShaderUsesPackedGBuffer_
             ? GetFrameGraphTexture(geometryGraph, "gNormalDepthCompat")
             : GetFrameGraphTexture(geometryGraph, "gNormalDepthPacked");
         GLuint gPosWS = GetFrameGraphTexture(geometryGraph, "gPositionWS");
-        if (optRenderLOG) std::cout << "[LIGHTING] G-buffer textures: PosVS=" << gPosVS << " Normal=" << gNormalDepth << " PosWS=" << gPosWS << "\n";
-        if (gPosVS == 0 || gNormalDepth == 0 || gPosWS == 0) {
+        if (optRenderLOG) std::cout << "[LIGHTING] G-buffer textures: Normal=" << gNormalDepth << " PosWS=" << gPosWS << "\n";
+        if (gNormalDepth == 0 || gPosWS == 0) {
             return;
         }
 
@@ -1970,7 +2176,7 @@ geometryGraph->compile();
         shader->PrecacheUniform(U_LIGHT_DIR_WS, "LightDirWS");
         shader->PrecacheUniform(U_LIGHT_COLOR, "LightColor");
         shader->PrecacheUniform(U_AMBIENT_COLOR, "AmbientColor");
-        shader->PrecacheUniform(U_GPOSITION, "gPosition");
+        shader->PrecacheUniform(U_VIEW, "view");
         shader->PrecacheUniform(U_GNORMAL_DEPTH_PACKED, "gNormalDepthPacked");
         shader->PrecacheUniform(U_GPOSITION_WS, "gPositionWS");
         shader->PrecacheUniform(U_SHADOW_MAP_CASCADE0, "shadowMapCascade0");
@@ -1980,6 +2186,7 @@ geometryGraph->compile();
         shader->PrecacheUniform(U_NUM_CASCADES, "numCascades");
         shader->Use();
         shader->SetVec3(U_CAMERA_POS, camera_.getPosition());
+        shader->SetMat4(U_VIEW, camera_.getViewMatrix());
         constexpr UniformID kShadowCascadeUniforms[] = {
             U_SHADOW_MAP_CASCADE0,
             U_SHADOW_MAP_CASCADE1,
@@ -1998,18 +2205,16 @@ geometryGraph->compile();
                 shader->SetFloat(("cascadeSplits[" + std::to_string(i) + "]").c_str(), cascadeSplits[i]);
             }
         }
-        bindTexture(0, gPosVS);
-        bindTexture(1, gNormalDepth);
-        bindTexture(2, gPosWS);
+        bindTexture(0, gNormalDepth);
+        bindTexture(1, gPosWS);
 
         static GLuint cachedLightingProgram = 0;
         const GLuint lightingProgram = shader->GetNativeHandle()
             ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle()) : 0;
         if (cachedLightingProgram != lightingProgram) {
             cachedLightingProgram = lightingProgram;
-            shader->SetInt(U_GPOSITION, 0);
-            shader->SetInt(U_GNORMAL_DEPTH_PACKED, 1);
-            shader->SetInt(U_GPOSITION_WS, 2);
+            shader->SetInt(U_GNORMAL_DEPTH_PACKED, 0);
+            shader->SetInt(U_GPOSITION_WS, 1);
             shader->SetInt(U_NUM_CASCADES, shadowCascadeCount);
             shader->SetInt("DisableShadows", shadowsEnabled ? 0 : 1);
             shader->SetInt("DisableViewDependentSpecular", kDisableViewDependentSpecular ? 1 : 0);
@@ -2151,7 +2356,7 @@ compositionPass.execute = [this]() {
     const bool forceCompatibilityUnlit = deferredShaderUsesPackedGBuffer_ && !deferredPackedCompatReady_;
     const bool disableLightingForPass = kDisableLighting || forceCompatibilityUnlit;
     GLuint gAlbedo = GetFrameGraphTexture(geometryGraph, "gAlbedoSpec");
-    GLuint gPosVS = GetFrameGraphTexture(geometryGraph, "gPositionVS");
+    GLuint gDepthTex = GetFrameGraphTexture(geometryGraph, "gDepth");
     GLuint gNormalDepth = deferredShaderUsesPackedGBuffer_
         ? GetFrameGraphTexture(geometryGraph, "gNormalDepthCompat")
         : GetFrameGraphTexture(geometryGraph, "gNormalDepthPacked");
@@ -2159,7 +2364,7 @@ compositionPass.execute = [this]() {
     GLuint lightBuf = GetFrameGraphTexture(lightingGraph, "lightBuffer");
     GLuint sceneCol = GetFrameGraphTexture(lightingGraph, "sceneColor");
     if (optRenderLOG) std::cout << "[COMPOSITION] Writing to sceneColor=" << sceneCol << "\n";
-    if (optRenderLOG) std::cout << "[COMPOSITION] Reading: Albedo=" << gAlbedo << " Light=" << lightBuf << " PosVS=" << gPosVS << "\n";
+    if (optRenderLOG) std::cout << "[COMPOSITION] Reading: Albedo=" << gAlbedo << " Light=" << lightBuf << " Depth=" << gDepthTex << "\n";
 
     if (kDisableCompositionPass) {
         if (optRenderLOG) std::cout << "[COMPOSITION] Disabled by kDisableCompositionPass (blit gAlbedoSpec)\n";
@@ -2177,7 +2382,7 @@ compositionPass.execute = [this]() {
         return;
     }
 
-    if (forceCompatibilityUnlit || gNormalDepth == 0 || gPosVS == 0 || lightBuf == 0) {
+    if (forceCompatibilityUnlit || gNormalDepth == 0 || gDepthTex == 0 || lightBuf == 0) {
         auto blit = shaderManager->GetShader("blit");
         if (!blit) {
             std::cerr << "[COMPOSITION] ERROR: blit shader not found for packed compatibility\n";
@@ -2201,6 +2406,7 @@ compositionPass.execute = [this]() {
     shader->PrecacheUniform(U_LIGHT_BUFFER_TEX, "lightBufferTex");
     shader->PrecacheUniform(U_GEMISSIVE_TEX, "gEmissiveTex");
     shader->PrecacheUniform(U_GNORMAL_DEPTH_PACKED, "gNormalDepthPacked");
+    shader->PrecacheUniform(U_INV_PROJECTION, "invProjection");
     shader->Use();
 
     bindTexture(0, gAlbedo);
@@ -2211,6 +2417,9 @@ compositionPass.execute = [this]() {
     shader->SetInt(U_GEMISSIVE_TEX, 2);
     bindTexture(3, gNormalDepth);
     shader->SetInt(U_GNORMAL_DEPTH_PACKED, 3);
+    bindTexture(4, gDepthTex);
+    shader->SetInt("gDepthTex", 4);
+    shader->SetMat4(U_INV_PROJECTION, glm::inverse(camera_.getProjectionMatrix()));
     shader->SetInt("DisableLighting", disableLightingForPass ? 1 : 0);
     shader->SetInt("DisableFog", kDisableFog ? 1 : 0);
     shader->SetVec4("fogColor", glm::vec4(0.5f, 0.5f, 0.5f, 0.0f));
@@ -2254,7 +2463,7 @@ compositionPass.execute = [this]() {
 
         GLuint sceneColorTex = GetFrameGraphTexture(lightingGraph, "sceneColor");
         GLuint sceneDepthTex = GetFrameGraphTexture(geometryGraph, "gDepth");
-        GLuint gPosVS = GetFrameGraphTexture(geometryGraph, "gPositionVS");
+        GLuint gPosWS = GetFrameGraphTexture(geometryGraph, "gPositionWS");
         GLuint lightBuf = GetFrameGraphTexture(lightingGraph, "lightBuffer");
         if (optRenderLOG) std::cout << "[FORWARD] Scene textures: Color=" << sceneColorTex << " Depth=" << sceneDepthTex << "\n";
 
@@ -2624,6 +2833,7 @@ compositionPass.execute = [this]() {
         }
 
         // ==================== ENVIRONMENT ALPHA PASS ====================
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][0], GL_TIMESTAMP);
         if (!kDisableEnvironmentAlphaPass && !environmentAlphaDraws.empty()) {
             bool useBindlessEnvAlpha = false;
             auto envShader = shaderManager->GetShader("environmentAlpha");
@@ -2864,7 +3074,9 @@ compositionPass.execute = [this]() {
                 checkGLError("After environment alpha");
             }
         }
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][1], GL_TIMESTAMP);
 
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][2], GL_TIMESTAMP);
         if (!kDisableRefractionPass && !refractionDraws.empty()) {
             bool useBindlessRefraction = false;
             auto refractionShader = shaderManager->GetShader("refraction");
@@ -3000,8 +3212,10 @@ compositionPass.execute = [this]() {
                 checkGLError("After refraction");
             }
         }
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][3], GL_TIMESTAMP);
 
         // ==================== WATER PASS ====================
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][4], GL_TIMESTAMP);
         if (!kDisableWaterPass && !waterDraws.empty()) {
             bool useBindlessWater = false;
             auto waterShader = shaderManager->GetShader("water");
@@ -3180,8 +3394,10 @@ compositionPass.execute = [this]() {
                 checkGLError("After water");
             }
         }
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][5], GL_TIMESTAMP);
 
         // ==================== POST-ALPHA UNLIT PASS ====================
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][6], GL_TIMESTAMP);
         if (!kDisablePostAlphaUnlitPass && !postAlphaUnlitDraws.empty()) {
             auto postShader = shaderManager->GetShader("postalphaunlit");
             if (!postShader) {
@@ -3433,8 +3649,10 @@ compositionPass.execute = [this]() {
                 checkGLError("After postalphaunlit");
             }
         }
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][7], GL_TIMESTAMP);
 
         // ==================== PARTICLE PASS ====================
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][8], GL_TIMESTAMP);
         glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDepthMask(GL_FALSE);
@@ -3507,7 +3725,7 @@ compositionPass.execute = [this]() {
                             }
 
                             inst->Render(viewProj, viewMatrix, invView, eyePos,
-                                         fogDistances, fogColor, gPosVS, invViewport,
+                                         fogDistances, fogColor, gPosWS, invViewport,
                                          numAnimPhases, animFramesPerSecond, particleTime, colorMode,
                                          pentry.node->GetIntensity0(), pentry.node->GetEmissiveIntensity());
                             renderedCount++;
@@ -3548,6 +3766,7 @@ compositionPass.execute = [this]() {
         glCullFace(GL_BACK);
         if (optRenderLOG) NC::LOGGING::Log("[FORWARD] Env: ", environmentDraws.size(), " EnvAlpha: ", environmentAlphaDraws.size(),
                          " Refr: ", refractionDraws.size(), " Water: ", waterDraws.size(), " Part: ", scene_.particleNodes.size(), " PostA: ", postAlphaUnlitDraws.size());
+        if (gpuQueriesInit_) glQueryCounter(gpuFwdTsDB_[gpuQueryBufWrite_][9], GL_TIMESTAMP);
         frameProfile_.fwdFlushCount = forwardFlushCount;
         if (gEnableGLErrorChecking) {
             GLenum err = glGetError();
@@ -3613,6 +3832,21 @@ void DeferredRenderer::renderSingleFrame()
 
         if (deltaTime < 0.0 || !std::isfinite(deltaTime)) deltaTime = 1.0 / 60.0;
         if (deltaTime > 0.1) deltaTime = 0.1;
+        if (ProcessPendingDroppedMapLoad(currentFrame)) {
+            return;
+        }
+
+        // ── Frame profiler: starts before ALL per-frame work ──────────────
+        frameProfile_ = FrameProfile{};
+        using ProfileClock = std::chrono::high_resolution_clock;
+        const auto profFrameStart = ProfileClock::now();
+        auto profLast = profFrameStart;
+        auto profElapsed = [&]() -> double {
+            auto now = ProfileClock::now();
+            double ms = std::chrono::duration<double, std::milli>(now - profLast).count();
+            profLast = now;
+            return ms;
+        };
 
         bool uiWantsKeyboard = false;
         if (ImGui::GetCurrentContext()) {
@@ -3636,6 +3870,41 @@ void DeferredRenderer::renderSingleFrame()
             if (glfwGetKey(win, GLFW_KEY_A) == GLFW_PRESS) pos -= hRight * speed;
             camera_.setPosition(pos);
         }
+        frameProfile_.inputPoll = profElapsed();
+
+        // ── Mode switch key (F1): toggle Work <-> Play ──────────────────
+        {
+            GLFWwindow* win = (GLFWwindow*)window_->GetNativeHandle();
+            static bool f1WasPressed = false;
+            const bool f1Pressed = glfwGetKey(win, GLFW_KEY_F1) == GLFW_PRESS;
+            if (f1Pressed && !f1WasPressed) {
+                SetRenderMode(renderMode_ == RenderMode::Work ? RenderMode::Play : RenderMode::Work);
+            }
+            f1WasPressed = f1Pressed;
+        }
+
+        // ── Dirty-frame detection ───────────────────────────────────────
+        {
+            const glm::mat4 curView = camera_.getViewMatrix();
+            const glm::mat4 curProj = camera_.getProjectionMatrix();
+            if (curView != dirtyLastViewMatrix_ || curProj != dirtyLastProjectionMatrix_) {
+                dirtyFlag_ = true;
+                dirtyLastViewMatrix_ = curView;
+                dirtyLastProjectionMatrix_ = curProj;
+            }
+            if (width != dirtyLastWidth_ || height != dirtyLastHeight_) {
+                dirtyFlag_ = true;
+                dirtyLastWidth_ = width;
+                dirtyLastHeight_ = height;
+            }
+            if (selectedIndex != dirtyLastSelectedIndex_) {
+                dirtyFlag_ = true;
+                dirtyLastSelectedIndex_ = selectedIndex;
+            }
+        }
+
+        // Populate mode in profiler
+        frameProfile_.renderMode = static_cast<int>(renderMode_);
 
         if (viewportDisabled_) {
             if (!NoPresentWhenViewportDisabled()) {
@@ -3657,41 +3926,29 @@ void DeferredRenderer::renderSingleFrame()
             return;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Nebula-parity frame orchestration (deterministic lifecycle order):
-        //   1. TickLifecycle       — streaming, pending→valid promotions
-        //   2. ApplyQueuedUpdates  — transform propagation (deferred replays)
-        //   3. MaterializeValid    — PrepareDrawLists populates renderer buckets
-        //   4. Rebuild             — MegaBuffer, mega offsets, batch systems
-        //   5. Batch/Flush         — render passes (shadow → geometry → …)
-        // ═══════════════════════════════════════════════════════════════════
+        if (shaderManager) {
+            shaderManager->ProcessPendingReloads();
+        }
+        frameProfile_.shaderReload = profElapsed();
 
-        // ── Frame profiler (Patch #5) ──
-        frameProfile_ = FrameProfile{};
-        using ProfileClock = std::chrono::high_resolution_clock;
-        const auto profFrameStart = ProfileClock::now();
-        auto profLast = profFrameStart;
-
-        // ── Frame fence sync: wait for frame N-2 to complete on GPU ──
-        {
+        // Frame fence wait: bounded wait to avoid long CPU stalls when the GPU spikes.
+        // NDEVC_FRAME_FENCE_WAIT_NS controls max wait per frame (default 1ms).
+        // Set NDEVC_DISABLE_FRAME_FENCE_WAIT=1 to disable.
+        if (FrameFenceWaitEnabled()) {
             const int waitIdx = (frameFenceIdx_ + 1) % (kMaxFramesInFlight + 1);
             if (frameFences_[waitIdx]) {
                 auto tFence = ProfileClock::now();
-                glClientWaitSync(frameFences_[waitIdx], GL_SYNC_FLUSH_COMMANDS_BIT,
-                                 500000000ull); // 500ms timeout
-                glDeleteSync(frameFences_[waitIdx]);
-                frameFences_[waitIdx] = nullptr;
+                const uint64_t waitBudgetNs = FrameFenceWaitBudgetNs();
+                const GLenum waitResult = glClientWaitSync(frameFences_[waitIdx], 0, waitBudgetNs);
+                if (waitResult == GL_ALREADY_SIGNALED || waitResult == GL_CONDITION_SATISFIED || waitResult == GL_WAIT_FAILED) {
+                    glDeleteSync(frameFences_[waitIdx]);
+                    frameFences_[waitIdx] = nullptr;
+                }
                 frameProfile_.fenceWait = std::chrono::duration<double, std::milli>(
                     ProfileClock::now() - tFence).count();
             }
         }
-        profLast = ProfileClock::now(); // reset after fence wait
-        auto profElapsed = [&]() -> double {
-            auto now = ProfileClock::now();
-            double ms = std::chrono::duration<double, std::milli>(now - profLast).count();
-            profLast = now;
-            return ms;
-        };
+        profLast = ProfileClock::now(); // reset after fence — sceneTick starts clean
 
         // Phase 1: TickLifecycle
         scene_.Tick(deltaTime, camera_);
@@ -3700,12 +3957,46 @@ void DeferredRenderer::renderSingleFrame()
         // Phase 2: ApplyQueuedUpdates (transform propagation is inside Tick)
 
         // Phase 3: MaterializeValid — draw lists populated
+        // Check for scene mutation BEFORE PrepareDrawLists so dirty-skip can fire early.
         const bool drawListsWereDirty = scene_.IsDrawListsDirty();
+        if (drawListsWereDirty) dirtyFlag_ = true;
+
+        // ── Dirty-frame skip: skip expensive draw prep and GPU passes when clean ──
+        dirtyFrameSkippedLast_ = false;
+        if (activePolicy_.dirtyRenderingEnabled && !dirtyFlag_) {
+            dirtyFrameSkippedLast_ = true;
+            frameProfile_.dirtyFrameSkipped = 1;
+            RenderImGui();
+            window_->SwapBuffers();
+            lastFrameDrawCalls_ = 0;
+            frameProfile_.frameTotal = std::chrono::duration<double, std::milli>(
+                ProfileClock::now() - profFrameStart).count();
+            rsFrame_.Push(static_cast<float>(frameProfile_.frameTotal));
+            rsCpu_.Push(0.0f);
+            rsSwap_.Push(static_cast<float>(frameProfile_.frameTotal));
+            ++profileFrameCounter_;
+            return;
+        }
+        dirtyFlag_ = false;
+        frameProfile_.dirtyFrameSkipped = 0;
+
         scene_.PrepareDrawLists(camera_,
             solidDraws, alphaTestDraws, decalDraws, particleDraws,
             environmentDraws, environmentAlphaDraws, simpleLayerDraws,
             refractionDraws, postAlphaUnlitDraws, waterDraws, animatedDraws);
         frameProfile_.prepareDraws = profElapsed();
+
+        // Capture draw list sizes immediately — valid for entire frame
+        frameProfile_.solidCount      = static_cast<int>(solidDraws.size());
+        frameProfile_.alphaCount      = static_cast<int>(alphaTestDraws.size());
+        frameProfile_.slCount         = static_cast<int>(simpleLayerDraws.size());
+        frameProfile_.envCount        = static_cast<int>(environmentDraws.size());
+        frameProfile_.envAlphaCount   = static_cast<int>(environmentAlphaDraws.size());
+        frameProfile_.decalCount      = static_cast<int>(decalDraws.size());
+        frameProfile_.waterCount      = static_cast<int>(waterDraws.size());
+        frameProfile_.refractionCount = static_cast<int>(refractionDraws.size());
+        frameProfile_.postAlphaCount  = static_cast<int>(postAlphaUnlitDraws.size());
+        frameProfile_.particleCount   = static_cast<int>(scene_.particleNodes.size());
 
         // Phase 4: Rebuild (only when draw lists changed)
         if (drawListsWereDirty) {
@@ -3736,17 +4027,22 @@ void DeferredRenderer::renderSingleFrame()
             BuildVisibilityGrids();
             solidBatchSystem_.reset(true);
             alphaTestBatchSystem_.reset(true);
+            solidBatchSystem_.InvalidateCullCache();
+            alphaTestBatchSystem_.InvalidateCullCache();
             environmentBatchSystem_.reset(true);
             environmentAlphaBatchSystem_.reset(true);
             decalBatchSystem_.reset(true);
             slGBufCacheValid_ = false;
+            slViewProjCacheValid_ = false;
             shadowCastersDirty_ = true;
             solidShadowGeomGroups_.clear();
             materialSSBODirty_ = true;
         }
 
         if (materialSSBODirty_) {
+            const auto tSSBO = ProfileClock::now();
             buildMaterialSSBO();
+            frameProfile_.materialSSBO = std::chrono::duration<double, std::milli>(ProfileClock::now() - tSSBO).count();
         }
 
         if (solidShaderVarAnimatedIndicesDirty_) {
@@ -3759,7 +4055,7 @@ void DeferredRenderer::renderSingleFrame()
         }
         frameProfile_.rebuild = profElapsed();
 
-        // ── [PARITY][FRAME] diagnostics (throttled) ──
+        // ── [PARITY][FRAME] diagnostics (throttled) — measured inline, outside all buckets ──
         {
             const int parityFrame = scene_.GetParityCounters().submittedDrawCommands;
             const auto& re = scene_.GetRuntimeEntities();
@@ -3791,6 +4087,12 @@ void DeferredRenderer::renderSingleFrame()
                     " alphaCmds=", alphaMetrics.commandCount);
                 parityFrameLogCounter = 0;
             }
+        }
+        profElapsed(); // reset profiler timer after parity to exclude its cost from animationTick
+
+        // Scene mutation is a dirty signal (for next frame)
+        if (drawListsWereDirty) {
+            dirtyFlag_ = true;
         }
 
         // Phase 5: Batch/Flush — frustum, animation, render passes
@@ -3831,16 +4133,20 @@ void DeferredRenderer::renderSingleFrame()
                 }
             };
 
-            applyShaderVarAnimationsToDraws(solidDraws);
-            applyShaderVarAnimationsToDraws(alphaTestDraws);
-            applyShaderVarAnimationsToDraws(simpleLayerDraws);
-            applyShaderVarAnimationsToDraws(environmentDraws);
-            applyShaderVarAnimationsToDraws(environmentAlphaDraws);
-            applyShaderVarAnimationsToDraws(decalDraws);
-            applyShaderVarAnimationsToDraws(waterDraws);
-            applyShaderVarAnimationsToDraws(refractionDraws);
-            applyShaderVarAnimationsToDraws(postAlphaUnlitDraws);
+            if (!solidShaderVarAnimatedIndices.empty()) {
+                applyShaderVarAnimationsToDraws(solidDraws);
+                applyShaderVarAnimationsToDraws(alphaTestDraws);
+                applyShaderVarAnimationsToDraws(simpleLayerDraws);
+                applyShaderVarAnimationsToDraws(environmentDraws);
+                applyShaderVarAnimationsToDraws(environmentAlphaDraws);
+                applyShaderVarAnimationsToDraws(decalDraws);
+                applyShaderVarAnimationsToDraws(waterDraws);
+                applyShaderVarAnimationsToDraws(refractionDraws);
+                applyShaderVarAnimationsToDraws(postAlphaUnlitDraws);
+            }
         }
+        frameProfile_.animatedCount  = static_cast<int>(animatedDraws.size());
+        frameProfile_.animationTick  = profElapsed(); // covers: frustum + animation
 
         if (width <= 0 || height <= 0) {
             return;
@@ -3874,37 +4180,56 @@ void DeferredRenderer::renderSingleFrame()
             }
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         }
+        frameProfile_.prePassSetup = profElapsed(); // GL baseline state reset
+
+        // Invalidate the device render state cache — raw GL calls above bypass it.
+        if (device_) device_->InvalidateRenderStateCache();
 
         if (!useLegacyDeferredInit_) {
             if (hasAnyDraws || !scene_.particleNodes.empty()) {
                 // Lazy-init GPU timer queries
                 if (!gpuQueriesInit_) {
-                    glGenQueries(kGpuQueryCount, gpuQueries_);
+                    glGenQueries(kGpuQueryCount, gpuQueriesDB_[0]);
+                    glGenQueries(kGpuQueryCount, gpuQueriesDB_[1]);
+                    glGenQueries(kGpuGeomTimestampQueryCount, gpuGeomTsDB_[0]);
+                    glGenQueries(kGpuGeomTimestampQueryCount, gpuGeomTsDB_[1]);
+                    glGenQueries(kGpuFwdTimestampQueryCount, gpuFwdTsDB_[0]);
+                    glGenQueries(kGpuFwdTimestampQueryCount, gpuFwdTsDB_[1]);
                     gpuQueriesInit_ = true;
                 }
 
-                profElapsed(); // reset timer
-                glBeginQuery(GL_TIME_ELAPSED, gpuQueries_[0]);
+
+                glBeginQuery(GL_TIME_ELAPSED, gpuQueriesDB_[gpuQueryBufWrite_][0]);
                 shadowGraph->execute();
                 glEndQuery(GL_TIME_ELAPSED);
                 frameProfile_.shadowPass = profElapsed();
 
-                glBeginQuery(GL_TIME_ELAPSED, gpuQueries_[1]);
+                glBeginQuery(GL_TIME_ELAPSED, gpuQueriesDB_[gpuQueryBufWrite_][1]);
                 geometryGraph->execute();
                 glEndQuery(GL_TIME_ELAPSED);
                 frameProfile_.geometryPass = profElapsed();
+                {
+                    const auto& sm = solidBatchSystem_.lastFlushMetrics();
+                    const auto& am = alphaTestBatchSystem_.lastFlushMetrics();
+                    const auto& em = environmentBatchSystem_.lastFlushMetrics();
+                    const auto& dm = decalBatchSystem_.lastFlushMetrics();
+                    frameProfile_.solidBatchCount = sm.batchCount;
+                    frameProfile_.alphaBatchCount = am.batchCount;
+                    frameProfile_.envBatchCount   = em.batchCount;
+                    frameProfile_.decalBatchCount = dm.batchCount;
+                }
 
-                glBeginQuery(GL_TIME_ELAPSED, gpuQueries_[2]);
+                glBeginQuery(GL_TIME_ELAPSED, gpuQueriesDB_[gpuQueryBufWrite_][2]);
                 decalGraph->execute();
                 glEndQuery(GL_TIME_ELAPSED);
                 frameProfile_.decalPass = profElapsed();
 
-                glBeginQuery(GL_TIME_ELAPSED, gpuQueries_[3]);
+                glBeginQuery(GL_TIME_ELAPSED, gpuQueriesDB_[gpuQueryBufWrite_][3]);
                 lightingGraph->execute();
                 glEndQuery(GL_TIME_ELAPSED);
                 frameProfile_.lightingPass = profElapsed();
 
-                glBeginQuery(GL_TIME_ELAPSED, gpuQueries_[4]);
+                glBeginQuery(GL_TIME_ELAPSED, gpuQueriesDB_[gpuQueryBufWrite_][4]);
                 particleGraph->execute();
                 glEndQuery(GL_TIME_ELAPSED);
                 frameProfile_.forwardPass = profElapsed();
@@ -3916,32 +4241,36 @@ void DeferredRenderer::renderSingleFrame()
                     if (cachedBlitState_) device_->ApplyRenderState(cachedBlitState_.get());
                 }
 
-                if (editorModeEnabled_) {
-                    glDisable(GL_DEPTH_TEST);
-                    glDepthMask(GL_FALSE);
-                    glDisable(GL_BLEND);
-                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-                    glDepthMask(GL_TRUE);
-                } else {
-                    auto blitShader = shaderManager->GetShader("blit");
-                    if (blitShader) {
-                        blitShader->Use();
-                        blitShader->SetInt("tex", 0);
-                        GLuint finalTex = GetFrameGraphTexture(lightingGraph, "sceneColor");
-                        if (optRenderLOG) std::cout << "[MAIN] Final blit - texture=" << finalTex << " screenVAO=" << screenVAO << "\n";
-                        bindTexture(0, finalTex);
-                        glBindVertexArray(screenVAO);
-                        glDrawArrays(GL_TRIANGLES, 0, 3);
-                        glBindVertexArray(0);
-                        if (gEnableGLErrorChecking) {
-                            GLenum err = glGetError();
-                            if (err != GL_NO_ERROR) std::cerr << "[MAIN] Blit error: 0x" << std::hex << err << std::dec << "\n";
-                        }
+                {
+                    const auto tBlit = ProfileClock::now();
+                    if (editorModeEnabled_) {
+                        glDisable(GL_DEPTH_TEST);
+                        glDepthMask(GL_FALSE);
+                        glDisable(GL_BLEND);
+                        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                        glDepthMask(GL_TRUE);
                     } else {
-                        std::cerr << "[MAIN] ERROR: Blit shader not found!\n";
+                        auto blitShader = shaderManager->GetShader("blit");
+                        if (blitShader) {
+                            blitShader->Use();
+                            blitShader->SetInt("tex", 0);
+                            GLuint finalTex = GetFrameGraphTexture(lightingGraph, "sceneColor");
+                            if (optRenderLOG) std::cout << "[MAIN] Final blit - texture=" << finalTex << " screenVAO=" << screenVAO << "\n";
+                            bindTexture(0, finalTex);
+                            glBindVertexArray(screenVAO);
+                            glDrawArrays(GL_TRIANGLES, 0, 3);
+                            glBindVertexArray(0);
+                            if (gEnableGLErrorChecking) {
+                                GLenum err = glGetError();
+                                if (err != GL_NO_ERROR) std::cerr << "[MAIN] Blit error: 0x" << std::hex << err << std::dec << "\n";
+                            }
+                        } else {
+                            std::cerr << "[MAIN] ERROR: Blit shader not found!\n";
+                        }
                     }
+                    frameProfile_.blitCompose = std::chrono::duration<double, std::milli>(ProfileClock::now() - tBlit).count();
                 }
             }
         }
@@ -4062,9 +4391,9 @@ void DeferredRenderer::renderSingleFrame()
             glm::mat4 viewProj = camera_.getProjectionMatrix() * camera_.getViewMatrix();
             const Camera::Frustum& frustum = frameFrustum_;
             UpdateVisibilityThisFrame(frustum);
-            alphaTestBatchSystem_.updateStaticVisibility(alphaTestDraws);
-            environmentBatchSystem_.updateStaticVisibility(environmentDraws);
-            environmentAlphaBatchSystem_.updateStaticVisibility(environmentAlphaDraws);
+            alphaTestBatchSystem_.updateStaticVisibility(alphaTestDraws, &frustum);
+            environmentBatchSystem_.updateStaticVisibility(environmentDraws, &frustum);
+            environmentAlphaBatchSystem_.updateStaticVisibility(environmentAlphaDraws, &frustum);
 
             shaderProgram->SetInt("DiffMap0", 0);
             shaderProgram->SetInt("SpecMap0", 1);
@@ -4109,6 +4438,7 @@ void DeferredRenderer::renderSingleFrame()
             glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
             checkGLError("After stencil setup");
 
+            if (!visResolveSkipped_) solidBatchSystem_.MarkStaticVisibilityDirty();
             solidBatchSystem_.cull(solidDraws, frustum);
             checkGLError("After bucket culling");
 
@@ -4270,12 +4600,11 @@ void DeferredRenderer::renderSingleFrame()
             shaderLight->SetFloat(("cascadeSplits[" + std::to_string(i) + "]").c_str(), cascadeSplits[i]);
         }
 
-        this->bindTexture(0, gPositionVS);
+        shaderLight->SetMat4("view", cachedViewMatrix);
+        this->bindTexture(0, gNormalDepthPacked);
         if (device_) { device_->BindSampler(nullptr, 0); } else { glBindSampler(0, 0); }
-        this->bindTexture(1, gNormalDepthPacked);
+        this->bindTexture(1, gPositionWS);
         if (device_) { device_->BindSampler(nullptr, 1); } else { glBindSampler(1, 0); }
-        this->bindTexture(2, gPositionWS);
-        if (device_) { device_->BindSampler(nullptr, 2); } else { glBindSampler(2, 0); }
 
         for (int i = 0; i < legacyCascadeCount; i++) {
             this->bindTexture(3 + i, shadowMapCascades[i]);
@@ -4286,9 +4615,8 @@ void DeferredRenderer::renderSingleFrame()
             }
         }
 
-        shaderLight->SetInt("gPosition", 0);
-        shaderLight->SetInt("gNormalDepthPacked", 1);
-        shaderLight->SetInt("gPositionWS", 2);
+        shaderLight->SetInt("gNormalDepthPacked", 0);
+        shaderLight->SetInt("gPositionWS", 1);
         shaderLight->SetInt("numCascades", legacyCascadeCount);
         shaderLight->SetInt("DisableShadows", kDisableShadows ? 1 : 0);
         shaderLight->SetInt("DisableViewDependentSpecular", kDisableViewDependentSpecular ? 1 : 0);
@@ -4389,18 +4717,19 @@ void DeferredRenderer::renderSingleFrame()
             if (device_) { device_->BindSampler(nullptr, 0); } else { glBindSampler(0, 0); }
             this->bindTexture(1, gAlbedoSpec);
             if (device_) { device_->BindSampler(nullptr, 1); } else { glBindSampler(1, 0); }
-            this->bindTexture(2, gPositionVS);
+            this->bindTexture(2, gEmissive);
             if (device_) { device_->BindSampler(nullptr, 2); } else { glBindSampler(2, 0); }
-            this->bindTexture(3, gEmissive);
+            this->bindTexture(3, gNormalDepthPacked);
             if (device_) { device_->BindSampler(nullptr, 3); } else { glBindSampler(3, 0); }
-            this->bindTexture(4, gNormalDepthPacked);
+            this->bindTexture(4, gDepth);
             if (device_) { device_->BindSampler(nullptr, 4); } else { glBindSampler(4, 0); }
 
             composition->SetInt("lightBufferTex", 0);
             composition->SetInt("gAlbedoSpec", 1);
-            composition->SetInt("gPositionVS", 2);
-            composition->SetInt("gEmissiveTex", 3);
-            composition->SetInt("gNormalDepthPacked", 4);
+            composition->SetInt("gEmissiveTex", 2);
+            composition->SetInt("gNormalDepthPacked", 3);
+            composition->SetInt("gDepthTex", 4);
+            composition->SetMat4("invProjection", glm::inverse(cachedProjectionMatrix));
             composition->SetInt("DisableLighting", kDisableLighting ? 1 : 0);
             composition->SetInt("DisableFog", kDisableFog ? 1 : 0);
 
@@ -4606,47 +4935,114 @@ void DeferredRenderer::renderSingleFrame()
         window_->SwapBuffers();
         frameProfile_.swapBuffers = profElapsed();
 
-        // ── Frame fence sync: mark this frame's GPU work for pacing ──
+        // ── Frame fence sync: mark this frame's GPU work for optional pacing ──
+        if (frameFences_[frameFenceIdx_]) {
+            glDeleteSync(frameFences_[frameFenceIdx_]);
+            frameFences_[frameFenceIdx_] = nullptr;
+        }
         frameFences_[frameFenceIdx_] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         frameFenceIdx_ = (frameFenceIdx_ + 1) % (kMaxFramesInFlight + 1);
 
         frameProfile_.frameTotal = std::chrono::duration<double, std::milli>(
             ProfileClock::now() - profFrameStart).count();
 
+        // Per-frame budget governor — runs every frame, uses cached gpuTotal + fresh cpuWork
+        UpdateBudgetGovernor();
+
         ++profileFrameCounter_;
         if (profileFrameCounter_ >= kProfileLogInterval) {
             profileFrameCounter_ = 0;
 
-            // Read GPU timer query results (blocks until available — once per 300 frames)
+            // Double-buffered GPU query reads — read from the PREVIOUS interval's
+            // buffer (1 - gpuQueryBufWrite_) which is definitely GPU-complete.
+            // Toggle write buffer so next interval writes to the other side.
             if (gpuQueriesInit_) {
-                for (int qi = 0; qi < kGpuQueryCount; qi++) {
-                    GLuint64 ns = 0;
-                    glGetQueryObjectui64v(gpuQueries_[qi], GL_QUERY_RESULT, &ns);
-                    double ms = static_cast<double>(ns) / 1.0e6;
-                    switch (qi) {
-                        case 0: frameProfile_.gpuShadow   = ms; break;
-                        case 1: frameProfile_.gpuGeometry  = ms; break;
-                        case 2: frameProfile_.gpuDecal     = ms; break;
-                        case 3: frameProfile_.gpuLighting  = ms; break;
-                        case 4: frameProfile_.gpuForward   = ms; break;
+                if (gpuQueryBufsReady_) {
+                    const int readBuf = 1 - gpuQueryBufWrite_;
+
+                    for (int qi = 0; qi < kGpuQueryCount; qi++) {
+                        GLuint64 ns = 0;
+                        glGetQueryObjectui64v(gpuQueriesDB_[readBuf][qi], GL_QUERY_RESULT, &ns);
+                        const double ms = static_cast<double>(ns) / 1.0e6;
+                        switch (qi) {
+                            case 0: frameProfile_.gpuShadow   = ms; break;
+                            case 1: frameProfile_.gpuGeometry = ms; break;
+                            case 2: frameProfile_.gpuDecal    = ms; break;
+                            case 3: frameProfile_.gpuLighting = ms; break;
+                            case 4: frameProfile_.gpuForward  = ms; break;
+                        }
+                    }
+
+                    for (int phase = 0; phase < kGpuGeomPhaseCount; ++phase) {
+                        const int beginIdx = phase * 2;
+                        const int endIdx   = beginIdx + 1;
+                        GLuint64 tsBegin = 0, tsEnd = 0;
+                        glGetQueryObjectui64v(gpuGeomTsDB_[readBuf][beginIdx], GL_QUERY_RESULT, &tsBegin);
+                        glGetQueryObjectui64v(gpuGeomTsDB_[readBuf][endIdx],   GL_QUERY_RESULT, &tsEnd);
+                        const double phaseMs = (tsEnd >= tsBegin)
+                            ? static_cast<double>(tsEnd - tsBegin) / 1.0e6 : 0.0;
+                        switch (phase) {
+                            case 0: frameProfile_.gpuGeomSolid = phaseMs; break;
+                            case 1: frameProfile_.gpuGeomAlpha = phaseMs; break;
+                            case 2: frameProfile_.gpuGeomSL    = phaseMs; break;
+                            case 3: frameProfile_.gpuGeomEnv   = phaseMs; break;
+                        }
+                    }
+
+                    double* fwdTargets[5] = {
+                        &frameProfile_.gpuEnvAlpha, &frameProfile_.gpuRefraction,
+                        &frameProfile_.gpuWater, &frameProfile_.gpuPostAlpha, &frameProfile_.gpuParticles
+                    };
+                    for (int phase = 0; phase < kGpuFwdPhaseCount; ++phase) {
+                        const int beginIdx = phase * 2;
+                        const int endIdx   = beginIdx + 1;
+                        GLuint64 tsBegin = 0, tsEnd = 0;
+                        glGetQueryObjectui64v(gpuFwdTsDB_[readBuf][beginIdx], GL_QUERY_RESULT, &tsBegin);
+                        glGetQueryObjectui64v(gpuFwdTsDB_[readBuf][endIdx],   GL_QUERY_RESULT, &tsEnd);
+                        *fwdTargets[phase] = (tsEnd >= tsBegin)
+                            ? static_cast<double>(tsEnd - tsBegin) / 1.0e6 : 0.0;
                     }
                 }
+                // Swap write buffer; mark both slots valid after the first swap
+                gpuQueryBufWrite_  = 1 - gpuQueryBufWrite_;
+                gpuQueryBufsReady_ = true;
             }
 
-            char profBuf[512];
+            // Compute derived fields
+            frameProfile_.fps     = frameProfile_.frameTotal > 0.0 ? 1000.0 / frameProfile_.frameTotal : 0.0;
+            frameProfile_.cpuWork = frameProfile_.frameTotal - frameProfile_.swapBuffers;
+            frameProfile_.gpuTotal = frameProfile_.gpuShadow + frameProfile_.gpuGeometry
+                + frameProfile_.gpuDecal + frameProfile_.gpuLighting + frameProfile_.gpuForward;
+
+            // Push into rolling stats for percentile logging
+            rsFrame_.Push(static_cast<float>(frameProfile_.frameTotal));
+            rsCpu_.Push(static_cast<float>(frameProfile_.cpuWork));
+            rsSwap_.Push(static_cast<float>(frameProfile_.swapBuffers));
+
+
+            char profBuf[768];
             std::snprintf(profBuf, sizeof(profBuf),
-                "[PROFILE] frame=%.2fms fence=%.2f tick=%.2f prep=%.2f rebuild=%.2f "
-                "shadow=%.2f geom=%.2f decal=%.2f light=%.2f fwd=%.2f "
-                "clear=%.2f imgui=%.2f swap=%.2f draws=%d",
-                frameProfile_.frameTotal, frameProfile_.fenceWait,
-                frameProfile_.sceneTick,
-                frameProfile_.prepareDraws, frameProfile_.rebuild,
-                frameProfile_.shadowPass,
-                frameProfile_.geometryPass,
+                "[PROFILE] fps=%.1f frame=%.2fms cpu=%.2f swap=%.2f fence=%.2f "
+                "input=%.3f shdrRld=%.3f tick=%.2f prep=%.2f rebuild=%.2f ssbo=%.3f "
+                "anim=%.2f prePass=%.3f "
+                "shadow=%.2f geom=%.2f decal=%.2f light=%.2f fwd=%.2f blit=%.2f imgui=%.2f draws=%d "
+                "mode=%s dirtySkip=%d qTier=%d "
+                "frame_p50=%.2f p95=%.2f p99=%.2f cpu_p50=%.2f p95=%.2f swap_p50=%.2f p95=%.2f",
+                frameProfile_.fps, frameProfile_.frameTotal,
+                frameProfile_.cpuWork, frameProfile_.swapBuffers, frameProfile_.fenceWait,
+                frameProfile_.inputPoll, frameProfile_.shaderReload,
+                frameProfile_.sceneTick, frameProfile_.prepareDraws, frameProfile_.rebuild,
+                frameProfile_.materialSSBO, frameProfile_.animationTick, frameProfile_.prePassSetup,
+                frameProfile_.shadowPass, frameProfile_.geometryPass,
                 frameProfile_.decalPass, frameProfile_.lightingPass,
-                frameProfile_.forwardPass, frameProfile_.editorClear,
-                frameProfile_.imguiRender, frameProfile_.swapBuffers,
-                lastFrameDrawCalls_);
+                frameProfile_.forwardPass, frameProfile_.blitCompose, frameProfile_.imguiRender,
+                lastFrameDrawCalls_,
+                (renderMode_ == RenderMode::Work) ? "Work" : "Play",
+                frameProfile_.dirtyFrameSkipped,
+                frameProfile_.qualityTier,
+                rsFrame_.Percentile(50), rsFrame_.Percentile(95), rsFrame_.Percentile(99),
+                rsCpu_.Percentile(50),   rsCpu_.Percentile(95),
+                rsSwap_.Percentile(50),  rsSwap_.Percentile(95));
             NC::LOGGING::Log(profBuf);
 
             char shadowBuf[256];
@@ -4660,11 +5056,14 @@ void DeferredRenderer::renderSingleFrame()
 
             char geomBuf[384];
             std::snprintf(geomBuf, sizeof(geomBuf),
-                "[PROFILE_GEOM] setup=%.2f sCull=%.2f sFlush=%.2f aCull=%.2f aFlush=%.2f sl=%.2f env=%.2f visC=%s",
+                "[PROFILE_GEOM] setup=%.2f sCull=%.2f sFlush=%.2f aCull=%.2f aFlush=%.2f sl=%.2f env=%.2f "
+                "sBatch=%d aBatch=%d eBatch=%d dBatch=%d visC=%s",
                 frameProfile_.geomSetup,
                 frameProfile_.geomSolidCull, frameProfile_.geomSolidFlush,
                 frameProfile_.geomAlphaCull, frameProfile_.geomAlphaFlush,
                 frameProfile_.geomSL, frameProfile_.geomEnv,
+                frameProfile_.solidBatchCount, frameProfile_.alphaBatchCount,
+                frameProfile_.envBatchCount, frameProfile_.decalBatchCount,
                 visResolveSkipped_ ? "HIT" : "MISS");
             NC::LOGGING::Log(geomBuf);
 
@@ -4675,18 +5074,306 @@ void DeferredRenderer::renderSingleFrame()
                 frameProfile_.geomSLGroup, frameProfile_.geomSLUpload,
                 frameProfile_.geomSLRender,
                 frameProfile_.geomSLGroupCount, frameProfile_.geomSLVisibleCount,
-                static_cast<int>(simpleLayerDraws.size()),
+                frameProfile_.slCount,
                 frameProfile_.slCacheHit ? "HIT" : "MISS");
             NC::LOGGING::Log(slBuf);
 
-            char gpuBuf[256];
+            char gpuBuf[512];
             std::snprintf(gpuBuf, sizeof(gpuBuf),
-                "[PROFILE_GPU] shadow=%.2f geom=%.2f decal=%.2f light=%.2f fwd=%.2f fwdFlush=%d",
+                "[PROFILE_GPU] total=%.2f shadow=%.2f geom=%.2f decal=%.2f light=%.2f fwd=%.2f fwdFlush=%d "
+                "fwdEnvA=%.2f fwdRefr=%.2f fwdWater=%.2f fwdPostA=%.2f fwdPart=%.2f",
+                frameProfile_.gpuTotal,
                 frameProfile_.gpuShadow, frameProfile_.gpuGeometry,
                 frameProfile_.gpuDecal, frameProfile_.gpuLighting,
-                frameProfile_.gpuForward, frameProfile_.fwdFlushCount);
+                frameProfile_.gpuForward, frameProfile_.fwdFlushCount,
+                frameProfile_.gpuEnvAlpha, frameProfile_.gpuRefraction,
+                frameProfile_.gpuWater, frameProfile_.gpuPostAlpha, frameProfile_.gpuParticles);
             NC::LOGGING::Log(gpuBuf);
+
+            char gpuGeomBuf[320];
+            std::snprintf(gpuGeomBuf, sizeof(gpuGeomBuf),
+                "[PROFILE_GPU_GEOM] solid=%.2f alpha=%.2f sl=%.2f env=%.2f split=%.2f total=%.2f",
+                frameProfile_.gpuGeomSolid, frameProfile_.gpuGeomAlpha,
+                frameProfile_.gpuGeomSL, frameProfile_.gpuGeomEnv,
+                frameProfile_.gpuGeomSolid + frameProfile_.gpuGeomAlpha +
+                frameProfile_.gpuGeomSL + frameProfile_.gpuGeomEnv,
+                frameProfile_.gpuGeometry);
+            NC::LOGGING::Log(gpuGeomBuf);
+
+            char drawsBuf[512];
+            std::snprintf(drawsBuf, sizeof(drawsBuf),
+                "[PROFILE_DRAWS] solid=%d alpha=%d sl=%d env=%d envA=%d decal=%d "
+                "water=%d refr=%d postA=%d part=%d anim=%d totalDC=%d",
+                frameProfile_.solidCount, frameProfile_.alphaCount,
+                frameProfile_.slCount, frameProfile_.envCount, frameProfile_.envAlphaCount,
+                frameProfile_.decalCount, frameProfile_.waterCount,
+                frameProfile_.refractionCount, frameProfile_.postAlphaCount,
+                frameProfile_.particleCount, frameProfile_.animatedCount,
+                lastFrameDrawCalls_);
+            NC::LOGGING::Log(drawsBuf);
+
+            char visBuf[384];
+            std::snprintf(visBuf, sizeof(visBuf),
+                "[PROFILE_VIS] cellsTotal=%d frustum=%d pvs=%d high=%d low=%d objGate=%d "
+                "alphaRed=%d decalRed=%d envARed=%d postARed=%d",
+                frameProfile_.visCellsTotal, frameProfile_.visCellsFrustum,
+                frameProfile_.visCellsAfterPVS,
+                frameProfile_.visCellsHigh, frameProfile_.visCellsLow,
+                frameProfile_.visObjectsAfterGate,
+                frameProfile_.alphaReduced, frameProfile_.decalReduced,
+                frameProfile_.envAlphaReduced, frameProfile_.postAlphaReduced);
+            NC::LOGGING::Log(visBuf);
+
+            char qualBuf[256];
+            std::snprintf(qualBuf, sizeof(qualBuf),
+                "[PROFILE_QUALITY] tier=%d lodBias=%.1f drawDistAdj=%.0f alphaAggr=%.2f "
+                "overBudget=%d underBudget=%d pvs=%s",
+                static_cast<int>(budgetGovernor_.tier),
+                budgetGovernor_.lodBiasAdjust,
+                budgetGovernor_.drawDistAdjust,
+                budgetGovernor_.alphaAggressiveness,
+                budgetGovernor_.overBudgetCount,
+                budgetGovernor_.underBudgetCount,
+                (pvsProvider_ && pvsProvider_->IsAvailable()) ? "YES" : "NO");
+            NC::LOGGING::Log(qualBuf);
         }
+
+        // CPU frame cap: policy-driven only.
+        // targetFps <= 0 means strictly uncapped — env var is NOT consulted so
+        // Work Mode cannot be accidentally capped by NDEVC_TARGET_FPS.
+        {
+            const int policyFps = activePolicy_.targetFps;
+            if (policyFps > 0) {
+                const double targetSec = 1.0 / static_cast<double>(policyFps);
+                using Dur = std::chrono::duration<double>;
+                const auto deadline = profFrameStart +
+                    std::chrono::duration_cast<ProfileClock::duration>(Dur(targetSec - 0.001));
+                std::this_thread::sleep_until(deadline);
+            }
+        }
+}
+
+// ---------------------------------------------------------------------------
+// BuildPolicy — construct a FramePolicy for the given mode
+// ---------------------------------------------------------------------------
+FramePolicy BuildPolicy(RenderMode mode) {
+    FramePolicy p{};
+    switch (mode) {
+    case RenderMode::Work:
+        p.editorLayoutEnabled      = true;
+        p.viewportOnlyUI           = false;
+        p.forceFullSceneVisible    = false;
+        p.visibilityCullingEnabled = true;
+        p.allowPVS                 = true;
+        p.dirtyRenderingEnabled    = true;
+        p.limitEditorPanelRefresh  = false;
+        p.targetFps                = 0;       // uncapped
+        p.lodBias                  = 0.0f;
+        p.maxDrawDistance           = 0.0f;
+        p.alphaReductionNearDist   = 300.0f;
+        p.alphaReductionFarDist    = 800.0f;
+        p.gpuBudgetMs              = 10.0f;
+        p.cpuBudgetMs              = 8.0f;
+        p.highDetailRadiusChunks   = 2;
+        p.budgetGovernorEnabled    = true;
+        break;
+    case RenderMode::Play:
+        p.editorLayoutEnabled      = true;   // editor stays visible like Unity
+        p.viewportOnlyUI           = false;
+        p.forceFullSceneVisible    = false;
+        p.visibilityCullingEnabled = true;
+        p.allowPVS                 = true;
+        p.dirtyRenderingEnabled    = false;  // continuous render in Play
+        p.limitEditorPanelRefresh  = false;
+        p.targetFps                = 0;       // uncapped in Play for maximum throughput
+        p.lodBias                  = 0.0f;
+        p.maxDrawDistance           = 0.0f;
+        p.alphaReductionNearDist   = 200.0f;
+        p.alphaReductionFarDist    = 600.0f;
+        p.gpuBudgetMs              = 7.5f;
+        p.cpuBudgetMs              = 6.0f;
+        p.highDetailRadiusChunks   = 3;
+        p.budgetGovernorEnabled    = true;
+        break;
+    }
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// ApplyPolicy — wire the policy into renderer state atomically
+// ---------------------------------------------------------------------------
+void DeferredRenderer::ApplyPolicy(const FramePolicy& policy) {
+    activePolicy_ = policy;
+
+    // Both Work and Play keep the full editor layout (Unity behaviour).
+    // imguiViewportOnly_ is an init-time decision only; never change it at runtime
+    // when docking was initialized — stopping docked-window submissions corrupts layout.
+    if (imguiDockingAvailable_) {
+        editorModeEnabled_ = true;  // always keep editor shell so docking stays intact
+    } else {
+        imguiViewportOnly_ = policy.viewportOnlyUI;
+        editorModeEnabled_ = policy.editorLayoutEnabled;
+    }
+    enableVisibilityGrid_ = policy.visibilityCullingEnabled;
+    visibleRange_         = policy.maxDrawDistance;
+
+    dirtyFlag_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// LogPolicySnapshot — concise log of active mode + policy
+// ---------------------------------------------------------------------------
+void DeferredRenderer::LogPolicySnapshot(const char* reason) const {
+    const char* modeName = (renderMode_ == RenderMode::Work) ? "Work" : "Play";
+    const FramePolicy& p = activePolicy_;
+    char buf[768];
+    std::snprintf(buf, sizeof(buf),
+        "[MODE] %s mode=%s editorLayout=%d viewportOnly=%d visCull=%d "
+        "dirtyRendering=%d targetFps=%d(%s) lodBias=%.1f maxDist=%.0f "
+        "alphaNear=%.0f alphaFar=%.0f gpuBudget=%.1f cpuBudget=%.1f "
+        "hiDetailChunks=%d governor=%d qualityTier=%d",
+        reason ? reason : "snapshot",
+        modeName,
+        p.editorLayoutEnabled ? 1 : 0,
+        p.viewportOnlyUI ? 1 : 0,
+        p.visibilityCullingEnabled ? 1 : 0,
+        p.dirtyRenderingEnabled ? 1 : 0,
+        p.targetFps,
+        (p.targetFps <= 0) ? "uncapped" : "capped",
+        p.lodBias + budgetGovernor_.lodBiasAdjust,
+        p.maxDrawDistance,
+        p.alphaReductionNearDist,
+        p.alphaReductionFarDist,
+        p.gpuBudgetMs,
+        p.cpuBudgetMs,
+        p.highDetailRadiusChunks,
+        p.budgetGovernorEnabled ? 1 : 0,
+        static_cast<int>(budgetGovernor_.tier));
+    NC::LOGGING::Log(buf);
+}
+
+// ---------------------------------------------------------------------------
+// MarkDirty / ConsumeDirty — dirty-frame tracking
+// ---------------------------------------------------------------------------
+void DeferredRenderer::MarkDirty() {
+    dirtyFlag_ = true;
+}
+
+bool DeferredRenderer::ConsumeDirty() {
+    if (dirtyFlag_) {
+        dirtyFlag_ = false;
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// GetRenderMode / SetRenderMode — public API for mode switching
+// ---------------------------------------------------------------------------
+RenderMode DeferredRenderer::GetRenderMode() const {
+    return renderMode_;
+}
+
+void DeferredRenderer::SetRenderMode(RenderMode mode) {
+    if (mode == renderMode_) return;
+    renderMode_ = mode;
+    FramePolicy policy = BuildPolicy(mode);
+    ApplyPolicy(policy);
+
+    // Invalidate transient caches on mode switch
+    visFrustumCacheValid_ = false;
+    visGridRevealedAll_ = false;
+    slGBufCacheValid_ = false;
+    slViewProjCacheValid_ = false;
+    shadowGroupCacheValid_ = false;
+    shadowCastersDirty_ = true;
+    solidBatchSystem_.InvalidateCullCache();
+    alphaTestBatchSystem_.InvalidateCullCache();
+
+    // Phase 2: reset budget governor for the new mode
+    budgetGovernor_.Reset();
+    lastAppliedTier_ = QualityTier::Full;
+
+    LogPolicySnapshot("SWITCH");
+}
+
+// ---------------------------------------------------------------------------
+// BudgetGovernor::Update — adaptive quality control based on frame timings
+// ---------------------------------------------------------------------------
+void BudgetGovernor::Update(double gpuMs, double cpuMs, float gpuBudget, float cpuBudget) {
+    const bool overBudget = (gpuMs > gpuBudget) || (cpuMs > cpuBudget);
+    const bool underBudget = (gpuMs < gpuBudget * 0.7) && (cpuMs < cpuBudget * 0.7);
+
+    if (overBudget) {
+        ++overBudgetCount;
+        underBudgetCount = 0;
+    } else if (underBudget) {
+        ++underBudgetCount;
+        overBudgetCount = 0;
+    } else {
+        overBudgetCount = 0;
+        underBudgetCount = 0;
+    }
+
+    if (overBudgetCount >= kHysteresisFrames) {
+        overBudgetCount = 0;
+        alphaAggressiveness = std::min(1.0f, alphaAggressiveness + kAlphaStep);
+        lodBiasAdjust = std::min(3.0f, lodBiasAdjust + kLodBiasStep);
+        drawDistAdjust = std::min(800.0f, drawDistAdjust + kDrawDistStep);
+        if (alphaAggressiveness >= 0.5f && tier == QualityTier::Full) {
+            tier = QualityTier::Reduced;
+        } else if (alphaAggressiveness >= 0.9f && tier == QualityTier::Reduced) {
+            tier = QualityTier::Minimum;
+        }
+    }
+
+    if (underBudgetCount >= kHysteresisFrames) {
+        underBudgetCount = 0;
+        alphaAggressiveness = std::max(0.0f, alphaAggressiveness - kAlphaStep);
+        lodBiasAdjust = std::max(0.0f, lodBiasAdjust - kLodBiasStep);
+        drawDistAdjust = std::max(0.0f, drawDistAdjust - kDrawDistStep);
+        if (alphaAggressiveness < 0.5f && tier == QualityTier::Reduced) {
+            tier = QualityTier::Full;
+        } else if (alphaAggressiveness < 0.9f && tier == QualityTier::Minimum) {
+            tier = QualityTier::Reduced;
+        }
+    }
+}
+
+void BudgetGovernor::Reset() {
+    tier = QualityTier::Full;
+    lodBiasAdjust = 0.0f;
+    drawDistAdjust = 0.0f;
+    alphaAggressiveness = 0.0f;
+    overBudgetCount = 0;
+    underBudgetCount = 0;
+}
+
+// ---------------------------------------------------------------------------
+// UpdateBudgetGovernor — call after frame profile is computed
+// ---------------------------------------------------------------------------
+void DeferredRenderer::UpdateBudgetGovernor() {
+    if (!activePolicy_.budgetGovernorEnabled) return;
+
+    const double gpuMs = frameProfile_.gpuTotal;  // last-known GPU time (updated every 1200 frames)
+    const double cpuMs = frameProfile_.frameTotal - frameProfile_.swapBuffers;
+    budgetGovernor_.Update(gpuMs, cpuMs,
+                           activePolicy_.gpuBudgetMs,
+                           activePolicy_.cpuBudgetMs);
+
+    frameProfile_.qualityTier       = static_cast<int>(budgetGovernor_.tier);
+    frameProfile_.governorLodBias   = budgetGovernor_.lodBiasAdjust;
+    frameProfile_.governorAlphaAggr = budgetGovernor_.alphaAggressiveness;
+    // Honest panel Hz: we always call RenderImGui every frame
+    frameProfile_.panelUpdateHzEffective = (frameProfile_.frameTotal > 0.0)
+        ? static_cast<float>(1000.0 / frameProfile_.frameTotal) : 0.0f;
+
+    // Quality tier change is a dirty signal
+    if (budgetGovernor_.tier != lastAppliedTier_) {
+        lastAppliedTier_ = budgetGovernor_.tier;
+        dirtyFlag_ = true;
+        visFrustumCacheValid_ = false;
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -21,11 +21,13 @@ public:
     std::shared_ptr<IBuffer> CreateBuffer(const BufferDesc& desc) override;
     std::shared_ptr<ISampler> CreateSampler(const SamplerDesc& desc) override;
 
+    void BindStorageBuffer(IBuffer* buffer, uint32_t bindingPoint) override;
     void SetViewport(const Viewport& viewport) override;
     void BindFramebuffer(IFramebuffer* fbo) override;
     void BindTexture(ITexture* texture, uint32_t slot) override;
     void BindSampler(ISampler* sampler, uint32_t slot) override;
     void ApplyRenderState(IRenderState* state) override;
+    void InvalidateRenderStateCache() override { renderStateCacheValid_ = false; }
 
     void Clear(bool color, bool depth, bool stencil,
         const glm::vec4& clearColor = glm::vec4(0),
@@ -40,6 +42,13 @@ private:
     GLuint boundTextures_[32];
     GLenum boundTextureTargets_[32];
     IRenderState* currentRenderState_;
+
+    // Per-instance render state cache (invalidated each frame after baseline reset)
+    RenderStateDesc cachedRenderState_{};
+    bool renderStateCacheValid_ = false;
+
+    // Per-instance viewport cache
+    Viewport cachedViewport_{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
 
     void ApplyDepthState(const DepthState& depth);
     void ApplyBlendState(const BlendState& blend);

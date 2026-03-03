@@ -5,6 +5,6 @@ layout(std430, binding = 1) readonly buffer ModelMatrices {
     mat4 modelMatrices[];
 };
 void main() {
-    mat4 model = modelMatrices[gl_BaseInstance];
+    mat4 model = modelMatrices[gl_BaseInstance + gl_InstanceID];
     gl_Position = lightSpaceMatrix * model * vec4(position, 1.0);
 }

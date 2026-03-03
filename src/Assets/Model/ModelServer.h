@@ -77,6 +77,16 @@ public:
         return IsModelLoaded(filepath) && modelCache.count(filepath) > 0;
     }
 
+    std::vector<std::string> GetLoadedModelPaths() const {
+        std::vector<std::string> out;
+        out.reserve(modelCache.size());
+        for (const auto& [path, model] : modelCache) {
+            (void)model;
+            out.push_back(path);
+        }
+        return out;
+    }
+
     int CountModelsInState(ModelLoadState s) const {
         int n = 0;
         for (const auto& [_, state] : modelStates_) {

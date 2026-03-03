@@ -7,7 +7,8 @@ in vec3 vWorldEyeVec;
 in float vProjDepth;
 
 uniform sampler2D particleTexture;
-uniform sampler2D gPositionVS;
+uniform sampler2D gPositionWSTex;
+uniform mat4 view;
 uniform int colorMode; // 0 = none, 1 = additive, 2 = alpha (unlit)
 uniform vec2 invViewport;
 uniform vec2 fogDistances;
@@ -27,12 +28,16 @@ void main() {
     float intensity = max(Intensity0, 0.0);
     float emissive = max(MatEmissiveIntensity, 0.0);
 
-    // soft particle factor (approximate Nebula dsfObjectDepth with gPositionVS)
+    // soft particle factor using background world-position reconstruction
     float softAlphaMod = 1.0;
     if (invViewport.x > 0.0 && invViewport.y > 0.0) {
         vec2 screenUv = gl_FragCoord.xy * invViewport;
-        vec3 bgViewPos = texture(gPositionVS, screenUv).xyz;
-        float backGroundViewDepth = length(bgViewPos);
+        float backGroundViewDepth = 1e6;
+        vec4 bgWorldPos = texture(gPositionWSTex, screenUv);
+        if (bgWorldPos.w > 0.0) {
+            vec3 bgViewPos = (view * vec4(bgWorldPos.xyz, 1.0)).xyz;
+            backGroundViewDepth = length(bgViewPos);
+        }
         if (backGroundViewDepth < 1e-5) backGroundViewDepth = 1e6;
         float particleViewDepth = length(vViewSpacePos);
         float softAlpha = clamp((backGroundViewDepth - particleViewDepth) * 0.5, 0.0, 1.0);
