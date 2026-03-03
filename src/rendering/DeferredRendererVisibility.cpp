@@ -60,6 +60,7 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
     if (!enableVisibilityGrid_) {
         // Only run revealAll once when transitioning from enabled → disabled
         if (!visGridRevealedAll_) {
+            visResolveSkipped_ = false;
             visibilityStage_.Reset();
             auto revealAll = [](std::vector<DrawCmd>& draws) {
                 bool changed = false;
@@ -88,6 +89,8 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
             visibleCells_.clear();
             lastVisibleCells_.clear();
             visGridRevealedAll_ = true;
+        } else {
+            visResolveSkipped_ = true;
         }
         return;
     }
@@ -102,7 +105,7 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
     else if (simpleLayerVisGrid_.IsBuilt()) queryGrid = &simpleLayerVisGrid_;
     else if (refractionVisGrid_.IsBuilt()) queryGrid = &refractionVisGrid_;
     else if (decalVisGrid_.IsBuilt()) queryGrid = &decalVisGrid_;
-    if (!queryGrid) return;
+    if (!queryGrid) { visResolveSkipped_ = true; return; }
     visGridRevealedAll_ = false;
 
     // Use the camera's ground look-at point (ray → Y=0 intersection) as the
@@ -125,6 +128,15 @@ void DeferredRenderer::UpdateVisibilityThisFrame(const Camera::Frustum& frustum)
 
     // Run the cell query every frame — it's cheap (few AABB frustum tests).
     queryGrid->QueryVisibleCells(visCenter, frustum, visibleRange_, visibleCells_);
+
+    // If the set of visible cells hasn't changed since the last frame, all
+    // per-draw disabled flags are still correct. Skip the expensive hash-set
+    // rebuild + 9x draw-list iteration (~5-6ms saved at 6095 draws).
+    if (visibleCells_ == lastVisibleCells_) {
+        visResolveSkipped_ = true;
+        return;
+    }
+    visResolveSkipped_ = false;
 
     // Nebula-style sequence:
     // OnCullBefore(frame) -> Clear camera links -> Perform visibility query -> Resolve draw visibility.

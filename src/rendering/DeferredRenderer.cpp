@@ -18,6 +18,7 @@
 #include "Rendering/OpenGL/OpenGLShaderManager.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -586,6 +587,25 @@ void DeferredRenderer::initGLFW() {
         gSamplerClamp.id = *(GLuint*)samplerClamp_abstracted->GetNativeHandle();
     }
 
+    if (TextureServer::sBindlessSupported) {
+        if (whiteTex.id) {
+            fallbackWhiteHandle_ = glGetTextureHandleARB(whiteTex.id);
+            if (fallbackWhiteHandle_) glMakeTextureHandleResidentARB(fallbackWhiteHandle_);
+        }
+        if (blackTex.id) {
+            fallbackBlackHandle_ = glGetTextureHandleARB(blackTex.id);
+            if (fallbackBlackHandle_) glMakeTextureHandleResidentARB(fallbackBlackHandle_);
+        }
+        if (normalTex.id) {
+            fallbackNormalHandle_ = glGetTextureHandleARB(normalTex.id);
+            if (fallbackNormalHandle_) glMakeTextureHandleResidentARB(fallbackNormalHandle_);
+        }
+        if (blackCubeTex.id) {
+            fallbackBlackCubeHandle_ = glGetTextureHandleARB(blackCubeTex.id);
+            if (fallbackBlackCubeHandle_) glMakeTextureHandleResidentARB(fallbackBlackCubeHandle_);
+        }
+    }
+
     NC::LOGGING::Log("[DEFERRED] initGLFW end framebuffer=", width, "x", height,
                      " shaderManager=", (shaderManager ? 1 : 0),
                      " particlesDisabled=", (ParticlesDisabled() ? 1 : 0));
@@ -874,64 +894,111 @@ void DeferredRenderer::generateSphereMesh() {
 
 void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm::vec3& camForward)
 {
+    frameProfile_.shadowGroup  = 0.0;
+    frameProfile_.shadowUpload = 0.0;
+    frameProfile_.shadowDraw   = 0.0;
+    frameProfile_.shadowSL     = 0.0;
+    frameProfile_.shadowCasterBuild = 0.0;
     static int frameCount = 0;
     static bool logShadows = (frameCount++ == 5);
     glm::vec3 lightDirWorld = -kLightDirToSun;
 
-    struct ShadowCaster {
-        const DrawCmd* draw = nullptr;
-        float radius = 0.0f;
-        float viewDepth = 0.0f;
-    };
-    std::vector<ShadowCaster> shadowCasters;
-    shadowCasters.reserve(solidDraws.size());
-    std::vector<ShadowCaster> simpleLayerShadowCasters;
-    simpleLayerShadowCasters.reserve(simpleLayerDraws.size());
-
+    auto tCasterStart = std::chrono::steady_clock::now();
     const glm::mat4 viewMatrix = camera_.getViewMatrix();
 
-    auto isFilteredShadowShader = [](const DrawCmd& obj) {
-        return obj.shdr == "shd:water" || obj.shdr == "shd:decal" ||
-               obj.shdr == "shd:simplelayer" ||
-               obj.shdr == "shd:uvanimated";
-    };
+    if (shadowCastersDirty_) {
+        shadowCasters_.clear();
+        shadowCasters_.reserve(solidDraws.size());
+        simpleLayerShadowCasters_.clear();
+        simpleLayerShadowCasters_.reserve(simpleLayerDraws.size());
 
-    for (const auto& obj : solidDraws) {
-        if (!obj.mesh || isFilteredShadowShader(obj)) continue;
-        if (obj.disabled) continue;
+        for (const auto& obj : solidDraws) {
+            if (!obj.mesh || obj.shadowFiltered) continue;
 
-        const glm::vec3 localCenter = (glm::vec3(obj.localBoxMin) + glm::vec3(obj.localBoxMax)) * 0.5f;
-        const float localRadius = glm::length(glm::vec3(obj.localBoxMax) - glm::vec3(obj.localBoxMin)) * 0.5f;
-        const float sx = glm::length(glm::vec3(obj.worldMatrix[0]));
-        const float sy = glm::length(glm::vec3(obj.worldMatrix[1]));
-        const float sz = glm::length(glm::vec3(obj.worldMatrix[2]));
-        const float radius = localRadius * std::max(sx, std::max(sy, sz));
-        const glm::vec3 worldCenter = glm::vec3(obj.worldMatrix * glm::vec4(localCenter, 1.0f));
+            glm::vec3 wc;
+            float r;
+            if (obj.cullBoundsValid) {
+                wc = obj.cullWorldCenter;
+                r = obj.cullWorldRadius;
+            } else {
+                const glm::vec3 localCenter = (glm::vec3(obj.localBoxMin) + glm::vec3(obj.localBoxMax)) * 0.5f;
+                const float localRadius = glm::length(glm::vec3(obj.localBoxMax) - glm::vec3(obj.localBoxMin)) * 0.5f;
+                const float sx = glm::length(glm::vec3(obj.worldMatrix[0]));
+                const float sy = glm::length(glm::vec3(obj.worldMatrix[1]));
+                const float sz = glm::length(glm::vec3(obj.worldMatrix[2]));
+                r = localRadius * std::max(sx, std::max(sy, sz));
+                wc = glm::vec3(obj.worldMatrix * glm::vec4(localCenter, 1.0f));
+            }
 
-        const float viewDepth = -glm::vec3(viewMatrix * glm::vec4(worldCenter, 1.0f)).z;
-        shadowCasters.push_back(ShadowCaster{&obj, radius, viewDepth});
+            const float vd = -(viewMatrix[0][2]*wc.x + viewMatrix[1][2]*wc.y + viewMatrix[2][2]*wc.z + viewMatrix[3][2]);
+            shadowCasters_.push_back(ShadowCaster{&obj, r, vd, wc});
+        }
+
+        // Pre-group solid casters by geomKey once — reused across cascades and frames
+        {
+            std::unordered_map<uint64_t, size_t> keyToIdx;
+            solidShadowGeomGroups_.clear();
+            for (uint32_t ci = 0; ci < static_cast<uint32_t>(shadowCasters_.size()); ++ci) {
+                const DrawCmd& obj = *shadowCasters_[ci].draw;
+                auto addGrp = [&](const Nvx2Group& g) {
+                    if (g.indexCount() == 0) return;
+                    const uint32_t cnt = g.indexCount();
+                    const uint32_t fIdx = obj.megaIndexOffset + g.firstIndex();
+                    const uint64_t gk = (static_cast<uint64_t>(cnt) << 32) | fIdx;
+                    auto [it, ins] = keyToIdx.try_emplace(gk, solidShadowGeomGroups_.size());
+                    if (ins) solidShadowGeomGroups_.push_back({cnt, fIdx, {}});
+                    solidShadowGeomGroups_[it->second].casterIndices.push_back(ci);
+                };
+                if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+                    addGrp(obj.mesh->groups[obj.group]);
+                } else {
+                    for (const auto& g : obj.mesh->groups) addGrp(g);
+                }
+            }
+        }
+
+        for (const auto& obj : simpleLayerDraws) {
+            if (!obj.mesh) continue;
+
+            glm::vec3 wc;
+            float r;
+            if (obj.cullBoundsValid) {
+                wc = obj.cullWorldCenter;
+                r = obj.cullWorldRadius;
+            } else {
+                const glm::vec3 localCenter = (glm::vec3(obj.localBoxMin) + glm::vec3(obj.localBoxMax)) * 0.5f;
+                const float localRadius = glm::length(glm::vec3(obj.localBoxMax) - glm::vec3(obj.localBoxMin)) * 0.5f;
+                const float sx = glm::length(glm::vec3(obj.worldMatrix[0]));
+                const float sy = glm::length(glm::vec3(obj.worldMatrix[1]));
+                const float sz = glm::length(glm::vec3(obj.worldMatrix[2]));
+                r = localRadius * std::max(sx, std::max(sy, sz));
+                wc = glm::vec3(obj.worldMatrix * glm::vec4(localCenter, 1.0f));
+            }
+
+            const float vd = -(viewMatrix[0][2]*wc.x + viewMatrix[1][2]*wc.y + viewMatrix[2][2]*wc.z + viewMatrix[3][2]);
+            simpleLayerShadowCasters_.push_back(ShadowCaster{&obj, r, vd, wc});
+        }
+
+        shadowCastersDirty_ = false;
+        shadowCasterCacheHit_ = false;
+    } else {
+        shadowCasterCacheHit_ = true;
+        const float vr0 = viewMatrix[0][2], vr1 = viewMatrix[1][2],
+                    vr2 = viewMatrix[2][2], vr3 = viewMatrix[3][2];
+        for (auto& c : shadowCasters_)
+            c.viewDepth = -(vr0*c.worldCenter.x + vr1*c.worldCenter.y + vr2*c.worldCenter.z + vr3);
+        for (auto& c : simpleLayerShadowCasters_)
+            c.viewDepth = -(vr0*c.worldCenter.x + vr1*c.worldCenter.y + vr2*c.worldCenter.z + vr3);
     }
 
-    for (const auto& obj : simpleLayerDraws) {
-        if (!obj.mesh || obj.disabled) continue;
-
-        const glm::vec3 localCenter = (glm::vec3(obj.localBoxMin) + glm::vec3(obj.localBoxMax)) * 0.5f;
-        const float localRadius = glm::length(glm::vec3(obj.localBoxMax) - glm::vec3(obj.localBoxMin)) * 0.5f;
-        const float sx = glm::length(glm::vec3(obj.worldMatrix[0]));
-        const float sy = glm::length(glm::vec3(obj.worldMatrix[1]));
-        const float sz = glm::length(glm::vec3(obj.worldMatrix[2]));
-        const float radius = localRadius * std::max(sx, std::max(sy, sz));
-        const glm::vec3 worldCenter = glm::vec3(obj.worldMatrix * glm::vec4(localCenter, 1.0f));
-
-        const float viewDepth = -glm::vec3(viewMatrix * glm::vec4(worldCenter, 1.0f)).z;
-        simpleLayerShadowCasters.push_back(ShadowCaster{&obj, radius, viewDepth});
-    }
+    frameProfile_.shadowCasterBuild = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - tCasterStart).count();
 
     if (logShadows) {
         std::cout << "  Computing light space matrices for " << NUM_CASCADES << " cascades\n";
         std::cout << "  Light direction: (" << lightDirWorld.x << ", " << lightDirWorld.y << ", " << lightDirWorld.z << ")\n";
-        std::cout << "  Shadow casters considered: " << shadowCasters.size() << "/" << solidDraws.size() << "\n";
-        std::cout << "  SimpleLayer shadow casters considered: " << simpleLayerShadowCasters.size() << "/" << simpleLayerDraws.size() << "\n";
+        std::cout << "  Shadow casters considered: " << shadowCasters_.size() << "/" << solidDraws.size() << "\n";
+        std::cout << "  SimpleLayer shadow casters considered: " << simpleLayerShadowCasters_.size() << "/" << simpleLayerDraws.size() << "\n";
     }
 
     const float fovY = glm::radians(camera_.getFov());
@@ -1102,172 +1169,290 @@ void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm:
         }
 
         if (shadowShaders) {
-            struct ShadowInstancedGroup {
-                uint32_t count = 0;
-                uint32_t firstIndex = 0;
-                std::vector<glm::mat4> matrices;
-            };
-
-            // Build per-cascade matrix list and indirect commands
-            std::vector<glm::mat4> shadowMatrices;
-            std::vector<DrawCommand> shadowCommands;
-            std::unordered_map<uint64_t, ShadowInstancedGroup> shadowGroups;
-            shadowMatrices.reserve(shadowCasters.size());
-            shadowCommands.reserve(shadowCasters.size() * 2);
+            auto tGroupStart = std::chrono::steady_clock::now();
+            shadowMatrices_.clear();
+            shadowCommands_.clear();
+            shadowMatrices_.reserve(shadowCasters_.size());
             int triangleCount = 0;
 
-            for (const auto& caster : shadowCasters) {
-                const DrawCmd& obj = *caster.draw;
-                if (caster.viewDepth + caster.radius < cascadeNear) continue;
-                if (caster.viewDepth - caster.radius > cascadeFar) continue;
-                if (!obj.mesh) continue;
-
-                auto appendGroup = [&](const Nvx2Group& g) {
-                    if (g.indexCount() == 0) return;
-                    const uint32_t count = g.indexCount();
-                    const uint32_t firstIndex = obj.megaIndexOffset + g.firstIndex();
-                    const uint64_t geomKey = (static_cast<uint64_t>(count) << 32) | firstIndex;
-                    auto& group = shadowGroups[geomKey];
-                    if (group.count == 0) {
-                        group.count = count;
-                        group.firstIndex = firstIndex;
-                    }
-                    group.matrices.push_back(obj.worldMatrix);
-                    triangleCount += g.indexCount() / 3;
-                };
-
-                if (obj.group >= 0 && obj.group < (int)obj.mesh->groups.size()) {
-                    appendGroup(obj.mesh->groups[obj.group]);
-                } else {
-                    for (const auto& g : obj.mesh->groups) {
-                        appendGroup(g);
-                    }
+            for (const auto& grp : solidShadowGeomGroups_) {
+                const uint32_t firstMat = static_cast<uint32_t>(shadowMatrices_.size());
+                uint32_t inRange = 0;
+                for (uint32_t ci : grp.casterIndices) {
+                    const ShadowCaster& caster = shadowCasters_[ci];
+                    if (caster.draw->disabled) continue;
+                    if (caster.viewDepth + caster.radius < cascadeNear) continue;
+                    if (caster.viewDepth - caster.radius > cascadeFar) continue;
+                    shadowMatrices_.push_back(caster.draw->worldMatrix);
+                    ++inRange;
+                }
+                if (inRange > 0) {
+                    DrawCommand cmd{};
+                    cmd.count = grp.indexCount;
+                    cmd.instanceCount = inRange;
+                    cmd.firstIndex = grp.firstIndex;
+                    cmd.baseVertex = 0;
+                    cmd.baseInstance = firstMat;
+                    shadowCommands_.push_back(cmd);
+                    triangleCount += static_cast<int>(grp.indexCount / 3) * inRange;
                 }
             }
+            frameProfile_.shadowGroup += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tGroupStart).count();
 
-            for (auto& [key, group] : shadowGroups) {
-                (void)key;
-                if (group.matrices.empty()) continue;
-                DrawCommand cmd{};
-                cmd.count = group.count;
-                cmd.instanceCount = static_cast<uint32_t>(group.matrices.size());
-                cmd.firstIndex = group.firstIndex;
-                cmd.baseVertex = 0;
-                cmd.baseInstance = static_cast<uint32_t>(shadowMatrices.size());
-                shadowMatrices.insert(shadowMatrices.end(), group.matrices.begin(), group.matrices.end());
-                shadowCommands.push_back(cmd);
-            }
-
-            if (!shadowCommands.empty()) {
+            if (!shadowCommands_.empty()) {
+                auto tUploadStart = std::chrono::steady_clock::now();
                 // Upload model matrices to SSBO at binding point 1
                 if (!shadowMatrixSSBO_) glGenBuffers(1, shadowMatrixSSBO_.put());
                 glBindBuffer(GL_SHADER_STORAGE_BUFFER, shadowMatrixSSBO_);
-                const size_t matrixBytes = shadowMatrices.size() * sizeof(glm::mat4);
+                const size_t matrixBytes = shadowMatrices_.size() * sizeof(glm::mat4);
                 if (matrixBytes > shadowMatrixSSBOCapacity_) {
-                    glBufferData(GL_SHADER_STORAGE_BUFFER,
-                                 static_cast<GLsizeiptr>(matrixBytes * 2),
-                                 nullptr, GL_STREAM_DRAW);
                     shadowMatrixSSBOCapacity_ = matrixBytes * 2;
                 }
+                // Orphan previous storage to avoid sync stall with in-flight GPU reads
+                glBufferData(GL_SHADER_STORAGE_BUFFER,
+                             static_cast<GLsizeiptr>(shadowMatrixSSBOCapacity_),
+                             nullptr, GL_STREAM_DRAW);
                 glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
                                 static_cast<GLsizeiptr>(matrixBytes),
-                                shadowMatrices.data());
+                                shadowMatrices_.data());
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, shadowMatrixSSBO_);
 
                 // Upload indirect commands
                 if (!shadowIndirectBuffer_) glGenBuffers(1, shadowIndirectBuffer_.put());
                 glBindBuffer(GL_DRAW_INDIRECT_BUFFER, shadowIndirectBuffer_);
-                const size_t cmdBytes = shadowCommands.size() * sizeof(DrawCommand);
+                const size_t cmdBytes = shadowCommands_.size() * sizeof(DrawCommand);
                 if (cmdBytes > shadowIndirectBufferCapacity_) {
-                    glBufferData(GL_DRAW_INDIRECT_BUFFER,
-                                 static_cast<GLsizeiptr>(cmdBytes * 2),
-                                 nullptr, GL_STREAM_DRAW);
                     shadowIndirectBufferCapacity_ = cmdBytes * 2;
                 }
+                glBufferData(GL_DRAW_INDIRECT_BUFFER,
+                             static_cast<GLsizeiptr>(shadowIndirectBufferCapacity_),
+                             nullptr, GL_STREAM_DRAW);
                 glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
                                 static_cast<GLsizeiptr>(cmdBytes),
-                                shadowCommands.data());
+                                shadowCommands_.data());
+                frameProfile_.shadowUpload += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tUploadStart).count();
 
                 // Single indirect draw for the entire cascade
+                auto tDrawStart = std::chrono::steady_clock::now();
                 MegaBuffer::instance().bind();
                 glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
                                             nullptr,
-                                            static_cast<GLsizei>(shadowCommands.size()),
+                                            static_cast<GLsizei>(shadowCommands_.size()),
                                             0);
                 glBindVertexArray(0);
                 glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+                frameProfile_.shadowDraw += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tDrawStart).count();
             }
             checkGLError("After shadow draw calls");
 
             if (logShadows) {
-                std::cout << "    Drew " << shadowCommands.size() << " indirect commands, "
+                std::cout << "    Drew " << shadowCommands_.size() << " indirect commands, "
                           << triangleCount << " triangles\n";
             }
         }
 
-        if (!simpleLayerShadowCasters.empty()) {
+        if (!simpleLayerShadowCasters_.empty()) {
+            auto tSLStart = std::chrono::steady_clock::now();
             auto simpleLayerShadowShader = shaderManager->GetShader("simplelayer_shadow");
-            auto simpleLayerDepthShader = shaderManager->GetShader("simplelayer_depth");
+            auto simpleLayerDepthShader  = shaderManager->GetShader("simplelayer_depth");
             if (!simpleLayerShadowShader || !simpleLayerDepthShader) {
                 NC::LOGGING::Error("[SHADOW] simplelayer shadow/depth shader variants missing");
             } else {
-                MegaBuffer::instance().bind();
-                int renderedSimpleLayerShadow = 0;
-                for (const auto& caster : simpleLayerShadowCasters) {
+                // Fix #4: batch simpleLayer shadow draws with instanced indirect rendering.
+                // Non-alphaTest (depth-only): group by geomKey, one glMultiDrawElementsIndirect.
+                // AlphaTest: group by (tex[0], cullMode), one instanced draw per unique group.
+
+                // ─── non-alphaTest depth pass ───────────────────────────────────────────
+                static thread_local std::unordered_map<uint64_t, ShadowInstancedGroup> slDepthGroups;
+                slDepthGroups.clear();
+                static thread_local std::vector<glm::mat4>   slDepthMats;
+                static thread_local std::vector<DrawCommand> slDepthCmds;
+                slDepthMats.clear();
+                slDepthCmds.clear();
+
+                // alphaTest groups keyed by (tex[0] ptr ^ cullMode bits)
+                struct SlAlphaGroup {
+                    NDEVC::Graphics::ITexture* tex0 = nullptr;
+                    int cullMode = 0;
+                    std::vector<glm::mat4>   mats;
+                    std::vector<DrawCommand> cmds;
+                    std::unordered_map<uint64_t, ShadowInstancedGroup> geomGroups;
+                };
+                static thread_local std::unordered_map<uint64_t, SlAlphaGroup> slAlphaGroups;
+                slAlphaGroups.clear();
+
+                for (const auto& caster : simpleLayerShadowCasters_) {
                     const DrawCmd& obj = *caster.draw;
+                    if (obj.disabled) continue;
                     if (caster.viewDepth + caster.radius < cascadeNear) continue;
                     if (caster.viewDepth - caster.radius > cascadeFar) continue;
                     if (!obj.mesh) continue;
 
-                    if (obj.cullMode <= 0) {
-                        glDisable(GL_CULL_FACE);
-                    } else {
-                        glEnable(GL_CULL_FACE);
-                        glCullFace(obj.cullMode == 1 ? GL_FRONT : GL_BACK);
-                    }
+                    auto addToGeomGroup = [&](std::unordered_map<uint64_t, ShadowInstancedGroup>& groups,
+                                              const Nvx2Group& g) {
+                        if (g.indexCount() == 0) return;
+                        const uint32_t count      = g.indexCount();
+                        const uint32_t firstIndex = obj.megaIndexOffset + g.firstIndex();
+                        const uint64_t geomKey    = (static_cast<uint64_t>(count) << 32) | firstIndex;
+                        auto& grp = groups[geomKey];
+                        if (grp.count == 0) { grp.count = count; grp.firstIndex = firstIndex; }
+                        grp.matrices.push_back(obj.worldMatrix);
+                    };
 
-                    auto shader = obj.alphaTest ? simpleLayerShadowShader : simpleLayerDepthShader;
-                    shader->Use();
-                    const glm::mat4 mvp = lightSpaceMatrices[cascade] * obj.worldMatrix;
-                    shader->SetMat4("mvp", glm::transpose(mvp));
-
-                    if (obj.alphaTest) {
-                        shader->SetInt("diffMapSampler", 0);
-                        bindTexture(0, obj.tex[0] ? toTextureHandle(obj.tex[0]) : whiteTex);
-                        if (device_ && samplerRepeat_abstracted) {
-                            device_->BindSampler(samplerRepeat_abstracted.get(), 0);
+                    if (!obj.alphaTest) {
+                        if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+                            addToGeomGroup(slDepthGroups, obj.mesh->groups[obj.group]);
                         } else {
-                            glBindSampler(0, gSamplerRepeat);
-                        }
-                    }
-
-                    if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
-                        const auto& g = obj.mesh->groups[obj.group];
-                        if (g.indexCount() > 0) {
-                            glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                                reinterpret_cast<void*>(static_cast<intptr_t>((obj.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t))));
+                            for (const auto& g : obj.mesh->groups) addToGeomGroup(slDepthGroups, g);
                         }
                     } else {
-                        for (const auto& g : obj.mesh->groups) {
-                            if (g.indexCount() == 0) continue;
-                            glDrawElements(GL_TRIANGLES, g.indexCount(), GL_UNSIGNED_INT,
-                                reinterpret_cast<void*>(static_cast<intptr_t>((obj.megaIndexOffset + g.firstIndex()) * sizeof(uint32_t))));
+                        const uint64_t ak = (reinterpret_cast<uintptr_t>(obj.tex[0]) * 0x9e3779b97f4a7c15ull)
+                                          ^ static_cast<uint64_t>(static_cast<uint32_t>(obj.cullMode));
+                        auto& ag = slAlphaGroups[ak];
+                        ag.tex0     = obj.tex[0];
+                        ag.cullMode = obj.cullMode;
+                        if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
+                            addToGeomGroup(ag.geomGroups, obj.mesh->groups[obj.group]);
+                        } else {
+                            for (const auto& g : obj.mesh->groups) addToGeomGroup(ag.geomGroups, g);
                         }
                     }
-                    renderedSimpleLayerShadow++;
                 }
 
-                if (device_) {
-                    device_->BindSampler(nullptr, 0);
-                } else {
-                    glBindSampler(0, 0);
+                // Build flat arrays for depth pass
+                for (auto& [key, grp] : slDepthGroups) {
+                    (void)key;
+                    if (grp.matrices.empty()) continue;
+                    DrawCommand cmd{};
+                    cmd.count         = grp.count;
+                    cmd.instanceCount = static_cast<uint32_t>(grp.matrices.size());
+                    cmd.firstIndex    = grp.firstIndex;
+                    cmd.baseVertex    = 0;
+                    cmd.baseInstance  = static_cast<uint32_t>(slDepthMats.size());
+                    slDepthMats.insert(slDepthMats.end(), grp.matrices.begin(), grp.matrices.end());
+                    slDepthCmds.push_back(cmd);
                 }
+
+                MegaBuffer::instance().bind();
+
+                // Draw depth-only batch
+                if (!slDepthCmds.empty()) {
+                    if (!slShadowMatrixSSBO_) glGenBuffers(1, slShadowMatrixSSBO_.put());
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, slShadowMatrixSSBO_);
+                    const size_t mb = slDepthMats.size() * sizeof(glm::mat4);
+                    if (mb > slShadowMatrixSSBOCapacity_) {
+                        slShadowMatrixSSBOCapacity_ = mb * 2;
+                    }
+                    glBufferData(GL_SHADER_STORAGE_BUFFER,
+                                 static_cast<GLsizeiptr>(slShadowMatrixSSBOCapacity_),
+                                 nullptr, GL_STREAM_DRAW);
+                    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                    static_cast<GLsizeiptr>(mb), slDepthMats.data());
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, slShadowMatrixSSBO_);
+
+                    if (!slShadowIndirectBuffer_) glGenBuffers(1, slShadowIndirectBuffer_.put());
+                    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slShadowIndirectBuffer_);
+                    const size_t cb = slDepthCmds.size() * sizeof(DrawCommand);
+                    if (cb > slShadowIndirectBufferCapacity_) {
+                        slShadowIndirectBufferCapacity_ = cb * 2;
+                    }
+                    glBufferData(GL_DRAW_INDIRECT_BUFFER,
+                                 static_cast<GLsizeiptr>(slShadowIndirectBufferCapacity_),
+                                 nullptr, GL_STREAM_DRAW);
+                    glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
+                                    static_cast<GLsizeiptr>(cb), slDepthCmds.data());
+
+                    glDisable(GL_CULL_FACE);
+                    simpleLayerDepthShader->Use();
+                    simpleLayerDepthShader->SetInt("UseInstancing", 1);
+                    simpleLayerDepthShader->SetMat4("lightSpaceMatrix", lightSpaceMatrices[cascade]);
+
+                    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
+                                                nullptr,
+                                                static_cast<GLsizei>(slDepthCmds.size()), 0);
+                    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+                }
+
+                // Draw alphaTest batches (one per unique tex0/cullMode group)
+                if (!slAlphaGroups.empty()) {
+                    // Reuse the slShadowMatrixSSBO_ for each alphaTest group sequentially
+                    simpleLayerShadowShader->Use();
+                    simpleLayerShadowShader->SetInt("UseInstancing", 1);
+                    simpleLayerShadowShader->SetMat4("lightSpaceMatrix", lightSpaceMatrices[cascade]);
+                    simpleLayerShadowShader->SetInt("diffMapSampler", 0);
+
+                    static thread_local std::vector<glm::mat4>   agMats;
+                    static thread_local std::vector<DrawCommand> agCmds;
+
+                    for (auto& [key, ag] : slAlphaGroups) {
+                        (void)key;
+                        agMats.clear();
+                        agCmds.clear();
+
+                        for (auto& [gk, grp] : ag.geomGroups) {
+                            (void)gk;
+                            if (grp.matrices.empty()) continue;
+                            DrawCommand cmd{};
+                            cmd.count         = grp.count;
+                            cmd.instanceCount = static_cast<uint32_t>(grp.matrices.size());
+                            cmd.firstIndex    = grp.firstIndex;
+                            cmd.baseVertex    = 0;
+                            cmd.baseInstance  = static_cast<uint32_t>(agMats.size());
+                            agMats.insert(agMats.end(), grp.matrices.begin(), grp.matrices.end());
+                            agCmds.push_back(cmd);
+                        }
+                        if (agCmds.empty()) continue;
+
+                        if (ag.cullMode <= 0) glDisable(GL_CULL_FACE);
+                        else { glEnable(GL_CULL_FACE); glCullFace(ag.cullMode == 1 ? GL_FRONT : GL_BACK); }
+
+                        bindTexture(0, ag.tex0 ? toTextureHandle(ag.tex0) : whiteTex);
+                        bindSampler(0, gSamplerRepeat);
+
+                        glBindBuffer(GL_SHADER_STORAGE_BUFFER, slShadowMatrixSSBO_);
+                        const size_t mb = agMats.size() * sizeof(glm::mat4);
+                        if (mb > slShadowMatrixSSBOCapacity_) {
+                            slShadowMatrixSSBOCapacity_ = mb * 2;
+                        }
+                        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                                     static_cast<GLsizeiptr>(slShadowMatrixSSBOCapacity_),
+                                     nullptr, GL_STREAM_DRAW);
+                        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                        static_cast<GLsizeiptr>(mb), agMats.data());
+                        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, slShadowMatrixSSBO_);
+
+                        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slShadowIndirectBuffer_);
+                        const size_t cb = agCmds.size() * sizeof(DrawCommand);
+                        if (cb > slShadowIndirectBufferCapacity_) {
+                            slShadowIndirectBufferCapacity_ = cb * 2;
+                        }
+                        glBufferData(GL_DRAW_INDIRECT_BUFFER,
+                                     static_cast<GLsizeiptr>(slShadowIndirectBufferCapacity_),
+                                     nullptr, GL_STREAM_DRAW);
+                        glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
+                                        static_cast<GLsizeiptr>(cb), agCmds.data());
+
+                        glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
+                                                    nullptr,
+                                                    static_cast<GLsizei>(agCmds.size()), 0);
+                        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+                    }
+                }
+
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0);
+                bindSampler(0, 0);
                 glDisable(GL_CULL_FACE);
 
                 if (logShadows) {
-                    std::cout << "    SimpleLayer shadow draws: " << renderedSimpleLayerShadow << "\n";
+                    std::cout << "    SimpleLayer shadow depth cmds: " << slDepthCmds.size()
+                              << " alphaTest groups: " << slAlphaGroups.size() << "\n";
                 }
             }
+            frameProfile_.shadowSL += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tSLStart).count();
         }
     }
 
@@ -1300,6 +1485,9 @@ void DeferredRenderer::Initialize() {
     logInitStep("InstallNax3Provider");
     initGLFW();
     logInitStep("initGLFW");
+    TextureServer::sBindlessSupported = (GLAD_GL_ARB_bindless_texture != 0);
+    NC::LOGGING::Log("[DEFERRED][INIT] GL_ARB_bindless_texture=",
+        TextureServer::sBindlessSupported ? "YES" : "NO");
     initCascadedShadowMaps();
     logInitStep("initCascadedShadowMaps");
     InitScreenQuad();
@@ -1378,6 +1566,26 @@ void DeferredRenderer::Initialize() {
         decalBatchSystem_.init(decalDraws);
         logInitStep("DrawBatchSystem::init");
 
+        if (TextureServer::sBindlessSupported) {
+            NC::LOGGING::Log("[DEFERRED][INIT] BindlessTextures resident=",
+                TextureServer::instance().residentTextureCount());
+        }
+
+        buildMaterialSSBO();
+        logInitStep("buildMaterialSSBO");
+
+        buildDecalMaterialSSBO();
+        logInitStep("buildDecalMaterialSSBO");
+
+        buildWaterMaterialSSBO();
+        logInitStep("buildWaterMaterialSSBO");
+
+        buildRefractionMaterialSSBO();
+        logInitStep("buildRefractionMaterialSSBO");
+
+        buildEnvAlphaMaterialSSBO();
+        logInitStep("buildEnvAlphaMaterialSSBO");
+
         BuildVisibilityGrids();
         logInitStep("BuildVisibilityGrids");
 
@@ -1409,6 +1617,267 @@ void DeferredRenderer::Initialize() {
     WriteWebSnapshot("initialize");
     logInitStep("WriteWebSnapshot");
     NC::LOGGING::Log("[DEFERRED] Initialize end");
+}
+
+void DeferredRenderer::buildMaterialSSBO() {
+    if (!TextureServer::sBindlessSupported) return;
+
+    const size_t solidCount = solidDraws.size();
+    const size_t alphaCount = alphaTestDraws.size();
+    const size_t totalCount = solidCount + alphaCount;
+    if (totalCount == 0) return;
+
+    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
+        if (!t) return fallback;
+        uint64_t h = t->GetBindlessHandle();
+        return h ? h : fallback;
+    };
+
+    std::vector<MaterialGPU> materials(totalCount);
+
+    auto fillMaterial = [&](MaterialGPU& m, const DrawCmd& dc) {
+        m.diffuseHandle  = texHandle(dc.tex[0], fallbackWhiteHandle_);
+        m.specularHandle = texHandle(dc.tex[1], fallbackBlackHandle_);
+        m.normalHandle   = texHandle(dc.tex[2], fallbackNormalHandle_);
+        m.emissiveHandle = texHandle(dc.tex[3], fallbackBlackHandle_);
+        m.emissiveIntensity = dc.cachedMatEmissiveIntensity;
+        m.specularIntensity = dc.cachedMatSpecularIntensity;
+        m.specularPower     = dc.cachedMatSpecularPower;
+        m.alphaCutoff       = dc.alphaCutoff;
+        m.flags = 0;
+        if (dc.alphaTest)       m.flags |= MATFLAG_ALPHA_TEST;
+        if (dc.cachedTwoSided)  m.flags |= MATFLAG_TWO_SIDED;
+        if (dc.cachedIsFlatNormal) m.flags |= MATFLAG_FLAT_NORMAL;
+        if (dc.receivesDecals)  m.flags |= MATFLAG_RECEIVES_DECALS;
+        if (dc.cachedIsAdditive) m.flags |= MATFLAG_ADDITIVE;
+        if (dc.cachedHasSpecMap) m.flags |= MATFLAG_HAS_SPEC_MAP;
+        m.bumpScale         = dc.cachedBumpScale;
+        m.intensity0        = dc.cachedIntensity0;
+        m.alphaBlendFactor  = dc.cachedAlphaBlendFactor;
+        m.diffMap1Handle = texHandle(dc.tex[4], 0);
+        m.specMap1Handle = texHandle(dc.tex[5], 0);
+        m.bumpMap1Handle = texHandle(dc.tex[6], 0);
+        m.maskMapHandle  = texHandle(dc.tex[7], 0);
+        m.alphaMapHandle = texHandle(dc.tex[8], 0);
+        m.cubeMapHandle  = texHandle(dc.tex[9], fallbackBlackCubeHandle_);
+        m.velocityX = dc.cachedVelocity.x;
+        m.velocityY = dc.cachedVelocity.y;
+        m.scale     = dc.cachedScale;
+        m.pad0      = 0.0f;
+    };
+
+    for (size_t i = 0; i < solidCount; ++i) {
+        solidDraws[i].gpuMaterialIndex = static_cast<uint32_t>(i);
+        fillMaterial(materials[i], solidDraws[i]);
+    }
+    for (size_t i = 0; i < alphaCount; ++i) {
+        const uint32_t idx = static_cast<uint32_t>(solidCount + i);
+        alphaTestDraws[i].gpuMaterialIndex = idx;
+        fillMaterial(materials[idx], alphaTestDraws[i]);
+    }
+
+    const size_t bytes = totalCount * sizeof(MaterialGPU);
+    if (!materialSSBO_.valid()) glGenBuffers(1, materialSSBO_.put());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialSSBO_);
+    if (bytes > materialSSBOCapacity_) {
+        materialSSBOCapacity_ = bytes;
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+            static_cast<GLsizeiptr>(materialSSBOCapacity_),
+            nullptr, GL_STATIC_DRAW);
+    }
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+        static_cast<GLsizeiptr>(bytes), materials.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    materialSSBOCount_ = totalCount;
+    materialSSBODirty_ = false;
+
+    NC::LOGGING::Log("[DEFERRED] MaterialSSBO built count=", totalCount,
+        " solid=", solidCount, " alpha=", alphaCount,
+        " bytes=", bytes);
+}
+
+void DeferredRenderer::buildDecalMaterialSSBO() {
+    if (!TextureServer::sBindlessSupported) return;
+    if (decalDraws.empty()) return;
+
+    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
+        if (!t) return fallback;
+        uint64_t h = t->GetBindlessHandle();
+        return h ? h : fallback;
+    };
+
+    const size_t count = decalDraws.size();
+    std::vector<DecalMaterialGPU> materials(count);
+    for (size_t i = 0; i < count; ++i) {
+        DrawCmd& dc = decalDraws[i];
+        DecalMaterialGPU& m = materials[i];
+        m.diffuseHandle  = texHandle(dc.tex[0], fallbackWhiteHandle_);
+        m.emissiveHandle = texHandle(dc.tex[3], fallbackBlackHandle_);
+        m.decalScale = dc.decalScale;
+        auto it = dc.shaderParamsInt.find("DecalDiffuseMode");
+        m.decalDiffuseMode = (it != dc.shaderParamsInt.end()) ? static_cast<uint32_t>(it->second) : 0u;
+        m.pad0 = 0.0f;
+        m.pad1 = 0.0f;
+        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
+    }
+
+    const size_t bytes = count * sizeof(DecalMaterialGPU);
+    if (!decalMaterialSSBO_.valid()) glGenBuffers(1, decalMaterialSSBO_.put());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, decalMaterialSSBO_);
+    if (bytes > decalMaterialSSBOCapacity_) {
+        decalMaterialSSBOCapacity_ = bytes;
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+            static_cast<GLsizeiptr>(decalMaterialSSBOCapacity_),
+            nullptr, GL_STATIC_DRAW);
+    }
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+        static_cast<GLsizeiptr>(bytes), materials.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    decalMaterialSSBOCount_ = count;
+
+    NC::LOGGING::Log("[DEFERRED] DecalMaterialSSBO built count=", count, " bytes=", bytes);
+}
+
+void DeferredRenderer::buildWaterMaterialSSBO() {
+    if (!TextureServer::sBindlessSupported) return;
+    if (waterDraws.empty()) return;
+
+    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
+        if (!t) return fallback;
+        uint64_t h = t->GetBindlessHandle();
+        return h ? h : fallback;
+    };
+
+    const size_t count = waterDraws.size();
+    std::vector<WaterMaterialGPU> materials(count);
+    for (size_t i = 0; i < count; ++i) {
+        DrawCmd& dc = waterDraws[i];
+        WaterMaterialGPU& m = materials[i];
+        m.diffuseHandle     = texHandle(dc.tex[0], fallbackWhiteHandle_);
+        m.bumpHandle        = texHandle(dc.tex[2], fallbackNormalHandle_);
+        m.emissiveHandle    = texHandle(dc.tex[3], fallbackBlackHandle_);
+        m.cubeHandle        = texHandle(dc.tex[9], fallbackBlackCubeHandle_);
+        m.intensity0        = dc.cachedIntensity0;
+        m.emissiveIntensity = dc.cachedMatEmissiveIntensity;
+        m.specularIntensity = dc.cachedMatSpecularIntensity;
+        m.bumpScale         = dc.cachedBumpScale;
+        float uvs = dc.cachedScale;
+        if (uvs <= 0.0f) uvs = 1.0f;
+        m.uvScale           = uvs;
+        m.velocityX         = dc.cachedVelocity.x;
+        m.velocityY         = dc.cachedVelocity.y;
+        m.flags = 0;
+        if (dc.cachedHasVelocity) m.flags |= WATER_FLAG_HAS_VELOCITY;
+        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
+    }
+
+    const size_t bytes = count * sizeof(WaterMaterialGPU);
+    if (!waterMaterialSSBO_.valid()) glGenBuffers(1, waterMaterialSSBO_.put());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, waterMaterialSSBO_);
+    if (bytes > waterMaterialSSBOCapacity_) {
+        waterMaterialSSBOCapacity_ = bytes;
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+            static_cast<GLsizeiptr>(waterMaterialSSBOCapacity_),
+            nullptr, GL_STATIC_DRAW);
+    }
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+        static_cast<GLsizeiptr>(bytes), materials.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    waterMaterialSSBOCount_ = count;
+    NC::LOGGING::Log("[DEFERRED] WaterMaterialSSBO built count=", count, " bytes=", bytes);
+}
+
+void DeferredRenderer::buildRefractionMaterialSSBO() {
+    if (!TextureServer::sBindlessSupported) return;
+    if (refractionDraws.empty()) return;
+
+    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
+        if (!t) return fallback;
+        uint64_t h = t->GetBindlessHandle();
+        return h ? h : fallback;
+    };
+
+    const size_t count = refractionDraws.size();
+    std::vector<RefractionMaterialGPU> materials(count);
+    for (size_t i = 0; i < count; ++i) {
+        DrawCmd& dc = refractionDraws[i];
+        RefractionMaterialGPU& m = materials[i];
+        m.distortHandle = texHandle(dc.tex[0], fallbackWhiteHandle_);
+        m.velocityX = dc.cachedVelocity.x;
+        m.velocityY = dc.cachedVelocity.y;
+        float distScale = dc.cachedIntensity0;
+        auto it = dc.shaderParamsFloat.find("distortionScale");
+        if (it != dc.shaderParamsFloat.end()) distScale = it->second;
+        m.distortionScale = distScale;
+        m.pad0 = 0.0f;
+        m.pad1 = 0.0f;
+        m.pad2 = 0.0f;
+        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
+    }
+
+    const size_t bytes = count * sizeof(RefractionMaterialGPU);
+    if (!refractionMaterialSSBO_.valid()) glGenBuffers(1, refractionMaterialSSBO_.put());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, refractionMaterialSSBO_);
+    if (bytes > refractionMaterialSSBOCapacity_) {
+        refractionMaterialSSBOCapacity_ = bytes;
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+            static_cast<GLsizeiptr>(refractionMaterialSSBOCapacity_),
+            nullptr, GL_STATIC_DRAW);
+    }
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+        static_cast<GLsizeiptr>(bytes), materials.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    refractionMaterialSSBOCount_ = count;
+    NC::LOGGING::Log("[DEFERRED] RefractionMaterialSSBO built count=", count, " bytes=", bytes);
+}
+
+void DeferredRenderer::buildEnvAlphaMaterialSSBO() {
+    if (!TextureServer::sBindlessSupported) return;
+    if (environmentAlphaDraws.empty()) return;
+
+    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
+        if (!t) return fallback;
+        uint64_t h = t->GetBindlessHandle();
+        return h ? h : fallback;
+    };
+
+    const size_t count = environmentAlphaDraws.size();
+    std::vector<EnvAlphaMaterialGPU> materials(count);
+    for (size_t i = 0; i < count; ++i) {
+        DrawCmd& dc = environmentAlphaDraws[i];
+        EnvAlphaMaterialGPU& m = materials[i];
+        m.diffuseHandle     = texHandle(dc.tex[0], fallbackWhiteHandle_);
+        m.specHandle        = texHandle(dc.tex[1], fallbackWhiteHandle_);
+        m.bumpHandle        = texHandle(dc.tex[2], fallbackNormalHandle_);
+        m.emsvHandle        = texHandle(dc.tex[3], fallbackBlackHandle_);
+        m.envCubeHandle     = texHandle(dc.tex[9], fallbackBlackCubeHandle_);
+        m.reflectivity      = dc.cachedIntensity0;
+        m.specularIntensity = dc.cachedMatSpecularIntensity;
+        m.alphaBlendFactor  = dc.cachedAlphaBlendFactor;
+        m.flags = 0;
+        if (dc.cachedTwoSided)    m.flags |= ENVALPHA_FLAG_TWO_SIDED;
+        if (dc.cachedIsFlatNormal) m.flags |= ENVALPHA_FLAG_FLAT_NORMAL;
+        m.pad0 = 0.0f;
+        m.pad1 = 0.0f;
+        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
+    }
+
+    const size_t bytes = count * sizeof(EnvAlphaMaterialGPU);
+    if (!envAlphaMaterialSSBO_.valid()) glGenBuffers(1, envAlphaMaterialSSBO_.put());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, envAlphaMaterialSSBO_);
+    if (bytes > envAlphaMaterialSSBOCapacity_) {
+        envAlphaMaterialSSBOCapacity_ = bytes;
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+            static_cast<GLsizeiptr>(envAlphaMaterialSSBOCapacity_),
+            nullptr, GL_STATIC_DRAW);
+    }
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+        static_cast<GLsizeiptr>(bytes), materials.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    envAlphaMaterialSSBOCount_ = count;
+    NC::LOGGING::Log("[DEFERRED] EnvAlphaMaterialSSBO built count=", count, " bytes=", bytes);
 }
 
 void DeferredRenderer::Shutdown() {
@@ -1471,11 +1940,22 @@ void DeferredRenderer::Shutdown() {
     }
 
     if (hasGLContext) {
+        // Clean up frame fence sync objects
+        for (int i = 0; i < kMaxFramesInFlight + 1; ++i) {
+            if (frameFences_[i]) { glDeleteSync(frameFences_[i]); frameFences_[i] = nullptr; }
+        }
         solidBatchSystem_.shutdownGL();
         alphaTestBatchSystem_.shutdownGL();
         environmentBatchSystem_.shutdownGL();
         environmentAlphaBatchSystem_.shutdownGL();
         decalBatchSystem_.shutdownGL();
+        if (fallbackWhiteHandle_) { glMakeTextureHandleNonResidentARB(fallbackWhiteHandle_); fallbackWhiteHandle_ = 0; }
+        if (fallbackBlackHandle_) { glMakeTextureHandleNonResidentARB(fallbackBlackHandle_); fallbackBlackHandle_ = 0; }
+        if (fallbackNormalHandle_) { glMakeTextureHandleNonResidentARB(fallbackNormalHandle_); fallbackNormalHandle_ = 0; }
+        if (fallbackBlackCubeHandle_) { glMakeTextureHandleNonResidentARB(fallbackBlackCubeHandle_); fallbackBlackCubeHandle_ = 0; }
+        materialSSBO_.reset();
+        materialSSBOCapacity_ = 0;
+        materialSSBOCount_ = 0;
         TextureServer::instance().clearCache(true);
         releaseOwnedGLResources();
     } else {
@@ -1488,6 +1968,7 @@ void DeferredRenderer::Shutdown() {
             MegaBuffer::instance().hasGLResources() ||
             TextureServer::instance().hasCachedTextures() ||
             shadowMatrixSSBO_ || shadowIndirectBuffer_ || pointLightInstanceVBO ||
+            materialSSBO_.valid() ||
             quadVAO || quadVBO || sphereVAO || debugCellVAO_ || debugCellVBO_ ||
             debugLineProgram_ || gDepthCopyReadFBO || gDepthDecalFBO ||
             gBuffer || lightFBO || sceneFBO || sceneFBO2 ||

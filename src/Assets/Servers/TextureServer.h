@@ -16,6 +16,8 @@ public:
         return srv;
     }
 
+    static inline bool sBindlessSupported = false;
+
     ~TextureServer() { clearCache(true); }
 
     GLuint loadTexture(const std::string& texResId) {
@@ -74,6 +76,10 @@ public:
 
     void clearCache(bool releaseGLObjects = true) {
         if (releaseGLObjects) {
+            for (auto& [_, h] : bindlessHandles_) {
+                if (h) glMakeTextureHandleNonResidentARB(h);
+            }
+            bindlessHandles_.clear();
             std::unordered_set<GLuint> released;
             released.reserve(gTexCache.size());
             for (auto& [_, tex] : gTexCache) {
@@ -82,6 +88,8 @@ public:
                     glDeleteTextures(1, &tex);
                 }
             }
+        } else {
+            bindlessHandles_.clear();
         }
         gTexCache.clear();
         gTexHasTransparency.clear();
@@ -89,10 +97,30 @@ public:
 
     bool hasCachedTextures() const { return !gTexCache.empty(); }
 
+    GLuint64 getOrCreateBindlessHandle(GLuint texID) {
+        if (!sBindlessSupported || texID == 0) return 0;
+        auto it = bindlessHandles_.find(texID);
+        if (it != bindlessHandles_.end()) return it->second;
+        GLuint64 h = glGetTextureHandleARB(texID);
+        if (h) {
+            glMakeTextureHandleResidentARB(h);
+            bindlessHandles_[texID] = h;
+        }
+        return h;
+    }
+
+    GLuint64 getBindlessHandle(GLuint texID) const {
+        auto it = bindlessHandles_.find(texID);
+        return (it != bindlessHandles_.end()) ? it->second : 0;
+    }
+
+    size_t residentTextureCount() const { return bindlessHandles_.size(); }
+
 private:
     TextureServer() = default;
     std::unordered_map<std::string, GLuint> gTexCache;
     std::unordered_map<std::string, bool> gTexHasTransparency;
+    std::unordered_map<GLuint, GLuint64> bindlessHandles_;
 
     static std::string ResolveTexturePath(const std::string& texResId) {
         namespace fs = std::filesystem;

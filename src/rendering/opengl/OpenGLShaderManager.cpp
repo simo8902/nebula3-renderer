@@ -42,10 +42,22 @@ OpenGLShaderManager::OpenGLShaderManager() {
     };
 
     CreateShader("NDEVCdeferred", SOURCE_DIR "/shaders/NDEVCdeferred.vert", SOURCE_DIR "/shaders/NDEVCdeferred.frag");
+    CreateShaderWithDefines(
+        "NDEVCdeferred_bindless",
+        SOURCE_DIR "/shaders/NDEVCdeferred.vert",
+        SOURCE_DIR "/shaders/NDEVCdeferred.frag",
+        "#define BINDLESS 1\n",
+        "#define BINDLESS 1\n");
     CreateShader("standard", SOURCE_DIR "/shaders/standard.vert", SOURCE_DIR "/shaders/standard.frag");
     CreateShader("particle", SOURCE_DIR "/shaders/particle.vert", SOURCE_DIR "/shaders/particle.frag");
     CreateShader("environment", SOURCE_DIR "/shaders/environment.vert", SOURCE_DIR "/shaders/environment.frag");
     CreateShader("environmentAlpha", SOURCE_DIR "/shaders/environment.vert", SOURCE_DIR "/shaders/environment_alpha.frag");
+    CreateShaderWithDefines(
+        "environmentAlpha_bindless",
+        SOURCE_DIR "/shaders/environment.vert",
+        SOURCE_DIR "/shaders/environment_alpha.frag",
+        "#define BINDLESS 1\n",
+        "#define BINDLESS 1\n");
     CreateShaderWithDefines(
         "simplelayer",
         SOURCE_DIR "/shaders/simplelayer.vert",
@@ -78,8 +90,26 @@ OpenGLShaderManager::OpenGLShaderManager() {
         "#define PASS 7\n");
     CreateShader("postalphaunlit", SOURCE_DIR "/shaders/postalphaunlit.vert", SOURCE_DIR "/shaders/postalphaunlit.frag");
     CreateShader("NDEVCdecal_mesh", SOURCE_DIR "/shaders/NDEVCdecal_mesh.vert", SOURCE_DIR "/shaders/NDEVCdecal_mesh.frag");
+    CreateShaderWithDefines(
+        "NDEVCdecal_mesh_bindless",
+        SOURCE_DIR "/shaders/NDEVCdecal_mesh.vert",
+        SOURCE_DIR "/shaders/NDEVCdecal_mesh.frag",
+        "#define BINDLESS 1\n",
+        "#define BINDLESS 1\n");
     CreateShader("refraction", SOURCE_DIR "/shaders/refraction.vert", SOURCE_DIR "/shaders/refraction.frag");
+    CreateShaderWithDefines(
+        "refraction_bindless",
+        SOURCE_DIR "/shaders/refraction.vert",
+        SOURCE_DIR "/shaders/refraction.frag",
+        "#define BINDLESS 1\n",
+        "#define BINDLESS 1\n");
     CreateShader("water", SOURCE_DIR "/shaders/water.vert", SOURCE_DIR "/shaders/water.frag");
+    CreateShaderWithDefines(
+        "water_bindless",
+        SOURCE_DIR "/shaders/water.vert",
+        SOURCE_DIR "/shaders/water.frag",
+        "#define BINDLESS 1\n",
+        "#define BINDLESS 1\n");
     CreateShader("lighting", SOURCE_DIR "/shaders/lighting.vert", SOURCE_DIR "/shaders/lighting.frag");
     CreateShader("lightCompose", SOURCE_DIR "/shaders/lighting.vert", SOURCE_DIR "/shaders/lightCompose.frag");
     CreateShader("lightComposition", SOURCE_DIR "/shaders/lighting.vert", SOURCE_DIR "/shaders/lightComposition.frag");

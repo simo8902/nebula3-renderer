@@ -34,10 +34,25 @@ struct EngineSystems::Impl {
                          " maxFixedUpdates=", config.maxFixedUpdatesPerFrame);
         NC::LOGGING::Log("[ENGINE] Renderer create ", (renderer ? "ok" : "null"));
         renderer->Initialize();
+
+
+		const GLubyte* version  = glGetString(GL_VERSION);
+		const GLubyte* renderer = glGetString(GL_RENDERER);
+		const GLubyte* vendor   = glGetString(GL_VENDOR);
+
+		std::cout << "GL_VERSION  : " << (version  ? (const char*)version  : "null") << '\n';
+		std::cout << "GL_RENDERER : " << (renderer ? (const char*)renderer : "null") << '\n';
+		std::cout << "GL_VENDOR   : " << (vendor   ? (const char*)vendor   : "null") << '\n';
+
         NC::LOGGING::Log("[ENGINE] Renderer initialize done");
         lastFrameTime = Clock::now();
         runtimeState = RuntimeState::Running;
         NC::LOGGING::Log("[ENGINE] Runtime state -> Running");
+
+        if (glfwExtensionSupported("GL_ARB_bindless_texture"))
+            printf("[GPU] GL_ARB_bindless_texture: SUPPORTED\n");
+        else
+            printf("[GPU] GL_ARB_bindless_texture: NOT SUPPORTED\n");
     }
 
     ~Impl() {

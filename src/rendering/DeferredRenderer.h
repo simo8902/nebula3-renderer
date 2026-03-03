@@ -9,6 +9,7 @@
 #include "Rendering/Interfaces/IRenderer.h"
 #include "Rendering/Camera.h"
 #include "Rendering/DrawCmd.h"
+#include "Rendering/MaterialGPU.h"
 #include "Rendering/Mesh.h"
 #include "Platform/NDEVcHeaders.h"
 #include "Rendering/Shader.h"
@@ -32,6 +33,7 @@
 #include "Engine/SceneManager.h"
 #include <array>
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 
 class DeferredRenderer : public NDEVC::Graphics::IRenderer {
@@ -97,6 +99,65 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 	NDEVC::Graphics::GL::UniqueBuffer shadowIndirectBuffer_;
 	size_t shadowIndirectBufferCapacity_ = 0;
 
+	// Shadow pass scratch buffers – reused each frame to eliminate per-frame heap allocs (fix #3)
+	struct ShadowCaster {
+		const DrawCmd* draw = nullptr;
+		float radius = 0.0f;
+		float viewDepth = 0.0f;
+		glm::vec3 worldCenter{0.0f};
+	};
+	struct ShadowInstancedGroup {
+		uint32_t count = 0;
+		uint32_t firstIndex = 0;
+		std::vector<glm::mat4> matrices;
+	};
+	std::vector<ShadowCaster> shadowCasters_;
+	std::vector<ShadowCaster> simpleLayerShadowCasters_;
+	bool shadowCastersDirty_ = true;
+	bool shadowCasterCacheHit_ = false;
+	std::vector<glm::mat4>    shadowMatrices_;
+	std::vector<DrawCommand>  shadowCommands_;
+	struct ShadowGeomGroup {
+		uint32_t indexCount = 0;
+		uint32_t firstIndex = 0;
+		std::vector<uint32_t> casterIndices;
+	};
+	std::vector<ShadowGeomGroup> solidShadowGeomGroups_;
+
+	// SimpleLayer shadow instancing GPU resources (fix #4)
+	NDEVC::Graphics::GL::UniqueBuffer slShadowMatrixSSBO_;
+	size_t slShadowMatrixSSBOCapacity_ = 0;
+	NDEVC::Graphics::GL::UniqueBuffer slShadowIndirectBuffer_;
+	size_t slShadowIndirectBufferCapacity_ = 0;
+
+	// SimpleLayer GBuffer instancing GPU resources (fix #4)
+	NDEVC::Graphics::GL::UniqueBuffer slGBufWorldMatSSBO_;
+	size_t slGBufWorldMatSSBOCapacity_ = 0;
+	NDEVC::Graphics::GL::UniqueBuffer slGBufInvWorldSSBO_;
+	size_t slGBufInvWorldSSBOCapacity_ = 0;
+	NDEVC::Graphics::GL::UniqueBuffer slGBufTilingSSBO_;
+	size_t slGBufTilingSSBOCapacity_ = 0;
+	NDEVC::Graphics::GL::UniqueBuffer slGBufIndirectBuffer_;
+	size_t slGBufIndirectBufferCapacity_ = 0;
+
+	// GBuffer instancing per-frame scratch vectors (reused to avoid heap allocs)
+	struct SlGBufGroup {
+		NDEVC::Graphics::ITexture* texSlot[4]{};
+		bool  alphaTest      = false;
+		float alphaClipRef   = 0.0f;
+		int   cullMode       = 0;
+		bool  receivesDecals = false;
+		uint32_t cmdOffset   = 0;
+		uint32_t cmdCount    = 0;
+	};
+	std::vector<SlGBufGroup>  slGBufGroups_;
+	std::vector<DrawCommand>  slGBufCmds_;
+	std::vector<glm::mat4>    slGBufWorldMats_;
+	std::vector<glm::mat4>    slGBufInvWorldMats_;
+	std::vector<float>        slGBufTilings_;
+	bool slGBufCacheValid_ = false;
+	uint64_t slGBufVisHash_ = 0;
+
 	struct PointLight {
 		glm::vec3 position;
 		float range;
@@ -149,6 +210,7 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 
 	bool enableVisibilityGrid_ = true;
 	bool visGridRevealedAll_ = false;
+	bool visResolveSkipped_ = false;
 	float visibleRange_ = 0.0f;         // world units; 0 = no range limit (frustum-only)
 	std::vector<int> visibleCells_;     // scratch buffer, reused per frame
 	std::vector<int> lastVisibleCells_; // previous frame's visible set (change detection)
@@ -336,6 +398,99 @@ class DeferredRenderer : public NDEVC::Graphics::IRenderer {
 			glSamplerParameteri(gSamplerShadow, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
 		}
 	}
+
+	// ── Frame profiler (Patch #5, expanded Patch #8) ─────────────────
+	struct FrameProfile {
+		// Phase totals (chrono, ms)
+		double sceneTick     = 0.0;
+		double prepareDraws  = 0.0;
+		double rebuild       = 0.0;
+		double shadowPass    = 0.0;
+		double geometryPass  = 0.0;
+		double decalPass     = 0.0;
+		double lightingPass  = 0.0;
+		double forwardPass   = 0.0;
+		double editorClear   = 0.0;
+		double imguiRender   = 0.0;
+		double swapBuffers   = 0.0;
+		double frameTotal    = 0.0;
+		// Shadow CPU breakdown
+		double shadowCasterBuild = 0.0;
+		double shadowGroup   = 0.0;
+		double shadowUpload  = 0.0;
+		double shadowDraw    = 0.0;
+		double shadowSL      = 0.0;
+		// Geometry CPU breakdown
+		double geomSetup      = 0.0;
+		double geomSolidCull  = 0.0;
+		double geomSolidFlush = 0.0;
+		double geomAlphaCull  = 0.0;
+		double geomAlphaFlush = 0.0;
+		double geomSL         = 0.0;
+		double geomEnv        = 0.0;
+		// SL sub-phases
+		double geomSLVis      = 0.0;
+		double geomSLSort     = 0.0;
+		double geomSLGroup    = 0.0;
+		double geomSLUpload   = 0.0;
+		double geomSLRender   = 0.0;
+		int    geomSLGroupCount   = 0;
+		int    geomSLVisibleCount = 0;
+		int    slCacheHit         = 0;
+		double fenceWait          = 0.0;
+		// GPU timer query results (ms)
+		double gpuShadow    = 0.0;
+		double gpuGeometry  = 0.0;
+		double gpuDecal     = 0.0;
+		double gpuLighting  = 0.0;
+		double gpuForward   = 0.0;
+		int    fwdFlushCount = 0;
+	};
+	FrameProfile frameProfile_;
+	int profileFrameCounter_ = 0;
+	static constexpr int kProfileLogInterval = 300;
+	static constexpr int kGpuQueryCount = 5;
+	GLuint gpuQueries_[kGpuQueryCount] = {};
+	bool gpuQueriesInit_ = false;
+
+	// Frame-level fence sync for GPU pacing (Patch #11)
+	static constexpr int kMaxFramesInFlight = 2;
+	GLsync frameFences_[kMaxFramesInFlight + 1] = {};
+	int frameFenceIdx_ = 0;
+
+	// GPU-driven material SSBO (Phase 2A)
+	NDEVC::GL::GLBufHandle materialSSBO_;
+	size_t materialSSBOCapacity_ = 0;
+	size_t materialSSBOCount_ = 0;
+	bool materialSSBODirty_ = true;
+	uint64_t fallbackWhiteHandle_ = 0;
+	uint64_t fallbackBlackHandle_ = 0;
+	uint64_t fallbackNormalHandle_ = 0;
+	uint64_t fallbackBlackCubeHandle_ = 0;
+	void buildMaterialSSBO();
+
+	// GPU-driven decal material SSBO (Phase 4)
+	NDEVC::GL::GLBufHandle decalMaterialSSBO_;
+	size_t decalMaterialSSBOCapacity_ = 0;
+	size_t decalMaterialSSBOCount_ = 0;
+	void buildDecalMaterialSSBO();
+
+	// GPU-driven water material SSBO (Phase 5)
+	NDEVC::GL::GLBufHandle waterMaterialSSBO_;
+	size_t waterMaterialSSBOCapacity_ = 0;
+	size_t waterMaterialSSBOCount_ = 0;
+	void buildWaterMaterialSSBO();
+
+	// GPU-driven refraction material SSBO (Phase 5)
+	NDEVC::GL::GLBufHandle refractionMaterialSSBO_;
+	size_t refractionMaterialSSBOCapacity_ = 0;
+	size_t refractionMaterialSSBOCount_ = 0;
+	void buildRefractionMaterialSSBO();
+
+	NDEVC::GL::GLBufHandle envAlphaMaterialSSBO_;
+	size_t envAlphaMaterialSSBOCapacity_ = 0;
+	size_t envAlphaMaterialSSBOCount_ = 0;
+	void buildEnvAlphaMaterialSSBO();
 
 	DrawCmd cachedObj;
 	int cachedIndex = -1;

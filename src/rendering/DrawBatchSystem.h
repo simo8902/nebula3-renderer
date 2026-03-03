@@ -114,19 +114,33 @@ public:
         size_t dynamicCount = 0;
     };
 
-    void flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTexturesToBind = 4, GLuint currentProgram = 0);
-    void flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEVC::Graphics::ISampler* samplerClamp);
+    void flush(NDEVC::Graphics::ISampler* samplerRepeat, int numTexturesToBind = 4, GLuint currentProgram = 0, bool bindlessMode = false);
+    void flushDecals(NDEVC::Graphics::ISampler* samplerRepeat, NDEVC::Graphics::ISampler* samplerClamp, bool bindlessMode = false);
     void reset(bool invalidateStaticCache = false);
     void invalidateStaticCache();
 
     const std::deque<DrawBatch*>& activeBatches() const { return active_; }
 
+    // ── Parity metrics: batch vs draw command count (Nebula framebatch parity) ──
+    struct FlushMetrics {
+        size_t batchCount = 0;
+        size_t commandCount = 0;
+    };
+    const FlushMetrics& lastFlushMetrics() const { return lastFlushMetrics_; }
+
 private:
+    FlushMetrics lastFlushMetrics_;
+    std::unordered_map<GLuint, GLint> receivesDecalsLocCache_;
     NDEVC::GL::GLBufHandle modelMatrixSSBO;
     NDEVC::GL::GLBufHandle transientModelMatrixSSBO;
     NDEVC::GL::GLBufHandle perObjectSSBO;
     NDEVC::GL::GLBufHandle indirectBuffer;
     NDEVC::GL::GLBufHandle transientIndirectBuffer;
+    void* modelMatrixPersistent_ = nullptr;
+    void* transientModelMatrixPersistent_ = nullptr;
+    void* indirectPersistent_ = nullptr;
+    void* transientIndirectPersistent_ = nullptr;
+    void* decalParamsPersistent_ = nullptr;
     size_t modelMatrixSSBOCapacity_ = 0;
     size_t transientModelMatrixSSBOCapacity_ = 0;
     size_t perObjectSSBOCapacity_ = 0;
@@ -134,17 +148,21 @@ private:
     size_t indirectBufferCapacity_ = 0;
     size_t transientIndirectBufferCapacity_ = 0;
     std::vector<glm::mat4> modelMatrices;
+    std::vector<uint32_t> materialIndices;
     std::vector<float> perObjectDataBuffer;
     std::vector<glm::vec4> decalParamsBuffer;
     std::vector<DrawCommand> dynamicPackedCommands_;
     std::vector<PackedDrawRange> packedRanges_;
     NDEVC::GL::GLBufHandle decalParamsSSBO;
+    NDEVC::GL::GLBufHandle materialIndexSSBO_;
+    size_t materialIndexSSBOCapacity_ = 0;
 
     std::unordered_map<BatchKey, DrawBatch, BatchKeyHash> batches_;
     std::deque<DrawBatch*> active_;
 
     size_t staticMatrixCount = 0;
     std::vector<glm::mat4> staticModelMatrices;
+    std::vector<uint32_t> staticMaterialIndices;
     std::unordered_map<BatchKey, std::vector<DrawCommand>, BatchKeyHash> staticBatchCommands;
     std::unordered_map<BatchKey, std::vector<size_t>, BatchKeyHash> staticBatchDrawIndices_;
     std::unordered_map<BatchKey, std::vector<std::vector<size_t>>, BatchKeyHash> staticBatchInstanceDrawIndices_;
@@ -153,6 +171,7 @@ private:
     uint64_t staticCacheSignature_ = 0;
     uint64_t staticCacheContentHash_ = 0;
     size_t staticCacheSourceCount_ = 0;
+    bool staticCacheValid_ = false;
     size_t dynamicSolidIndexSourceCount_ = 0;
     size_t dynamicSolidStaticSourceCount_ = 0;
     std::vector<size_t> dynamicSolidDrawIndices_;
@@ -178,6 +197,7 @@ private:
         uint32_t firstIndex = 0;
         float alphaCutoff = 0.5f;
         std::vector<glm::mat4> matrices;
+        std::vector<uint32_t> materialIndices;
     };
     std::unordered_map<BatchKey, std::unordered_map<uint64_t, DynamicGenericGroup>, BatchKeyHash> dynamicGroupsCache_;
 

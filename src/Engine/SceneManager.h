@@ -15,8 +15,88 @@
 #include <unordered_map>
 #include <unordered_set>
 
+// ════════════════════════════════════════════════════════════════════════
+// SceneManager — Nebula-parity lifecycle overview
+//
+// Load path (maps 1:1 to Nebula's basegamefeatureunit → render-ready):
+//   LoadMap → BuildStreamingIndex → UpdateIncrementalStreaming
+//     → LoadMapInstances / LoadMapInstanceByIndex
+//       → create RuntimeEntityRecord (Created)
+//       → setTransform (Activated)
+//       → readiness gate: IsModelRenderReady?
+//           yes → markValidAndReplay → BuildDraws (ProxyCreated)
+//                 → classify draws (InternalAttached) → (Valid)
+//           no  → PendingValid, deferred updates queued in ModelInstance
+//
+// Per-frame (maps to Nebula's framesynchandlerthread + internalgraphicsserver):
+//   Tick:  streaming → TickPendingEntities (promote PendingValid→Valid)
+//          → transform change detection → propagate to scene draws
+//   PrepareDrawLists: copy scene draws to renderer buckets
+//
+// Streaming churn:
+//   UnloadInstanceByOwner erases draws + lifecycle record
+//   ApplySceneRebuildAfterStreamingChanges refreshes mega offsets
+//     and restores isStatic flags to node mobility source-of-truth
+// ════════════════════════════════════════════════════════════════════════
 class SceneManager {
 public:
+    // ── Nebula-parity lifecycle stage enum ──────────────────────────────
+    // Maps 1:1 to Nebula's entity lifecycle ordering:
+    //   basegamefeatureunit -> loaderserver -> categorymanager ->
+    //   entityloader -> factorymanager -> entitymanager ->
+    //   graphicsproperty -> internalmodelentity
+    enum class ParityStage : int {
+        Idle            = 0,  // No load in progress
+        LevelLoad       = 1,  // loaderserver::LoadLevel
+        CategoryLoad    = 2,  // categorymanager::LoadInstances
+        EntityCreate    = 3,  // entityloader row iteration + factorymanager
+        EntityActivate  = 4,  // entitymanager::AttachEntity -> OnActivate
+        ProxyCreate     = 5,  // graphicsproperty::SetupGraphicsEntities
+        InternalAttach  = 6,  // internalmodelentityhandler -> stage attach
+        PendingValid    = 7,  // internalmodelentity async validity gate
+        Valid           = 8,  // render-ready
+        Count
+    };
+    static const char* ParityStageName(ParityStage s);
+
+    // ── Per-load/frame parity counters ─────────────────────────────────
+    struct ParityCounters {
+        int categoryRowsLoaded     = 0;  // map instance rows processed
+        int runtimeEntitiesCreated = 0;  // ModelInstance objects created
+        int entitiesActivated      = 0;  // instances with transform set
+        int graphicsProxiesCreated = 0;  // BuildDrawsWithTransform calls
+        int internalAttached       = 0;  // draws classified into buckets
+        int validRenderables       = 0;  // draws with valid mesh+megabuffer
+        int submittedDrawCommands  = 0;  // draws emitted to renderer lists
+        void reset() { *this = ParityCounters{}; }
+    };
+    const ParityCounters& GetParityCounters() const { return parityCounters_; }
+    ParityStage GetCurrentParityStage() const { return parityStage_; }
+
+    // ── Per-instance runtime lifecycle state (Nebula entity lifecycle) ──
+    // Tracks each loaded instance through a deterministic state progression
+    // matching Nebula's entity -> graphicsproperty -> internalmodelentity flow.
+    enum class EntityLifecycleState : int {
+        Created          = 0,  // ModelInstance allocated (≡ entityloader row)
+        Activated        = 1,  // Transform applied        (≡ entitymanager::AttachEntity)
+        ProxyCreated     = 2,  // Draws built              (≡ graphicsproperty::SetupGraphicsEntities)
+        InternalAttached = 3,  // Draws classified         (≡ internalmodelentityhandler stage attach)
+        PendingValid     = 4,  // Waiting for model ready  (≡ internalmodelentity async gate)
+        Valid            = 5,  // Render-ready
+        Count
+    };
+    static const char* EntityLifecycleStateName(EntityLifecycleState s);
+
+    struct RuntimeEntityRecord {
+        void*                owner       = nullptr;
+        std::string          modelPath;
+        EntityLifecycleState state       = EntityLifecycleState::Created;
+        int                  drawCount   = 0;  // draws classified for this entity
+    };
+    const std::unordered_map<void*, RuntimeEntityRecord>& GetRuntimeEntities() const
+        { return runtimeEntities_; }
+    int CountRuntimeEntitiesInState(EntityLifecycleState s) const;
+
     // Called once after the GL context and MegaBuffer exist
     void Initialize(NDEVC::Graphics::IGraphicsDevice* device,
                     NDEVC::Graphics::IShaderManager* shaderMgr);
@@ -49,6 +129,10 @@ public:
 
     // Returns true if scene draw lists changed since last PrepareDrawLists call.
     bool IsDrawListsDirty() const { return drawListsDirty_; }
+
+    // Returns true if buildMegaBuffer() was already called during this tick's
+    // streaming rebuild, so the renderer can skip the redundant Phase 4 call.
+    bool WasMegaBufferRebuiltThisTick() const { return megaBufferRebuiltThisTick_; }
 
     // Read-only accessors used by DeferredRenderer internals
     const std::string& GetCurrentMapPath() const { return currentMapSourcePath_; }
@@ -91,6 +175,8 @@ private:
         std::unordered_map<size_t, void*> loadedOwnersByMapIndex;
         double lastTickTime = 0.0;
         bool initialized = false;
+        bool stable = false;
+        int  lastStableCenterCell = -1;
     };
     StreamWindowState streamState_;
     glm::vec3 streamCameraPos_{0.0f, 0.0f, 0.0f};
@@ -114,8 +200,11 @@ private:
     std::vector<DrawCmd> sceneWaterDraws_;
     std::vector<DrawCmd> sceneParticleDraws_;
     bool drawListsDirty_ = true;
+    bool megaBufferRebuiltThisTick_ = false;
+    int pendingEntityCount_ = 0;
     std::unordered_map<void*, glm::mat4> instanceTransformCache_;
     std::unordered_set<void*> movedInstanceOwners_;
+    bool transformsStable_ = false;
 
     ModelInstance* appendN3WTransform(const std::string& path,
         const glm::vec3& pos, const glm::quat& rot, const glm::vec3& scale);
@@ -139,6 +228,25 @@ private:
         const std::string& meshResourceId);
     void NotifyWebModelUnloaded(const std::string& modelPath,
         const std::string& meshResourceId);
+
+    // ── Parity diagnostics state ───────────────────────────────────────
+    ParityStage    parityStage_ = ParityStage::Idle;
+    ParityCounters parityCounters_;
+    int            parityMapLoadSeq_ = 0;   // monotonic map load counter
+    int            parityFrameSeq_   = 0;   // monotonic frame counter
+    void ParityLogStageTransition(ParityStage next);
+    void ParityLogCounters(const char* context);
+
+    // ── Runtime entity lifecycle tracking ───────────────────────────────
+    std::unordered_map<void*, RuntimeEntityRecord> runtimeEntities_;
+    void TransitionEntity(void* owner, EntityLifecycleState newState);
+    void TickPendingEntities();
+    void MaterializeEntityDraws(void* owner, const std::string& modelPath,
+        ModelInstance& instance, const Model& model);
+
+public:
+    // Parity validation / debug dump (callable from editor or diagnostics)
+    void ParityDumpRuntimeEntities() const;
 };
 
 #endif

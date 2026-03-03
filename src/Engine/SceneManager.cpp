@@ -397,24 +397,236 @@ void RefreshMegaOffsets(std::vector<DrawCmd>& draws) {
 
 class ExternalTextureRef final : public NDEVC::Graphics::ITexture {
 public:
-    ExternalTextureRef(GLuint handle, NDEVC::Graphics::TextureType type)
-        : handle_(handle), type_(type) {}
+    ExternalTextureRef(GLuint handle, NDEVC::Graphics::TextureType type, GLuint64 bindless = 0)
+        : handle_(handle), type_(type), bindlessHandle_(bindless) {}
 
     uint32_t GetWidth() const override { return 1; }
     uint32_t GetHeight() const override { return 1; }
     NDEVC::Graphics::Format GetFormat() const override { return NDEVC::Graphics::Format::RGBA8_UNORM; }
     NDEVC::Graphics::TextureType GetType() const override { return type_; }
     void* GetNativeHandle() const override { return static_cast<void*>(const_cast<GLuint*>(&handle_)); }
+    uint64_t GetBindlessHandle() const override { return bindlessHandle_; }
 
 private:
     GLuint handle_ = 0;
     NDEVC::Graphics::TextureType type_ = NDEVC::Graphics::TextureType::Texture2D;
+    GLuint64 bindlessHandle_ = 0;
 };
 
 double NowSeconds() {
     using Clock = std::chrono::steady_clock;
     return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
 }
+}
+
+// ── Parity lifecycle diagnostics (Nebula 1:1 mapping) ──────────────────
+const char* SceneManager::ParityStageName(ParityStage s) {
+    static const char* names[] = {
+        "Idle",            // 0
+        "LevelLoad",       // 1 — loaderserver::LoadLevel
+        "CategoryLoad",    // 2 — categorymanager::LoadInstances
+        "EntityCreate",    // 3 — entityloader row iteration
+        "EntityActivate",  // 4 — entitymanager::AttachEntity
+        "ProxyCreate",     // 5 — graphicsproperty::SetupGraphicsEntities
+        "InternalAttach",  // 6 — internalmodelentityhandler
+        "PendingValid",    // 7 — async validity gate
+        "Valid",           // 8 — render-ready
+    };
+    const int idx = static_cast<int>(s);
+    if (idx >= 0 && idx < static_cast<int>(ParityStage::Count))
+        return names[idx];
+    return "Unknown";
+}
+
+void SceneManager::ParityLogStageTransition(ParityStage next) {
+    NC::LOGGING::Log("[PARITY] stage ", ParityStageName(parityStage_),
+                     " -> ", ParityStageName(next),
+                     " (mapLoad=", parityMapLoadSeq_, " frame=", parityFrameSeq_, ")");
+    parityStage_ = next;
+}
+
+void SceneManager::ParityLogCounters(const char* context) {
+    NC::LOGGING::Log("[PARITY][", (context ? context : "?"), "]"
+                     " categoryRows=",      parityCounters_.categoryRowsLoaded,
+                     " entitiesCreated=",    parityCounters_.runtimeEntitiesCreated,
+                     " entitiesActivated=",  parityCounters_.entitiesActivated,
+                     " gfxProxies=",         parityCounters_.graphicsProxiesCreated,
+                     " internalAttached=",   parityCounters_.internalAttached,
+                     " validRenderables=",   parityCounters_.validRenderables,
+                     " submittedDrawCmds=",  parityCounters_.submittedDrawCommands);
+    NC::LOGGING::Log("[PARITY][", (context ? context : "?"), "][LIFECYCLE]"
+                     " total=",             static_cast<int>(runtimeEntities_.size()),
+                     " Created=",           CountRuntimeEntitiesInState(EntityLifecycleState::Created),
+                     " Activated=",         CountRuntimeEntitiesInState(EntityLifecycleState::Activated),
+                     " ProxyCreated=",      CountRuntimeEntitiesInState(EntityLifecycleState::ProxyCreated),
+                     " InternalAttached=",  CountRuntimeEntitiesInState(EntityLifecycleState::InternalAttached),
+                     " PendingValid=",      CountRuntimeEntitiesInState(EntityLifecycleState::PendingValid),
+                     " Valid=",             CountRuntimeEntitiesInState(EntityLifecycleState::Valid));
+}
+
+const char* SceneManager::EntityLifecycleStateName(EntityLifecycleState s) {
+    static const char* names[] = {
+        "Created",          // 0
+        "Activated",        // 1
+        "ProxyCreated",     // 2
+        "InternalAttached", // 3
+        "PendingValid",     // 4
+        "Valid",            // 5
+    };
+    const int idx = static_cast<int>(s);
+    if (idx >= 0 && idx < static_cast<int>(EntityLifecycleState::Count))
+        return names[idx];
+    return "Unknown";
+}
+
+int SceneManager::CountRuntimeEntitiesInState(EntityLifecycleState s) const {
+    int n = 0;
+    for (const auto& [_, rec] : runtimeEntities_) {
+        if (rec.state == s) ++n;
+    }
+    return n;
+}
+
+void SceneManager::ParityDumpRuntimeEntities() const {
+    NC::LOGGING::Log("[PARITY][DUMP] runtime entities total=",
+                     static_cast<int>(runtimeEntities_.size()));
+
+    for (int si = 0; si < static_cast<int>(EntityLifecycleState::Count); ++si) {
+        const auto state = static_cast<EntityLifecycleState>(si);
+        int printed = 0;
+        for (const auto& [owner, rec] : runtimeEntities_) {
+            if (rec.state != state) continue;
+            if (printed == 0) {
+                NC::LOGGING::Log("[PARITY][DUMP]  state=",
+                                 EntityLifecycleStateName(state), ":");
+            }
+            NC::LOGGING::Log("[PARITY][DUMP]    owner=", owner,
+                             " model=", rec.modelPath,
+                             " draws=", rec.drawCount);
+            ++printed;
+            if (printed >= 16) {
+                const int remaining = CountRuntimeEntitiesInState(state) - printed;
+                if (remaining > 0) {
+                    NC::LOGGING::Log("[PARITY][DUMP]    ... and ",
+                                     remaining, " more in ", EntityLifecycleStateName(state));
+                }
+                break;
+            }
+        }
+    }
+}
+
+// Nebula parity: entitymanager state progression validation.
+// Detects unexpected backward/skip transitions while allowing two known-valid
+// patterns: immediate readiness (skip PendingValid) and materialization re-walk.
+void SceneManager::TransitionEntity(void* owner, EntityLifecycleState newState) {
+    auto it = runtimeEntities_.find(owner);
+    if (it == runtimeEntities_.end()) return;
+
+    const EntityLifecycleState oldState = it->second.state;
+    const int oldOrd = static_cast<int>(oldState);
+    const int newOrd = static_cast<int>(newState);
+
+    // Known valid patterns that skip or re-walk ordinals:
+    //   InternalAttached(3) → Valid(5) : immediate readiness, PendingValid skipped
+    //   PendingValid(4)     → ProxyCreated(2) : materialization re-walk after model ready
+    const bool isImmediateValid = (oldState == EntityLifecycleState::InternalAttached &&
+                                   newState == EntityLifecycleState::Valid);
+    const bool isMaterializationReWalk = (oldState == EntityLifecycleState::PendingValid &&
+                                          newState == EntityLifecycleState::ProxyCreated);
+
+    if (newOrd < oldOrd && !isMaterializationReWalk) {
+        NC::LOGGING::Warning("[PARITY][TRANSITION] backward transition owner=", owner,
+                             " ", EntityLifecycleStateName(oldState),
+                             "->", EntityLifecycleStateName(newState),
+                             " model=", it->second.modelPath);
+    } else if (newOrd > oldOrd + 1 && !isImmediateValid) {
+        NC::LOGGING::Warning("[PARITY][TRANSITION] skip transition owner=", owner,
+                             " ", EntityLifecycleStateName(oldState),
+                             "->", EntityLifecycleStateName(newState),
+                             " model=", it->second.modelPath);
+    }
+
+    if (oldState == EntityLifecycleState::PendingValid && newState != EntityLifecycleState::PendingValid) {
+        --pendingEntityCount_;
+    }
+    if (newState == EntityLifecycleState::PendingValid && oldState != EntityLifecycleState::PendingValid) {
+        ++pendingEntityCount_;
+    }
+
+    it->second.state = newState;
+}
+
+// Nebula parity: graphicsproperty::SetupGraphicsEntities → internalmodelentityhandler
+// → stage attach → render-ready.  Builds draws, classifies into buckets, transitions
+// the runtime entity through ProxyCreated → InternalAttached → Valid in one call.
+void SceneManager::MaterializeEntityDraws(void* owner, const std::string& modelPath,
+    ModelInstance& instance, const Model& model) {
+    std::vector<DrawCmd> draws;
+    BuildDrawsWithTransform(model, instance.getTransform(), owner, draws);
+    ++parityCounters_.graphicsProxiesCreated;
+    TransitionEntity(owner, EntityLifecycleState::ProxyCreated);
+
+    int entityDrawCount = 0;
+    for (auto& dc : draws) {
+        if (dc.sourceNode && !dc.sourceNode->mesh_ressource_id.empty()) {
+            instanceMeshResourceByOwner_[owner] = dc.sourceNode->mesh_ressource_id;
+            loadedMeshByModelPath_[modelPath] = dc.sourceNode->mesh_ressource_id;
+        }
+        ++parityCounters_.internalAttached;
+        ++entityDrawCount;
+        switch (DetermineDrawBucket(dc)) {
+        case DrawBucket::Decal:       sceneDecalDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::Water:       sceneWaterDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::Refraction:  sceneRefractionDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::PostAlphaUnlit: scenePostAlphaUnlitDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::SimpleLayer: sceneSimpleLayerDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::EnvironmentAlpha: sceneEnvironmentAlphaDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::Environment: sceneEnvironmentDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::AlphaTest:   sceneAlphaTestDraws_.push_back(std::move(dc)); break;
+        case DrawBucket::Solid:
+        default:                      sceneSolidDraws_.push_back(std::move(dc)); break;
+        }
+    }
+
+    auto recIt = runtimeEntities_.find(owner);
+    if (recIt != runtimeEntities_.end()) {
+        recIt->second.drawCount = entityDrawCount;
+    }
+    TransitionEntity(owner, EntityLifecycleState::InternalAttached);
+    TransitionEntity(owner, EntityLifecycleState::Valid);
+    drawListsDirty_ = true;
+}
+
+// Nebula parity: per-frame promotion of entities whose models became render-ready.
+// Equivalent to internalmodelentity's async validity gate resolving on the next
+// frame sync after the managed resource reaches Loaded state.
+void SceneManager::TickPendingEntities() {
+    if (pendingEntityCount_ <= 0) return;
+
+    for (auto& [owner, rec] : runtimeEntities_) {
+        if (rec.state != EntityLifecycleState::PendingValid) continue;
+        if (!ModelServer::instance().IsModelRenderReady(rec.modelPath)) continue;
+
+        // Find the ModelInstance for this owner
+        ModelInstance* inst = nullptr;
+        for (const auto& mi : instances) {
+            if (mi && static_cast<void*>(mi.get()) == owner) {
+                inst = mi.get();
+                break;
+            }
+        }
+        if (!inst) continue;
+
+        auto m = inst->getModel();
+        if (!m) continue;
+
+        // Consume deferred queue exactly once
+        auto replayed = inst->markValidAndReplay();
+        (void)replayed;
+
+        MaterializeEntityDraws(owner, rec.modelPath, *inst, *m);
+    }
 }
 
 void SceneManager::Initialize(NDEVC::Graphics::IGraphicsDevice* device,
@@ -435,6 +647,12 @@ void SceneManager::AppendModel(const std::string& path, const glm::vec3& pos,
 
 void SceneManager::LoadMap(const MapData* map) {
     NC::LOGGING::Log("[SCENE] LoadMap begin ptr=", (map ? 1 : 0));
+
+    // ── Parity: reset counters, advance map-load sequence ──
+    parityCounters_.reset();
+    ++parityMapLoadSeq_;
+    ParityLogStageTransition(ParityStage::LevelLoad);
+
     ResetStreamingState();
     instances.clear();
     particleNodes.clear();
@@ -458,6 +676,9 @@ void SceneManager::LoadMap(const MapData* map) {
     sceneParticleDraws_.clear();
     instanceTransformCache_.clear();
     movedInstanceOwners_.clear();
+    transformsStable_ = false;
+    runtimeEntities_.clear();
+    pendingEntityCount_ = 0;
 
     if (!map) {
         ownedCurrentMap_.reset();
@@ -573,6 +794,23 @@ void SceneManager::LoadMap(const MapData* map) {
     }
 
     drawListsDirty_ = true;
+
+    // ── Parity: count valid renderables (draws with mesh) ──
+    auto countValid = [](const std::vector<DrawCmd>& draws) -> int {
+        int n = 0;
+        for (const auto& dc : draws) { if (dc.mesh) ++n; }
+        return n;
+    };
+    parityCounters_.validRenderables =
+        countValid(sceneSolidDraws_) + countValid(sceneAlphaTestDraws_) +
+        countValid(sceneDecalDraws_) + countValid(sceneEnvironmentDraws_) +
+        countValid(sceneEnvironmentAlphaDraws_) + countValid(sceneSimpleLayerDraws_) +
+        countValid(sceneRefractionDraws_) + countValid(scenePostAlphaUnlitDraws_) +
+        countValid(sceneWaterDraws_);
+
+    ParityLogStageTransition(ParityStage::Valid);
+    ParityLogCounters("MAP_LOAD_END");
+
     NC::LOGGING::Log("[SCENE] LoadMap end instances=", instances.size(),
                      " solid=", sceneSolidDraws_.size(),
                      " alpha=", sceneAlphaTestDraws_.size(),
@@ -630,24 +868,35 @@ void SceneManager::Clear() {
     sceneParticleDraws_.clear();
     instanceTransformCache_.clear();
     movedInstanceOwners_.clear();
+    transformsStable_ = false;
+    runtimeEntities_.clear();
+    pendingEntityCount_ = 0;
     drawListsDirty_ = true;
     NC::LOGGING::Log("[SCENE] Clear end");
 }
 
 void SceneManager::Tick(double dt, const Camera& camera) {
     (void)dt;
+    megaBufferRebuiltThisTick_ = false;
     streamCameraPos_ = camera.getPosition();
     streamCameraValid_ = true;
     UpdateIncrementalStreaming(false);
 
+    // ── Parity: promote PendingValid entities whose models are now ready ──
+    TickPendingEntities();
+
     movedInstanceOwners_.clear();
-    std::unordered_set<void*> liveOwners;
-    liveOwners.reserve(instances.size());
+
+    // When transforms were stable last frame and no scene changes occurred
+    // (drawListsDirty_ signals streaming/pending entity modifications),
+    // skip the 3380-instance hash-map lookup + 16-float comparison loop.
+    if (transformsStable_ && !drawListsDirty_) {
+        return;
+    }
 
     for (const auto& instance : instances) {
         if (!instance) continue;
         void* owner = static_cast<void*>(instance.get());
-        liveOwners.insert(owner);
 
         const glm::mat4 currentTransform = instance->getTransform();
         auto cacheIt = instanceTransformCache_.find(owner);
@@ -663,13 +912,7 @@ void SceneManager::Tick(double dt, const Camera& camera) {
         }
     }
 
-    for (auto it = instanceTransformCache_.begin(); it != instanceTransformCache_.end();) {
-        if (liveOwners.find(it->first) == liveOwners.end()) {
-            it = instanceTransformCache_.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    transformsStable_ = movedInstanceOwners_.empty();
 
     if (!movedInstanceOwners_.empty()) {
         PropagateMovedInstanceTransformsToAllSceneDraws();
@@ -762,6 +1005,16 @@ void SceneManager::PrepareDrawLists(
     collectAnimated(postAlphaUnlitDraws);
     collectAnimated(waterDraws);
     collectAnimated(particleDraws);
+
+    // ── Parity: count submitted draw commands for this frame ──
+    ++parityFrameSeq_;
+    parityCounters_.submittedDrawCommands =
+        static_cast<int>(solidDraws.size() + alphaTestDraws.size() +
+                         decalDraws.size() + environmentDraws.size() +
+                         environmentAlphaDraws.size() + simpleLayerDraws.size() +
+                         refractionDraws.size() + postAlphaUnlitDraws.size() +
+                         waterDraws.size() + particleDraws.size());
+
     NC::LOGGING::Log("[SCENE] PrepareDrawLists solid=", solidDraws.size(),
                      " alpha=", alphaTestDraws.size(),
                      " decals=", decalDraws.size(),
@@ -775,6 +1028,8 @@ void SceneManager::PrepareDrawLists(
                      " animated=", animatedDraws.size());
 }
 
+// Propagates runtime transform changes into scene draw worldMatrix/rootMatrix.
+// Also resets invWorldMatrixHash to force GBuffer inverse recomputation.
 void SceneManager::PropagateMovedInstanceTransforms(std::vector<DrawCmd>& draws) {
     if (draws.empty() || movedInstanceOwners_.empty()) {
         return;
@@ -822,6 +1077,7 @@ void SceneManager::PropagateMovedInstanceTransforms(std::vector<DrawCmd>& draws)
         }
         dc.cullBoundsValid = false;
         dc.cullTransformHash = 0ull;
+        dc.invWorldMatrixHash = ~0ull;
         dc.frustumCulled = false;
         if (dc.isStatic) {
             // Avoid stale static-batch matrices after runtime transform changes.
@@ -870,15 +1126,39 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
     instance->setTransform(pos, rot, scale);
     ModelInstance* rawInstance = instance.get();
     void* owner = static_cast<void*>(rawInstance);
+
+    // ── Lifecycle record for runtime-appended model ──
+    RuntimeEntityRecord rec;
+    rec.owner     = owner;
+    rec.modelPath = modelPath;
+    rec.state     = EntityLifecycleState::Created;
+    runtimeEntities_[owner] = std::move(rec);
+    TransitionEntity(owner, EntityLifecycleState::Activated);
+
     instances.push_back(instance);
     instanceSpawnTimes[owner] = 0.0;
     instanceModelPathByOwner_[owner] = modelPath;
     ++loadedModelRefCountByPath_[modelPath];
 
+    // ── Readiness gate ──
+    if (!ModelServer::instance().IsModelRenderReady(modelPath)) {
+        TransitionEntity(owner, EntityLifecycleState::PendingValid);
+        drawListsDirty_ = true;
+        NC::LOGGING::Log("[SCENE] appendN3WTransform pending path=", modelPath);
+        return rawInstance;
+    }
+
+    // Model ready — consume deferred queue, build draws
+    auto replayed = instance->markValidAndReplay();
+    (void)replayed;
+
     std::vector<DrawCmd> newDraws;
     BuildDrawsWithTransform(*model, rawInstance->getTransform(), owner, newDraws);
+    TransitionEntity(owner, EntityLifecycleState::ProxyCreated);
 
-    auto classifyDraw = [this](DrawCmd&& dc) {
+    int entityDrawCount = 0;
+    auto classifyDraw = [this, &entityDrawCount](DrawCmd&& dc) {
+        ++entityDrawCount;
         switch (DetermineDrawBucket(dc)) {
         case DrawBucket::Decal:
             sceneDecalDraws_.push_back(std::move(dc));
@@ -918,6 +1198,17 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
             }
             classifyDraw(std::move(dc));
         }
+
+    // ── Lifecycle: InternalAttached → Valid (readiness gate passed) ──
+    {
+        auto recIt = runtimeEntities_.find(owner);
+        if (recIt != runtimeEntities_.end()) {
+            recIt->second.drawCount = entityDrawCount;
+        }
+    }
+    TransitionEntity(owner, EntityLifecycleState::InternalAttached);
+    TransitionEntity(owner, EntityLifecycleState::Valid);
+
     drawListsDirty_ = true;
     NC::LOGGING::Log("[SCENE] appendN3WTransform success path=", modelPath,
                      " draws=", newDraws.size(),
@@ -945,7 +1236,8 @@ NDEVC::Graphics::ITexture* SceneManager::GetOrCreateTextureRef(
         return nullptr;
     }
 
-    auto wrapped = std::make_shared<ExternalTextureRef>(handle, type);
+    const GLuint64 bindless = TextureServer::instance().getOrCreateBindlessHandle(handle);
+    auto wrapped = std::make_shared<ExternalTextureRef>(handle, type, bindless);
     NDEVC::Graphics::ITexture* raw = wrapped.get();
     textureRefsByResourceId_.emplace(cacheKey, std::move(wrapped));
     return raw;
@@ -977,6 +1269,8 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
         DrawCmd dc;
         dc.mesh = mesh;
         dc.shdr = node->shader;
+        dc.shadowFiltered = (dc.shdr == "shd:water" || dc.shdr == "shd:decal" ||
+                             dc.shdr == "shd:simplelayer" || dc.shdr == "shd:uvanimated");
         dc.nodeName = node->node_name;
         dc.modelNodeType = node->model_node_type;
         dc.rootMatrix = instanceTransform;
@@ -1126,6 +1420,10 @@ void SceneManager::LoadMapInstances(const MapData* map) {
         NC::LOGGING::Warning("[SCENE] LoadMapInstances skipped (null map)");
         return;
     }
+
+    // ── Parity: CategoryLoad stage (≡ categorymanager::LoadInstances) ──
+    ParityLogStageTransition(ParityStage::CategoryLoad);
+
     size_t skippedInvalidTemplate = 0;
     size_t skippedInvalidResource = 0;
     size_t skippedEmptyPath = 0;
@@ -1134,7 +1432,12 @@ void SceneManager::LoadMapInstances(const MapData* map) {
     size_t loadedInstances = 0;
     NC::LOGGING::Log("[SCENE] LoadMapInstances begin mapInstances=", map->instances.size());
 
+    // ── Parity: EntityCreate stage (≡ entityloader row iteration) ──
+    ParityLogStageTransition(ParityStage::EntityCreate);
+
     for (const auto& inst : map->instances) {
+        ++parityCounters_.categoryRowsLoaded;
+
         if (inst.templ_index < 0 || static_cast<size_t>(inst.templ_index) >= map->templates.size()) {
             ++skippedInvalidTemplate;
             continue;
@@ -1168,6 +1471,16 @@ void SceneManager::LoadMapInstances(const MapData* map) {
             ++skippedInstanceCreate;
             continue;
         }
+        ++parityCounters_.runtimeEntitiesCreated;
+
+        void* owner = static_cast<void*>(modelInstance.get());
+
+        // ── Lifecycle: Created ──
+        RuntimeEntityRecord rec;
+        rec.owner     = owner;
+        rec.modelPath = modelPath;
+        rec.state     = EntityLifecycleState::Created;
+        runtimeEntities_[owner] = std::move(rec);
 
         const glm::vec3 pos(inst.pos.x, inst.pos.y, inst.pos.z);
         const glm::quat rot(inst.rot.w, inst.rot.x, inst.rot.y, inst.rot.z);
@@ -1175,17 +1488,34 @@ void SceneManager::LoadMapInstances(const MapData* map) {
             ? glm::vec3(inst.scale.x, inst.scale.y, inst.scale.z)
             : glm::vec3(1.0f);
         modelInstance->setTransform(pos, rot, scale);
+        ++parityCounters_.entitiesActivated;
+        TransitionEntity(owner, EntityLifecycleState::Activated);
 
-        void* owner = static_cast<void*>(modelInstance.get());
         instances.push_back(modelInstance);
         instanceSpawnTimes[owner] = 0.0;
         instanceModelPathByOwner_[owner] = modelPath;
         ++loadedModelRefCountByPath_[modelPath];
 
+        // ── Readiness gate: only build draws for render-ready models ──
+        if (!ModelServer::instance().IsModelRenderReady(modelPath)) {
+            TransitionEntity(owner, EntityLifecycleState::PendingValid);
+            ++loadedInstances;
+            continue;
+        }
+
+        // Model ready — consume deferred queue, build draws
+        auto replayed = modelInstance->markValidAndReplay();
+        (void)replayed; // transform already applied to matrix
+
         std::vector<DrawCmd> draws;
         BuildDrawsWithTransform(*model, modelInstance->getTransform(), owner, draws);
+        ++parityCounters_.graphicsProxiesCreated;
+        TransitionEntity(owner, EntityLifecycleState::ProxyCreated);
 
-        auto classifyDraw = [this](DrawCmd&& dc) {
+        int entityDrawCount = 0;
+        auto classifyDraw = [this, &entityDrawCount](DrawCmd&& dc) {
+            ++parityCounters_.internalAttached;
+            ++entityDrawCount;
             switch (DetermineDrawBucket(dc)) {
             case DrawBucket::Decal:
                 sceneDecalDraws_.push_back(std::move(dc));
@@ -1225,11 +1555,27 @@ void SceneManager::LoadMapInstances(const MapData* map) {
             }
             classifyDraw(std::move(dc));
         }
+
+        // ── Lifecycle: InternalAttached → Valid (readiness gate passed) ──
+        {
+            auto recIt = runtimeEntities_.find(owner);
+            if (recIt != runtimeEntities_.end()) {
+                recIt->second.drawCount = entityDrawCount;
+            }
+        }
+        TransitionEntity(owner, EntityLifecycleState::InternalAttached);
+        TransitionEntity(owner, EntityLifecycleState::Valid);
+
         ++loadedInstances;
         if ((loadedInstances % 256) == 0) {
             NC::LOGGING::Log("[SCENE] LoadMapInstances progress loaded=", loadedInstances);
         }
     }
+
+    // ── Parity: transition through proxy/attach stages ──
+    ParityLogStageTransition(ParityStage::ProxyCreate);
+    ParityLogStageTransition(ParityStage::InternalAttach);
+
     NC::LOGGING::Log("[SCENE] LoadMapInstances end loaded=", loadedInstances,
                      " skippedInvalidTemplate=", skippedInvalidTemplate,
                      " skippedInvalidResource=", skippedInvalidResource,
@@ -1237,6 +1583,7 @@ void SceneManager::LoadMapInstances(const MapData* map) {
                      " skippedModelLoad=", skippedModelLoad,
                      " skippedInstanceCreate=", skippedInstanceCreate,
                      " totalInstances=", instances.size());
+    ParityLogCounters("LOAD_INSTANCES_END");
 }
 
 void SceneManager::ResetStreamingState() {
@@ -1344,6 +1691,18 @@ ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t m
     if (!modelInstance) {
         return nullptr;
     }
+    ++parityCounters_.categoryRowsLoaded;
+    ++parityCounters_.runtimeEntitiesCreated;
+
+    ModelInstance* rawInstance = modelInstance.get();
+    void* owner = static_cast<void*>(rawInstance);
+
+    // ── Lifecycle: Created ──
+    RuntimeEntityRecord rec;
+    rec.owner     = owner;
+    rec.modelPath = modelPath;
+    rec.state     = EntityLifecycleState::Created;
+    runtimeEntities_[owner] = std::move(rec);
 
     const glm::vec3 pos(inst.pos.x, inst.pos.y, inst.pos.z);
     const glm::quat rot(inst.rot.w, inst.rot.x, inst.rot.y, inst.rot.z);
@@ -1351,18 +1710,35 @@ ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t m
         ? glm::vec3(inst.scale.x, inst.scale.y, inst.scale.z)
         : glm::vec3(1.0f);
     modelInstance->setTransform(pos, rot, scale);
+    ++parityCounters_.entitiesActivated;
+    TransitionEntity(owner, EntityLifecycleState::Activated);
 
-    ModelInstance* rawInstance = modelInstance.get();
-    void* owner = static_cast<void*>(rawInstance);
     instances.push_back(modelInstance);
     instanceSpawnTimes[owner] = 0.0;
     instanceModelPathByOwner_[owner] = modelPath;
     ++loadedModelRefCountByPath_[modelPath];
 
+    // ── Readiness gate: only build draws for render-ready models ──
+    if (!ModelServer::instance().IsModelRenderReady(modelPath)) {
+        TransitionEntity(owner, EntityLifecycleState::PendingValid);
+        streamState_.loadedOwnersByMapIndex[mapIndex] = owner;
+        drawListsDirty_ = true;
+        return rawInstance;
+    }
+
+    // Model ready — consume deferred queue, build draws
+    auto replayed = modelInstance->markValidAndReplay();
+    (void)replayed;
+
     std::vector<DrawCmd> draws;
     BuildDrawsWithTransform(*model, modelInstance->getTransform(), owner, draws);
+    ++parityCounters_.graphicsProxiesCreated;
+    TransitionEntity(owner, EntityLifecycleState::ProxyCreated);
 
-    auto classifyDraw = [this](DrawCmd&& dc) {
+    int entityDrawCount = 0;
+    auto classifyDraw = [this, &entityDrawCount](DrawCmd&& dc) {
+        ++parityCounters_.internalAttached;
+        ++entityDrawCount;
         switch (DetermineDrawBucket(dc)) {
         case DrawBucket::Decal:
             sceneDecalDraws_.push_back(std::move(dc));
@@ -1406,6 +1782,16 @@ ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t m
         }
         classifyDraw(std::move(dc));
     }
+
+    // ── Lifecycle: InternalAttached → Valid (readiness gate passed) ──
+    {
+        auto recIt = runtimeEntities_.find(owner);
+        if (recIt != runtimeEntities_.end()) {
+            recIt->second.drawCount = entityDrawCount;
+        }
+    }
+    TransitionEntity(owner, EntityLifecycleState::InternalAttached);
+    TransitionEntity(owner, EntityLifecycleState::Valid);
 
     streamState_.loadedOwnersByMapIndex[mapIndex] = owner;
     drawListsDirty_ = true;
@@ -1478,6 +1864,15 @@ void SceneManager::UnloadInstanceByOwner(void* owner) {
     instanceMeshResourceByOwner_.erase(owner);
     instanceTransformCache_.erase(owner);
     movedInstanceOwners_.erase(owner);
+    {
+        auto recIt = runtimeEntities_.find(owner);
+        if (recIt != runtimeEntities_.end()) {
+            if (recIt->second.state == EntityLifecycleState::PendingValid) {
+                --pendingEntityCount_;
+            }
+            runtimeEntities_.erase(recIt);
+        }
+    }
 
     if (!modelPath.empty()) {
         auto refIt = loadedModelRefCountByPath_.find(modelPath);
@@ -1515,10 +1910,53 @@ void SceneManager::RebuildNodeMapFromInstances() {
     }
 }
 
+// Nebula parity: post-streaming rebuild ensures deterministic re-materialization.
+// Refreshes GPU buffer offsets and restores isStatic flags to source-of-truth
+// after streaming churn, preventing stale state from leaking across load/unload.
 void SceneManager::ApplySceneRebuildAfterStreamingChanges(bool meshLayoutChanged) {
     if (meshLayoutChanged) {
         MeshServer::instance().buildMegaBuffer();
+        megaBufferRebuiltThisTick_ = true;
+
+        // Refresh mega offsets on scene draws so they don't hold stale
+        // values from before the MegaBuffer rebuild.
+        RefreshMegaOffsets(sceneSolidDraws_);
+        RefreshMegaOffsets(sceneAlphaTestDraws_);
+        RefreshMegaOffsets(sceneDecalDraws_);
+        RefreshMegaOffsets(sceneEnvironmentDraws_);
+        RefreshMegaOffsets(sceneEnvironmentAlphaDraws_);
+        RefreshMegaOffsets(sceneSimpleLayerDraws_);
+        RefreshMegaOffsets(sceneRefractionDraws_);
+        RefreshMegaOffsets(scenePostAlphaUnlitDraws_);
+        RefreshMegaOffsets(sceneWaterDraws_);
+        RefreshMegaOffsets(sceneParticleDraws_);
     }
+
+    // Restore isStatic flags to source-of-truth values.
+    // PropagateMovedInstanceTransforms demotes isStatic→false on runtime
+    // transform changes.  After streaming churn, re-evaluate from the
+    // authoritative node mobility hint so static draws regain batch eligibility.
+    auto restoreStaticFlags = [](std::vector<DrawCmd>& draws) {
+        for (auto& dc : draws) {
+            if (!dc.sourceNode) continue;
+            if (dc.hasPotentialTransformAnimation || dc.hasShaderVarAnimations) {
+                dc.isStatic = false;
+            } else {
+                const NodeMobilityHint hint = ResolveNodeMobilityHint(dc.sourceNode);
+                dc.isStatic = (hint != NodeMobilityHint::Dynamic);
+            }
+        }
+    };
+    restoreStaticFlags(sceneSolidDraws_);
+    restoreStaticFlags(sceneAlphaTestDraws_);
+    restoreStaticFlags(sceneDecalDraws_);
+    restoreStaticFlags(sceneEnvironmentDraws_);
+    restoreStaticFlags(sceneEnvironmentAlphaDraws_);
+    restoreStaticFlags(sceneSimpleLayerDraws_);
+    restoreStaticFlags(sceneRefractionDraws_);
+    restoreStaticFlags(scenePostAlphaUnlitDraws_);
+    restoreStaticFlags(sceneWaterDraws_);
+
     RebuildNodeMapFromInstances();
     drawListsDirty_ = true;
 }
@@ -1543,6 +1981,28 @@ void SceneManager::UpdateIncrementalStreaming(bool forceFullSync) {
         return;
     }
     streamState_.lastTickTime = nowSec;
+
+    // ── Stable-state short-circuit ──
+    // When all target instances are already loaded and none need unloading,
+    // the streaming tick wastes 5-8ms rebuilding an unordered_set of 3380
+    // entries + doing ~6760 hash lookups for zero net work. Since
+    // enableIncrementalStreaming_ is false, the target set is always ALL
+    // instances, so once everything is loaded the result never changes.
+    // When incremental IS enabled, the target set only changes when the
+    // camera moves to a different streaming cell.
+    if (!forceFullSync && streamState_.stable) {
+        if (!enableIncrementalStreaming_) {
+            return;
+        }
+        const int curCell = streamCameraValid_
+            ? ComputeStreamingCellIndex(streamCameraPos_)
+            : -1;
+        if (curCell == streamState_.lastStableCenterCell) {
+            return;
+        }
+        streamState_.lastStableCenterCell = curCell;
+        streamState_.stable = false;
+    }
 
     std::vector<size_t> targetMapIndices;
     if (forceFullSync || !enableIncrementalStreaming_ || !streamCameraValid_) {
@@ -1632,12 +2092,18 @@ void SceneManager::UpdateIncrementalStreaming(bool forceFullSync) {
     }
 
     if (loadedCount > 0 || unloadedCount > 0) {
+        streamState_.stable = false;
         ApplySceneRebuildAfterStreamingChanges(meshLayoutChanged);
         NC::LOGGING::Log("[SCENE][STREAM] Update loaded=", loadedCount,
                          " unloaded=", unloadedCount,
                          " loadedNow=", streamState_.loadedOwnersByMapIndex.size(),
                          " target=", targetSet.size(),
                          " force=", forceFullSync ? 1 : 0);
+    } else {
+        streamState_.stable = true;
+        if (enableIncrementalStreaming_ && streamCameraValid_) {
+            streamState_.lastStableCenterCell = ComputeStreamingCellIndex(streamCameraPos_);
+        }
     }
 }
 

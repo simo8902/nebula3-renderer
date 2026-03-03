@@ -26,6 +26,7 @@ public:
     virtual Format GetFormat() const = 0;
     virtual TextureType GetType() const = 0;
     virtual void* GetNativeHandle() const = 0;
+    virtual uint64_t GetBindlessHandle() const { return 0; }
 };
 
 }

@@ -32,6 +32,8 @@ struct DrawCmd {
 	mutable float cullWorldRadius = 0.0f;
 	mutable bool cullBoundsValid = false;
 	mutable uint64_t cullTransformHash = 0ull;
+	mutable glm::mat4 cachedInvWorldMatrix{1.0f};
+	mutable uint64_t  invWorldMatrixHash = ~0ull;
 
 	int group = -1;
 	NDEVC::Graphics::ITexture* tex[12]{};
@@ -58,6 +60,7 @@ struct DrawCmd {
 	bool disabled = false;
 	mutable bool frustumCulled = false;
 	bool isStatic = true;
+	uint32_t gpuMaterialIndex = UINT32_MAX;
 
 	// Pre-cached at load time — eliminates per-frame unordered_map lookups
 	bool cachedIsAdditive = false;
@@ -75,5 +78,6 @@ struct DrawCmd {
 	float cachedBumpScale = 1.0f;
 	float cachedAlphaBlendFactor = 1.0f;
 	glm::vec2 cachedVelocity{ 0.0f, 0.0f };
+	bool shadowFiltered = false;
 };
 #endif
