@@ -37,6 +37,7 @@ OpenGLShaderManager::OpenGLShaderManager() {
             throw NC::Errors::LoggedRuntimeError(name + " shader init failed");
         }
         shaders_[name] = shader;
+        RegisterShaderFileDependencies(name, shader);
         const GLuint programId = shader->GetNativeHandle()
             ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle())
             : 0;
@@ -52,6 +53,7 @@ OpenGLShaderManager::OpenGLShaderManager() {
             throw NC::Errors::LoggedRuntimeError(name + " shader init failed");
         }
         shaders_[name] = shader;
+        RegisterShaderFileDependencies(name, shader);
         const GLuint programId = shader->GetNativeHandle()
             ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle())
             : 0;
@@ -253,7 +255,7 @@ void OpenGLShaderManager::UpdateFileMonitoring() {
     }
 
     std::unordered_map<std::string, std::filesystem::file_time_type> changedTimestamps;
-    std::unordered_set<std::string> changedShaders;
+    std::unordered_set<std::string> changedMaterials;
     for (const auto& watched : watchedPaths) {
         std::error_code ec;
         const std::filesystem::path fsPath(watched.path);
@@ -279,17 +281,17 @@ void OpenGLShaderManager::UpdateFileMonitoring() {
         auto snapshotIt = timestampsSnapshot.find(watched.path);
         if (snapshotIt == timestampsSnapshot.end() || snapshotIt->second != ftime) {
             changedTimestamps[watched.path] = ftime;
-            changedShaders.insert(watched.name);
+            changedMaterials.insert(watched.name);
             NC::LOGGING::Log("[GL_SHADER_MGR] File changed name=", watched.name, " path=", watched.path);
         }
     }
 
-    if (!changedShaders.empty()) {
+    if (!changedMaterials.empty()) {
         std::lock_guard<std::mutex> lock(shaderMutex_);
         for (const auto& [path, ftime] : changedTimestamps) {
             fileTimestamps_[path] = ftime;
         }
-        pendingReloads_.insert(changedShaders.begin(), changedShaders.end());
+        pendingReloads_.insert(changedMaterials.begin(), changedMaterials.end());
     }
 }
 
@@ -371,6 +373,7 @@ void OpenGLShaderManager::LoadShader(const std::filesystem::path& path) {
 
             if (shader->IsValid()) {
                 shaders_[baseName] = shader;
+                RegisterShaderFileDependencies(baseName, shader);
                 std::error_code ecVert;
                 std::error_code ecFrag;
                 const auto vertTime = std::filesystem::last_write_time(vertPath, ecVert);
@@ -394,6 +397,7 @@ void OpenGLShaderManager::LoadShader(const std::filesystem::path& path) {
 
             if (shader->IsValid()) {
                 shaders_[baseName] = shader;
+                RegisterShaderFileDependencies(baseName, shader);
                 std::error_code ecTime;
                 const auto ftime = std::filesystem::last_write_time(path, ecTime);
                 if (ecTime) {
@@ -441,6 +445,19 @@ void OpenGLShaderManager::HandleFileDrop(const std::vector<std::string>& paths) 
     for(const auto& path : paths) {
         NC::LOGGING::Log("[GL_SHADER_MGR] HandleFileDrop path=", path);
         LoadShader(path);
+    }
+}
+
+void OpenGLShaderManager::RegisterShaderFileDependencies(const std::string& materialName, const std::shared_ptr<IShader>& shader) {
+    auto glShader = std::dynamic_pointer_cast<OpenGLShader>(shader);
+    if (!glShader) return;
+    
+    const auto& paths = glShader->GetPaths();
+    if (!paths.vertex.empty()) {
+        pathToMaterialsMap_[paths.vertex].insert(materialName);
+    }
+    if (!paths.fragment.empty() && paths.fragment != paths.vertex) {
+        pathToMaterialsMap_[paths.fragment].insert(materialName);
     }
 }
 
