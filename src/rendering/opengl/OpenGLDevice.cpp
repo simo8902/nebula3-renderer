@@ -18,12 +18,14 @@ OpenGLDevice::OpenGLDevice()
         boundTextures_[i] = 0;
         boundTextureTargets_[i] = GL_TEXTURE_2D;
     }
+    /*
     if (!GLAD_GL_ARB_shader_storage_buffer_object)
         NC::LOGGING::Warning("[GL] GL_ARB_shader_storage_buffer_object not supported — SSBOs unavailable");
     if (!GLAD_GL_ARB_shader_draw_parameters)
         NC::LOGGING::Warning("[GL] GL_ARB_shader_draw_parameters not supported — gl_DrawID/gl_BaseVertex unavailable");
     if (!GLAD_GL_ARB_gpu_shader_int64)
         NC::LOGGING::Warning("[GL] GL_ARB_gpu_shader_int64 not supported — int64 uniforms unavailable");
+*/
 }
 
 std::shared_ptr<ITexture> OpenGLDevice::CreateTexture(const TextureDesc& desc) {
@@ -63,11 +65,9 @@ void OpenGLDevice::SetViewport(const Viewport& viewport) {
 }
 
 void OpenGLDevice::BindFramebuffer(IFramebuffer* fbo) {
-    GLuint handle = fbo ? *(GLuint*)fbo->GetNativeHandle() : 0;
-    if (boundFBO_ != handle) {
-        glBindFramebuffer(GL_FRAMEBUFFER, handle);
-        boundFBO_ = handle;
-    }
+    GLuint handle = fbo ? *(GLuint*)fbo->GetNativeHandle() : defaultFBO_;
+    glBindFramebuffer(GL_FRAMEBUFFER, handle);
+    boundFBO_ = handle;
 }
 
 void OpenGLDevice::BindTexture(ITexture* texture, uint32_t slot) {

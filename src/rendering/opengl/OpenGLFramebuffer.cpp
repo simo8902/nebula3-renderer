@@ -66,6 +66,7 @@ void OpenGLFramebuffer::CreateFramebuffer() {
         glReadBuffer(GL_NONE);
     }
 
+    while (glGetError() != GL_NO_ERROR) {}
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status != GL_FRAMEBUFFER_COMPLETE) {
         std::cerr << "[OpenGLFramebuffer] FBO incomplete, status=0x" << std::hex << status << std::dec << "\n";
@@ -73,6 +74,10 @@ void OpenGLFramebuffer::CreateFramebuffer() {
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (!desc_.debugName.empty()) {
+        glObjectLabel(GL_FRAMEBUFFER, handle_, static_cast<GLsizei>(desc_.debugName.size()), desc_.debugName.c_str());
+    }
 }
 
 }

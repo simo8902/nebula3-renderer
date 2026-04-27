@@ -7,10 +7,12 @@
 
 Camera camera = Camera(
 	"MainCamera",
-	glm::vec3(0.0f, 0.0f, 3.0f),
-	glm::vec3(0.0f, 0.0f, -1.0f),
-	glm::vec3(0.0f, 1.0f, 0.0f),
-	0.0f, 0.0f, 35.0f, 0.1f, 45.0f, 0.1f, 1000.0f
+	glm::vec3(0.0f, 2.0f, 10.0f),       // positioned slightly up and back
+	glm::vec3(0.0f, 0.0f, -1.0f),       // looking forward (-Z)
+	glm::vec3(0.0f, 1.0f, 0.0f),        // world up
+	270.0f, 0.0f,                       // yaw, pitch
+	8.0f, 0.1f,                         // move speed, mouse sensitivity
+	60.0f, 0.1f, 10000.0f               // fov, near, far
 );
 
 bool gEnableGLErrorChecking = false;
@@ -37,9 +39,6 @@ void Rendering::initGLFW() {
 	NC::LOGGING::Log("[RENDERING] initGLFW begin");
 	impl_->Initialize();
 	NC::LOGGING::Log("[RENDERING] initGLFW end");
-}
-
-void Rendering::initDeferred() {
 }
 
 void Rendering::initCascadedShadowMaps() {

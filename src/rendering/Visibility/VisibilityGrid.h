@@ -29,7 +29,6 @@ public:
     void Clear();
 
     void QueryVisibleCells(const glm::vec3& camPos,
-                           const Camera::Frustum& frustum,
                            float visRange,
                            std::vector<int>& outCellIndices) const;
 
@@ -47,7 +46,6 @@ public:
 private:
     bool IsCellVisible(const VisibilityCell& cell,
                        const glm::vec3& camPos,
-                       const Camera::Frustum& frustum,
                        float visRange) const;
 
     std::vector<VisibilityCell> cells_;

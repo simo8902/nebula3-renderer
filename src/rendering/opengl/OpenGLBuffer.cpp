@@ -18,17 +18,17 @@ OpenGLBuffer::~OpenGLBuffer() {
 
 void OpenGLBuffer::CreateBuffer(const BufferDesc& desc) {
     target_ = BufferType2GL(desc.type);
-    glGenBuffers(1, &handle_);
-    glBindBuffer(target_, handle_);
-    glBufferData(target_, desc.size, desc.initialData, GL_DYNAMIC_DRAW);
-    glBindBuffer(target_, 0);
+    glCreateBuffers(1, &handle_);
+    glNamedBufferStorage(handle_, desc.size, desc.initialData, GL_DYNAMIC_STORAGE_BIT);
+
+    if (!desc.debugName.empty()) {
+        glObjectLabel(GL_BUFFER, handle_, static_cast<GLsizei>(desc.debugName.size()), desc.debugName.c_str());
+    }
 }
 
 void OpenGLBuffer::UpdateData(const void* data, uint32_t size, uint32_t offset) {
     if (size + offset > size_) return;
-    glBindBuffer(target_, handle_);
-    glBufferSubData(target_, offset, size, data);
-    glBindBuffer(target_, 0);
+    glNamedBufferSubData(handle_, offset, size, data);
 }
 
 GLenum OpenGLBuffer::BufferType2GL(BufferType type) {

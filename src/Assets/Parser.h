@@ -14,9 +14,7 @@ public:
 
     bool parse_file(const std::string& filepath);
 
-    Node* getRootNode() const { return n3node_list.empty() ? nullptr : n3node_list[0]; }
-    std::vector<Node*> getNodeList() const { return n3node_list; }
-    std::vector<std::unique_ptr<Node>> getNodeStorage() { return std::move(n3node_storage); }
+    std::vector<Node> takeNodeStorage() { return std::move(n3node_storage); }
     std::string getModelType() const { return n3modeltype; }
     std::string getModelName() const { return n3modelname; }
     int getVersion() const { return n3version; }
@@ -28,9 +26,8 @@ private:
     int n3version = 0;
     std::string n3modeltype;
     std::string n3modelname;
-    std::vector<Node*> n3node_list;
-    std::vector<std::unique_ptr<Node>> n3node_storage;
-    std::vector<Node*> nodeStackObj;
+    std::vector<Node> n3node_storage;
+    std::vector<uint32_t> nodeStackObj;
     std::vector<std::string> nodeStack;
     std::string currentNFRT;
     std::string lastNFRT;

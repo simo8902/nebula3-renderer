@@ -29,6 +29,8 @@ public:
 
     virtual void SetViewport(const Viewport& viewport) = 0;
     virtual void BindFramebuffer(IFramebuffer* fbo) = 0;
+    virtual void SetDefaultFramebuffer(uint32_t fbo) = 0;
+    virtual uint32_t GetDefaultFramebuffer() const = 0;
     virtual void BindTexture(ITexture* texture, uint32_t slot) = 0;
     virtual void BindSampler(ISampler* sampler, uint32_t slot) = 0;
     virtual void ApplyRenderState(IRenderState* state) = 0;
@@ -38,7 +40,7 @@ public:
 
     virtual void Clear(bool color, bool depth, bool stencil,
         const glm::vec4& clearColor = glm::vec4(0),
-        float clearDepth = 1.0f,
+        float clearDepth = 0.0f,
         uint8_t clearStencil = 0) = 0;
 
     virtual const char* GetRendererName() const = 0;

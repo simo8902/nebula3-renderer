@@ -3,7 +3,9 @@
 
 #include "Rendering/OpenGL/OpenGLShaderManager.h"
 #include "Core/Errors.h"
+#include "Core/GlobalState.h"
 #include "Core/Logger.h"
+#include "Core/VFS.h"
 #include "Rendering/OpenGL/OpenGLShader.h"
 #include <cstdlib>
 #include <fstream>
@@ -24,28 +26,54 @@ std::string BuildShaderPath(const std::string& shaderBaseDir, const char* fileNa
     return (std::filesystem::path(shaderBaseDir) / "shaders" / fileName).string();
 }
 
+bool CameraTraceEnabledByDefault() {
+    const char* value = std::getenv("NDEVC_CAMERA_TRACE");
+    return value == nullptr || value[0] != '0';
+}
+
 } // namespace
 
 OpenGLShaderManager::OpenGLShaderManager() {
     const std::string shaderBaseDir = ResolveShaderBaseDir();
     NC::LOGGING::Log("[GL_SHADER_MGR] ctor shaderBaseDir=", shaderBaseDir);
 
-    auto CreateShader = [this](const std::string& name, const std::string& vert, const std::string& frag) {
-        NC::LOGGING::Log("[GL_SHADER_MGR] CreateShader name=", name, " V=", vert, " F=", frag);
-        auto shader = std::make_shared<OpenGLShader>(vert.c_str(), frag.c_str());
-        if (!shader->IsValid()) {
-            throw NC::Errors::LoggedRuntimeError(name + " shader init failed");
+    auto ShaderSourceAvailable = [](const std::string& path) {
+        return std::filesystem::exists(path) || NC::VFS::Instance().Exists(path);
+    };
+
+    auto CreateShader = [this, ShaderSourceAvailable](const std::string& name,
+                                                       const std::string& vert,
+                                                       const std::string& frag,
+                                                       bool required = false) {
+        if (!ShaderSourceAvailable(vert) || !ShaderSourceAvailable(frag)) {
+            if (required) {
+                throw NC::Errors::LoggedRuntimeError(name + " shader source missing");
+            }
+            NC::LOGGING::Warning("[GL_SHADER_MGR] Skipping missing shader name=", name);
+            return;
         }
+        auto shader = std::make_shared<OpenGLShader>(vert.c_str(), frag.c_str());
         shaders_[name] = shader;
-        RegisterShaderFileDependencies(name, shader);
+
         const GLuint programId = shader->GetNativeHandle()
             ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle())
             : 0;
         NC::LOGGING::Log("[GL_SHADER_MGR] Shader ready name=", name, " program=", programId);
     };
 
-    auto CreateShaderWithDefines = [this](const std::string& name, const std::string& vert, const std::string& frag,
-                                          const std::string& vertDefines, const std::string& fragDefines) {
+    auto CreateShaderWithDefines = [this, ShaderSourceAvailable](const std::string& name,
+                                                                 const std::string& vert,
+                                                                 const std::string& frag,
+                                                                 const std::string& vertDefines,
+                                                                 const std::string& fragDefines,
+                                                                 bool required = false) {
+        if (!ShaderSourceAvailable(vert) || !ShaderSourceAvailable(frag)) {
+            if (required) {
+                throw NC::Errors::LoggedRuntimeError(name + " shader source missing");
+            }
+            NC::LOGGING::Warning("[GL_SHADER_MGR] Skipping missing shader name=", name);
+            return;
+        }
         NC::LOGGING::Log("[GL_SHADER_MGR] CreateShaderWithDefines name=", name, " V=", vert, " F=", frag,
                          " VDef=", vertDefines.size(), " FDef=", fragDefines.size());
         auto shader = std::make_shared<OpenGLShader>(vert.c_str(), frag.c_str(), vertDefines, fragDefines);
@@ -53,34 +81,103 @@ OpenGLShaderManager::OpenGLShaderManager() {
             throw NC::Errors::LoggedRuntimeError(name + " shader init failed");
         }
         shaders_[name] = shader;
-        RegisterShaderFileDependencies(name, shader);
         const GLuint programId = shader->GetNativeHandle()
             ? *reinterpret_cast<GLuint*>(shader->GetNativeHandle())
             : 0;
         NC::LOGGING::Log("[GL_SHADER_MGR] Shader ready name=", name, " program=", programId);
     };
 
-    CreateShader("NDEVCdeferred",
-                 BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
-                 BuildShaderPath(shaderBaseDir, "NDEVCdeferred.frag"));
+    CreateShaderWithDefines(
+        "NDEVCdeferred",
+        BuildShaderPath(shaderBaseDir, "standard.vert"),
+        BuildShaderPath(shaderBaseDir, "standard.frag"),
+        "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_BUMP_GBUFFER 1\n",
+        "#define STANDARD_PASS_BUMP_GBUFFER 1\n",
+        true);
     CreateShaderWithDefines(
         "NDEVCdeferred_bindless",
-        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
-        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.frag"),
-        "#define BINDLESS 1\n",
-        "#define BINDLESS 1\n");
-    CreateShader("NDEVCdeferred_alpha_depth",
-        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
-        BuildShaderPath(shaderBaseDir, "NDEVCdeferred_alpha_depth.frag"));
+        BuildShaderPath(shaderBaseDir, "standard.vert"),
+        BuildShaderPath(shaderBaseDir, "standard.frag"),
+        "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_BUMP_GBUFFER 1\n",
+        "#define STANDARD_PASS_BUMP_GBUFFER 1\n",
+        true);
     CreateShaderWithDefines(
-        "NDEVCdeferred_alpha_depth_bindless",
-        BuildShaderPath(shaderBaseDir, "NDEVCdeferred.vert"),
-        BuildShaderPath(shaderBaseDir, "NDEVCdeferred_alpha_depth.frag"),
-        "#define BINDLESS 1\n",
-        "#define BINDLESS 1\n");
+        "NDEVCdeferred_alpha_clip",
+        BuildShaderPath(shaderBaseDir, "standard.vert"),
+        BuildShaderPath(shaderBaseDir, "standard.frag"),
+        "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_BUMP_GBUFFER 1\n#define STANDARD_ALPHA_TEST 1\n",
+        "#define STANDARD_PASS_BUMP_GBUFFER 1\n#define STANDARD_ALPHA_TEST 1\n",
+        true);
+    CreateShaderWithDefines(
+        "NDEVCsimplelayer",
+        BuildShaderPath(shaderBaseDir, "NDEVCsimplelayer.vert"),
+        BuildShaderPath(shaderBaseDir, "NDEVCsimplelayer.frag"),
+        "#define SKINNING_MODE 2\n#define PASS 5\n",
+        "#define PASS 5\n",
+        true);
+    CreateShaderWithDefines(
+        "NDEVCsimplelayer_alpha_clip",
+        BuildShaderPath(shaderBaseDir, "NDEVCsimplelayer.vert"),
+        BuildShaderPath(shaderBaseDir, "NDEVCsimplelayer.frag"),
+        "#define SKINNING_MODE 2\n#define PASS 4\n#define ALPHA_CLIP 1\n",
+        "#define PASS 4\n#define ALPHA_CLIP 1\n",
+        true);
+    CreateShader("standard_gbuffer_compose",
+                 BuildShaderPath(shaderBaseDir, "standard_gbuffer_compose.vert"),
+                 BuildShaderPath(shaderBaseDir, "standard_gbuffer_compose.frag"),
+                 true);
+    CreateShader("standard_light_accum",
+                 BuildShaderPath(shaderBaseDir, "standard_gbuffer_compose.vert"),
+                 BuildShaderPath(shaderBaseDir, "standard_light_accum.frag"),
+                 true);
+    CreateShader("standard_present",
+                 BuildShaderPath(shaderBaseDir, "standard_gbuffer_compose.vert"),
+                 BuildShaderPath(shaderBaseDir, "standard_present.frag"),
+                 true);
+    CreateShader("compose",
+                 BuildShaderPath(shaderBaseDir, "compose.vert"),
+                 BuildShaderPath(shaderBaseDir, "compose.frag"),
+                 true);
     CreateShader("standard",
                  BuildShaderPath(shaderBaseDir, "standard.vert"),
                  BuildShaderPath(shaderBaseDir, "standard.frag"));
+    const std::string standardVert = BuildShaderPath(shaderBaseDir, "standard.vert");
+    const std::string standardFrag = BuildShaderPath(shaderBaseDir, "standard.frag");
+    auto CreateStandardVariant = [&](const std::string& name,
+                                     const std::string& vertDefines,
+                                     const std::string& fragDefines) {
+        CreateShaderWithDefines(name, standardVert, standardFrag, vertDefines, fragDefines);
+    };
+    CreateStandardVariant("standard_highlight",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_HIGHLIGHT 1\n",
+                          "#define STANDARD_PASS_HIGHLIGHT 1\n");
+    CreateStandardVariant("standard_diffuse_fog_alpha",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_DIFFUSE_FOG_ALPHA 1\n",
+                          "#define STANDARD_PASS_DIFFUSE_FOG_ALPHA 1\n");
+    CreateStandardVariant("standard_lit_composite",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_LIT_COMPOSITE 1\n",
+                          "#define STANDARD_PASS_LIT_COMPOSITE 1\n");
+    CreateStandardVariant("standard_lit_composite_alpha",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_LIT_COMPOSITE 1\n",
+                          "#define STANDARD_PASS_LIT_COMPOSITE 1\n#define STANDARD_ALPHA_MODULATE 1\n");
+    CreateStandardVariant("standard_lit_composite_alpha_test",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_LIT_COMPOSITE 1\n#define STANDARD_ALPHA_TEST 1\n",
+                          "#define STANDARD_PASS_LIT_COMPOSITE 1\n#define STANDARD_ALPHA_TEST 1\n");
+    CreateStandardVariant("standard_emissive_tint_fog",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_EMISSIVE_TINT_FOG 1\n",
+                          "#define STANDARD_PASS_EMISSIVE_TINT_FOG 1\n");
+    CreateStandardVariant("standard_bump_gbuffer",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_BUMP_GBUFFER 1\n",
+                          "#define STANDARD_PASS_BUMP_GBUFFER 1\n");
+    CreateStandardVariant("standard_bump_gbuffer_alpha_test",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_BUMP_GBUFFER 1\n#define STANDARD_ALPHA_TEST 1\n",
+                          "#define STANDARD_PASS_BUMP_GBUFFER 1\n#define STANDARD_ALPHA_TEST 1\n");
+    CreateStandardVariant("standard_projective_depth",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_PROJECTIVE_DEPTH 1\n",
+                          "#define STANDARD_PASS_PROJECTIVE_DEPTH 1\n");
+    CreateStandardVariant("standard_projective_depth_alpha_test",
+                          "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_PROJECTIVE_DEPTH 1\n#define STANDARD_ALPHA_TEST 1\n",
+                          "#define STANDARD_PASS_PROJECTIVE_DEPTH 1\n#define STANDARD_ALPHA_TEST 1\n");
     CreateShader("particle",
                  BuildShaderPath(shaderBaseDir, "particle.vert"),
                  BuildShaderPath(shaderBaseDir, "particle.frag"));
@@ -201,10 +298,17 @@ void OpenGLShaderManager::Shutdown() {
 }
 
 void OpenGLShaderManager::ProcessPendingReloads() {
+    static const bool cameraTrace = CameraTraceEnabledByDefault();
     std::unordered_set<std::string> todo;
+    size_t remaining = 0;
     {
         std::lock_guard<std::mutex> lock(shaderMutex_);
-        todo.swap(pendingReloads_);
+        auto it = pendingReloads_.begin();
+        if (it != pendingReloads_.end()) {
+            todo.insert(*it);
+            pendingReloads_.erase(it);
+        }
+        remaining = pendingReloads_.size();
     }
     static bool loggedIdleOnce = false;
     if (todo.empty()) {
@@ -217,6 +321,13 @@ void OpenGLShaderManager::ProcessPendingReloads() {
 
     loggedIdleOnce = false;
     NC::LOGGING::Log("[GL_SHADER_MGR] ProcessPendingReloads count=", todo.size());
+    if (cameraTrace) {
+        for (const auto& name : todo) {
+            NC::LOGGING::Info(NC::LOGGING::Category::Shader,
+                "[CAMERA_TRACE][SHADER_RELOAD] name=", name,
+                " remainingQueued=", remaining);
+        }
+    }
     for (auto& name : todo) ReloadShader(name);
 }
 
@@ -254,8 +365,9 @@ void OpenGLShaderManager::UpdateFileMonitoring() {
         timestampsSnapshot = fileTimestamps_;
     }
 
+    std::unordered_map<std::string, std::filesystem::file_time_type> observedTimestamps;
     std::unordered_map<std::string, std::filesystem::file_time_type> changedTimestamps;
-    std::unordered_set<std::string> changedMaterials;
+    std::unordered_set<std::string> changedShaders;
     for (const auto& watched : watchedPaths) {
         std::error_code ec;
         const std::filesystem::path fsPath(watched.path);
@@ -279,19 +391,42 @@ void OpenGLShaderManager::UpdateFileMonitoring() {
         }
 
         auto snapshotIt = timestampsSnapshot.find(watched.path);
-        if (snapshotIt == timestampsSnapshot.end() || snapshotIt->second != ftime) {
+        if (snapshotIt == timestampsSnapshot.end()) {
+            observedTimestamps[watched.path] = ftime;
+        } else if (snapshotIt->second != ftime) {
             changedTimestamps[watched.path] = ftime;
-            changedMaterials.insert(watched.name);
+            changedShaders.insert(watched.name);
             NC::LOGGING::Log("[GL_SHADER_MGR] File changed name=", watched.name, " path=", watched.path);
         }
     }
 
-    if (!changedMaterials.empty()) {
+    if (!observedTimestamps.empty() || !changedShaders.empty()) {
         std::lock_guard<std::mutex> lock(shaderMutex_);
+        for (const auto& [path, ftime] : observedTimestamps) {
+            fileTimestamps_[path] = ftime;
+        }
         for (const auto& [path, ftime] : changedTimestamps) {
             fileTimestamps_[path] = ftime;
         }
-        pendingReloads_.insert(changedMaterials.begin(), changedMaterials.end());
+        if (watcherPrimed_) {
+            pendingReloads_.insert(changedShaders.begin(), changedShaders.end());
+            if (CameraTraceEnabledByDefault()) {
+                NC::LOGGING::Info(NC::LOGGING::Category::Shader,
+                    "[CAMERA_TRACE][SHADER_WATCH] changedShaders=", changedShaders.size(),
+                    " pendingQueued=", pendingReloads_.size(),
+                    " observedNewPaths=", observedTimestamps.size());
+            }
+        } else {
+            watcherPrimed_ = true;
+            if (CameraTraceEnabledByDefault()) {
+                NC::LOGGING::Info(NC::LOGGING::Category::Shader,
+                    "[CAMERA_TRACE][SHADER_WATCH_PRIME] observedPaths=", observedTimestamps.size(),
+                    " ignoredInitialChanges=", changedShaders.size());
+            }
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(shaderMutex_);
+        watcherPrimed_ = true;
     }
 }
 
@@ -373,7 +508,6 @@ void OpenGLShaderManager::LoadShader(const std::filesystem::path& path) {
 
             if (shader->IsValid()) {
                 shaders_[baseName] = shader;
-                RegisterShaderFileDependencies(baseName, shader);
                 std::error_code ecVert;
                 std::error_code ecFrag;
                 const auto vertTime = std::filesystem::last_write_time(vertPath, ecVert);
@@ -397,7 +531,6 @@ void OpenGLShaderManager::LoadShader(const std::filesystem::path& path) {
 
             if (shader->IsValid()) {
                 shaders_[baseName] = shader;
-                RegisterShaderFileDependencies(baseName, shader);
                 std::error_code ecTime;
                 const auto ftime = std::filesystem::last_write_time(path, ecTime);
                 if (ecTime) {
@@ -427,7 +560,17 @@ void OpenGLShaderManager::ReloadAll() {
 
 void OpenGLShaderManager::ReloadShader(const std::string& name) {
     try {
-        auto& shader = shaders_.at(name);
+        std::shared_ptr<IShader> shader;
+        {
+            std::lock_guard<std::mutex> lock(shaderMutex_);
+            auto it = shaders_.find(name);
+            if (it == shaders_.end()) {
+                NC::LOGGING::Warning("[GL_SHADER_MGR] Cannot reload, shader not found: ", name);
+                return;
+            }
+            shader = it->second;
+        }
+
         auto glShader = std::dynamic_pointer_cast<OpenGLShader>(shader);
         if (glShader) {
             glShader->Reload();
@@ -445,19 +588,6 @@ void OpenGLShaderManager::HandleFileDrop(const std::vector<std::string>& paths) 
     for(const auto& path : paths) {
         NC::LOGGING::Log("[GL_SHADER_MGR] HandleFileDrop path=", path);
         LoadShader(path);
-    }
-}
-
-void OpenGLShaderManager::RegisterShaderFileDependencies(const std::string& materialName, const std::shared_ptr<IShader>& shader) {
-    auto glShader = std::dynamic_pointer_cast<OpenGLShader>(shader);
-    if (!glShader) return;
-    
-    const auto& paths = glShader->GetPaths();
-    if (!paths.vertex.empty()) {
-        pathToMaterialsMap_[paths.vertex].insert(materialName);
-    }
-    if (!paths.fragment.empty() && paths.fragment != paths.vertex) {
-        pathToMaterialsMap_[paths.fragment].insert(materialName);
     }
 }
 

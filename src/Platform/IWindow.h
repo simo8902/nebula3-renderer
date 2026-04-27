@@ -14,6 +14,7 @@ public:
     virtual ~IWindow() = default;
 
     virtual void MakeCurrent() const = 0;
+    virtual void ReleaseContext() const = 0;
     virtual void SwapBuffers() = 0;
     virtual void PollEvents() = 0;
     virtual bool ShouldClose() const = 0;
@@ -25,13 +26,16 @@ public:
     virtual void SetScrollCallback(std::function<void(double, double)> callback) = 0;
 
     virtual void* GetNativeHandle() const = 0;
+    virtual unsigned int GetDefaultFramebuffer() const { return 0; }
 
     virtual int GetKey(int key) const = 0;
     virtual bool IsKeyPressed(int key) const = 0;
+    virtual bool IsMouseButtonPressed(int button) const { (void)button; return false; }
 
     virtual void GetCursorPos(double& x, double& y) const = 0;
     virtual void SetCursorPos(double x, double y) = 0;
     virtual void SetInputMode(int mode, int value) = 0;
+    virtual void SetSwapInterval(int interval) = 0;
 };
 
 }

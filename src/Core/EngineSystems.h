@@ -28,10 +28,10 @@ public:
     struct Config {
         double fixedUpdateStepSeconds = 1.0 / 60.0;
         int maxFixedUpdatesPerFrame = 5;
-        double maxFrameDeltaSeconds = 0.1;
+        double maxFrameDeltaSeconds = 1.0 / 30.0;  // 33ms max, prevents 10x frame time variance
     };
 
-    explicit EngineSystems(const Config& config = Config());
+    explicit EngineSystems(const Config& config);
     ~EngineSystems();
 
     NDEVC::Graphics::IRenderer* GetRenderer() const;

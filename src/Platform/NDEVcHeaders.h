@@ -95,6 +95,13 @@ inline std::string ResolveAssetRoot(const char* envName,
 #endif
 
     for (const auto& rel : relativeCandidates) {
+        const std::filesystem::path candidate = std::filesystem::path("C:/drasa_online/work") / rel;
+        if (std::filesystem::exists(candidate, ec) && std::filesystem::is_directory(candidate, ec)) {
+            return NormalizeRoot(candidate);
+        }
+    }
+
+    for (const auto& rel : relativeCandidates) {
         if (std::filesystem::exists(rel, ec) && std::filesystem::is_directory(rel, ec)) {
             return NormalizeRoot(rel);
         }

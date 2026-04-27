@@ -28,7 +28,6 @@ public:
 	~Rendering();
 
 	void initGLFW();
-	void initDeferred();
 	void initCascadedShadowMaps();
 	void initLOOP();
 	void resizeFramebuffers(int newWidth, int newHeight);

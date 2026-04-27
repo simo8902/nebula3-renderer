@@ -2,6 +2,7 @@
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
 #include "Rendering/Visibility/VisibilityGrid.h"
+#include "Core/Logger.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -108,7 +109,6 @@ void VisibilityGrid::Clear() {
 
 bool VisibilityGrid::IsCellVisible(const VisibilityCell& cell,
                                    const glm::vec3& camPos,
-                                   const Camera::Frustum& frustum,
                                    float visRange) const {
     const float yMin = (cell.minY <=  1e8f) ? cell.minY : -1.0f;
     const float yMax = (cell.maxY >= -1e8f) ? cell.maxY :  1.0f;
@@ -125,34 +125,23 @@ bool VisibilityGrid::IsCellVisible(const VisibilityCell& cell,
         if (std::sqrt(dx * dx + dz * dz) > visRange + halfDiag) return false;
     }
 
-    for (int i = 0; i < 6; ++i) {
-        const Camera::Plane& plane = frustum.planes[i];
-        const glm::vec3 pv(
-            plane.normal.x >= 0.0f ? boxMax.x : boxMin.x,
-            plane.normal.y >= 0.0f ? boxMax.y : boxMin.y,
-            plane.normal.z >= 0.0f ? boxMax.z : boxMin.z
-        );
-        if (glm::dot(plane.normal, pv) + plane.d < 0.0f) return false;
-    }
-
     return true;
 }
 
 void VisibilityGrid::QueryVisibleCells(const glm::vec3& camPos,
-                                       const Camera::Frustum& frustum,
-                                       float visRange,
-                                       std::vector<int>& outCellIndices) const {
-    outCellIndices.clear();
+                                         float range,
+                                         std::vector<int>& outVisibleIndices) const {
+    outVisibleIndices.clear();
     if (!isBuilt_) return;
 
     int xMin = 0, xMax = gridW_ - 1;
     int zMin = 0, zMax = gridH_ - 1;
 
-    if (visRange > 0.0f) {
+    if (range > 0.0f) {
         const int camCellX = static_cast<int>(std::floor((camPos.x - gridOriginXZ_.x) / cellSizeX_));
         const int camCellZ = static_cast<int>(std::floor((camPos.z - gridOriginXZ_.y) / cellSizeZ_));
-        const int rangeCellsX = static_cast<int>(std::ceil(visRange / cellSizeX_)) + 1;
-        const int rangeCellsZ = static_cast<int>(std::ceil(visRange / cellSizeZ_)) + 1;
+        const int rangeCellsX = static_cast<int>(std::ceil(range / cellSizeX_)) + 1;
+        const int rangeCellsZ = static_cast<int>(std::ceil(range / cellSizeZ_)) + 1;
         xMin = std::max(0,         camCellX - rangeCellsX);
         xMax = std::min(gridW_ - 1, camCellX + rangeCellsX);
         zMin = std::max(0,         camCellZ - rangeCellsZ);
@@ -162,13 +151,13 @@ void VisibilityGrid::QueryVisibleCells(const glm::vec3& camPos,
     for (int z = zMin; z <= zMax; ++z) {
         for (int x = xMin; x <= xMax; ++x) {
             const int idx = z * gridW_ + x;
-            if (IsCellVisible(cells_[idx], camPos, frustum, visRange)) {
-                outCellIndices.push_back(idx);
+            if (IsCellVisible(cells_[idx], camPos, range)) {
+                outVisibleIndices.push_back(idx);
             }
         }
     }
 
-    lastVisibleCellCount_ = static_cast<int>(outCellIndices.size());
+    lastVisibleCellCount_ = static_cast<int>(outVisibleIndices.size());
 }
 
 bool VisibilityGrid::UpdateVisibility(std::vector<DrawCmd>& draws,

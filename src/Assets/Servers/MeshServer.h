@@ -8,6 +8,7 @@
 #include "Rendering/MegaBuffer.h"
 #include "Platform/NDEVcHeaders.h"
 #include "Rendering/Mesh.h"
+#include "Assets/ResourceServer.h"
 
 class MeshServer {
 public:
@@ -41,7 +42,9 @@ public:
     }
 
     void buildMegaBuffer() {
-        NC::LOGGING::Log("[MESH] buildMegaBuffer begin meshCount=", meshCache.size());
+        printf("[MEGABUFFER_BUILD] Starting with meshCount=%zu\n", meshCache.size());
+        fflush(stdout);
+
         std::vector<ObjVertex> allVerts;
         std::vector<uint32_t>  allIndices;
 
@@ -53,9 +56,15 @@ public:
         allVerts.reserve(totalV);
         allIndices.reserve(totalI);
 
+        int meshIdx = 0;
         for (auto& [id, mesh] : meshCache) {
             mesh->megaVertexOffset = (uint32_t)allVerts.size();
             mesh->megaIndexOffset  = (uint32_t)allIndices.size();
+
+            printf("[MEGABUFFER_MESH %d] id=%s vertCount=%zu indexCount=%zu megaVertexOffset=%u megaIndexOffset=%u\n",
+                   meshIdx++, id.c_str(), mesh->verts.size(), mesh->idx.size(),
+                   mesh->megaVertexOffset, mesh->megaIndexOffset);
+            fflush(stdout);
 
              for (uint32_t idx : mesh->idx)
                 allIndices.push_back(idx + mesh->megaVertexOffset);
@@ -65,7 +74,13 @@ public:
         }
 
         MegaBuffer::instance().build(allVerts, allIndices);
-        NC::LOGGING::Log("[MESH] buildMegaBuffer end totalVerts=", allVerts.size(), " totalIndices=", allIndices.size());
+        printf("[MEGABUFFER_BUILD] Finished: totalVerts=%zu totalIndices=%zu\n", allVerts.size(), allIndices.size());
+        fflush(stdout);
+
+        ResourceServer::instance().Clear();
+        for (auto& [id, mesh] : meshCache) {
+            ResourceServer::instance().Register(mesh.get());
+        }
     }
 
     void clearCache() {

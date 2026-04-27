@@ -9,6 +9,8 @@
 #include <vector>
 #include "ITexture.h"
 
+#include <string>
+
 namespace NDEVC::Graphics {
 
 struct FramebufferAttachment {
@@ -17,6 +19,7 @@ struct FramebufferAttachment {
 };
 
 struct FramebufferDesc {
+    std::string debugName;
     std::vector<FramebufferAttachment> colorAttachments;
     FramebufferAttachment depthStencilAttachment;
     uint32_t width = 0;

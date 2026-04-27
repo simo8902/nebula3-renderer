@@ -18,10 +18,12 @@ public:
     Format GetFormat() const override { return desc_.format; }
     TextureType GetType() const override { return desc_.type; }
     void* GetNativeHandle() const override { return (void*)&handle_; }
+    uint64_t GetBindlessHandle() const override;
     GLenum GetTarget() const { return target_; }
 
 private:
     GLuint handle_;
+    GLuint64 bindlessHandle_ = 0;
     GLenum target_;
     TextureDesc desc_;
 

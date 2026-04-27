@@ -64,7 +64,7 @@ bool InternalVisibilityStage::ResolveDrawVisibility(std::vector<DrawCmd>& draws)
             changed = true;
         }
         if (shouldDisable) {
-            draw.frustumCulled = false;
+            // Placeholder if anything else needs to react to visibility changes
         }
     }
     return changed;

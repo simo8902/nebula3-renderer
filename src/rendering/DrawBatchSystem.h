@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
+#include <deque>
 
 #include "Rendering/Camera.h"
 #include "Rendering/Mesh.h"
@@ -100,12 +101,22 @@ public:
     bool hasGLResources() const;
 
     void init(const std::vector<DrawCmd>& solidDraws);
-    void cull(const std::vector<DrawCmd>& solidDraws, const Camera::Frustum& frustum);
+    void cull(const std::vector<DrawCmd>& solidDraws);
 
-    void cullGeneric(const std::vector<DrawCmd>& draws, const Camera::Frustum& frustum,
-                     uint32_t shaderHash, int numTextures = 4);
+    void cullGeneric(const std::vector<DrawCmd>& draws, uint32_t shaderHash, int numTextures = 4);
 
     void cullDecals(const std::vector<DrawCmd>& draws);
+    std::vector<uint8_t> frameScratchMemory_;
+    size_t frameScratchOffset_ = 0;
+
+         template<typename T>
+         T* AllocFrame(size_t count) {
+             const size_t bytes = sizeof(T) * count;
+             if (frameScratchOffset_ + bytes > frameScratchMemory_.size()) return nullptr;
+             T* ptr = reinterpret_cast<T*>(&frameScratchMemory_[frameScratchOffset_]);
+             frameScratchOffset_ = (frameScratchOffset_ + bytes + 15) & ~15; // Align 16
+             return ptr;
+         }
 
     struct PackedDrawRange {
         size_t staticOffset = 0;
@@ -121,10 +132,18 @@ public:
 
     const std::deque<DrawBatch*>& activeBatches() const { return active_; }
 
-    // ── Parity metrics: batch vs draw command count (Nebula framebatch parity) ──
     struct FlushMetrics {
         size_t batchCount = 0;
         size_t commandCount = 0;
+        size_t instanceCount = 0;
+        size_t zeroInstanceCommandCount = 0;
+        double matrixUploadMs = 0.0;
+        double materialIndexUploadMs = 0.0;
+        double indirectPackMs = 0.0;
+        double indirectUploadMs = 0.0;
+        double bindlessPartitionMs = 0.0;
+        double drawSubmitMs = 0.0;
+        double cleanupMs = 0.0;
     };
     const FlushMetrics& lastFlushMetrics() const { return lastFlushMetrics_; }
 
@@ -163,9 +182,6 @@ private:
     size_t staticMatrixCount = 0;
     std::vector<glm::mat4> staticModelMatrices;
     std::vector<uint32_t> staticMaterialIndices;
-    std::unordered_map<BatchKey, std::vector<DrawCommand>, BatchKeyHash> staticBatchCommands;
-    std::unordered_map<BatchKey, std::vector<size_t>, BatchKeyHash> staticBatchDrawIndices_;
-    std::unordered_map<BatchKey, std::vector<std::vector<size_t>>, BatchKeyHash> staticBatchInstanceDrawIndices_;
     std::array<bool, kUploadRingSize> staticMatricesUploadedBySlot_{};
     bool initialMatrixUploadLogged = false;
     uint64_t staticCacheSignature_ = 0;
@@ -186,9 +202,7 @@ private:
     bool materialIndexStaticDirty_ = true;
     std::vector<DrawCommand> staticIndirectCommandsPacked_;
     std::unordered_map<BatchKey, size_t, BatchKeyHash> staticIndirectOffsets_;
-    // Parallel to staticIndirectCommandsPacked_: representative source draw index for each command.
     std::vector<size_t> staticCmdDrawIndices_;
-    // Parallel to staticIndirectCommandsPacked_: flattened per-command source draw indices.
     std::vector<size_t> staticCmdInstanceOffsets_;
     std::vector<uint32_t> staticCmdInstanceCounts_;
     std::vector<size_t> staticCmdInstanceDrawIndices_;
@@ -197,28 +211,20 @@ private:
     struct DynamicGenericGroup {
         uint32_t count = 0;
         uint32_t firstIndex = 0;
-        float alphaCutoff = 0.5f;
         std::vector<glm::mat4> matrices;
         std::vector<uint32_t> materialIndices;
     };
-    std::unordered_map<BatchKey, std::unordered_map<uint64_t, DynamicGenericGroup>, BatchKeyHash> dynamicGroupsCache_;
+    // Optimized: Flat map to avoid nested unordered_map overhead
+    std::unordered_map<uint64_t, DynamicGenericGroup> dynamicGroupsCacheFlat_;
 
 public:
-    // Update instanceCount in static indirect commands based on DrawCmd::disabled flags.
-    // Much cheaper than invalidateStaticCache() — no matrix/batch rebuild, just toggles.
-    void updateStaticVisibility(const std::vector<DrawCmd>& solidDraws,
-                                const Camera::Frustum* frustum = nullptr);
-
+    void updateStaticVisibility(const std::vector<DrawCmd>& solidDraws);
     void InvalidateCullCache() { cullResultCacheValid_ = false; }
-
-    // Mark that disabled flags on static draws may have changed; updateStaticVisibility
-    // will re-evaluate them on next cull(). Call when the visibility grid resolves dirty.
     void MarkStaticVisibilityDirty() { staticVisibilityDirty_ = true; }
 
 private:
     bool staticVisibilityDirty_ = true;
     bool cullResultCacheValid_ = false;
-    Camera::Frustum cullCachedFrustum_{};
     std::array<bool,   kUploadRingSize> bindlessPartitionSlotValid_{};
     std::array<size_t, kUploadRingSize> bindlessSlotDecalCount_{};
 };

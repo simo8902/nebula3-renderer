@@ -17,6 +17,7 @@ public:
     ~GLFWWindow();
 
     void MakeCurrent() const override;
+    void ReleaseContext() const override;
     void SwapBuffers() override;
     void PollEvents() override;
     bool ShouldClose() const override;
@@ -31,10 +32,12 @@ public:
 
     int GetKey(int key) const override;
     bool IsKeyPressed(int key) const override;
+    bool IsMouseButtonPressed(int button) const override;
 
     void GetCursorPos(double& x, double& y) const override;
     void SetCursorPos(double x, double y) override;
     void SetInputMode(int mode, int value) override;
+    void SetSwapInterval(int interval) override;
 
 private:
     GLFWwindow* handle_;

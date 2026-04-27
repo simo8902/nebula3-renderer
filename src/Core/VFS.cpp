@@ -187,7 +187,7 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
     outStartupMapPath.clear();
 
     if (ndpkPath.empty()) {
-        NC::LOGGING::Error("[VFS] MountNdpk: empty path");
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "MountNdpk: empty path");
         return false;
     }
 
@@ -196,13 +196,13 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
     fileHandle_ = CreateFileA(ndpkPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fileHandle_ == INVALID_HANDLE_VALUE) {
-        NC::LOGGING::Error("[VFS] Cannot open NDPK: ", ndpkPath);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "Cannot open NDPK: ", ndpkPath);
         return false;
     }
 
     LARGE_INTEGER fileSizeLI{};
     if (!GetFileSizeEx(fileHandle_, &fileSizeLI) || fileSizeLI.QuadPart < static_cast<LONGLONG>(kHeaderSize)) {
-        NC::LOGGING::Error("[VFS] NDPK too small: ", ndpkPath);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "NDPK too small: ", ndpkPath);
         CloseHandle(fileHandle_);
         fileHandle_ = INVALID_HANDLE_VALUE;
         return false;
@@ -211,7 +211,7 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
 
     mappingHandle_ = CreateFileMappingA(fileHandle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
     if (!mappingHandle_) {
-        NC::LOGGING::Error("[VFS] CreateFileMapping failed for: ", ndpkPath);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "CreateFileMapping failed for: ", ndpkPath);
         CloseHandle(fileHandle_);
         fileHandle_ = INVALID_HANDLE_VALUE;
         return false;
@@ -219,7 +219,7 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
 
     base_ = reinterpret_cast<const uint8_t*>(MapViewOfFile(mappingHandle_, FILE_MAP_READ, 0, 0, 0));
     if (!base_) {
-        NC::LOGGING::Error("[VFS] MapViewOfFile failed for: ", ndpkPath);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "MapViewOfFile failed for: ", ndpkPath);
         CloseHandle(mappingHandle_);
         CloseHandle(fileHandle_);
         mappingHandle_ = nullptr;
@@ -229,12 +229,12 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
 #else
     fd_ = open(ndpkPath.c_str(), O_RDONLY);
     if (fd_ < 0) {
-        NC::LOGGING::Error("[VFS] Cannot open NDPK: ", ndpkPath);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "Cannot open NDPK: ", ndpkPath);
         return false;
     }
     struct stat st{};
     if (fstat(fd_, &st) != 0 || st.st_size < static_cast<off_t>(kHeaderSize)) {
-        NC::LOGGING::Error("[VFS] NDPK too small: ", ndpkPath);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "NDPK too small: ", ndpkPath);
         close(fd_); fd_ = -1;
         return false;
     }
@@ -242,7 +242,7 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
     base_ = reinterpret_cast<const uint8_t*>(
         mmap(nullptr, baseSize_, PROT_READ, MAP_PRIVATE, fd_, 0));
     if (base_ == MAP_FAILED) {
-        NC::LOGGING::Error("[VFS] mmap failed for: ", ndpkPath);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "mmap failed for: ", ndpkPath);
         close(fd_); fd_ = -1;
         base_ = nullptr;
         return false;
@@ -259,12 +259,12 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
     const uint64_t manifestSize = ReadU64(b + 20);
 
     if (magic != kNdpkMagic) {
-        NC::LOGGING::Error("[VFS] Invalid NDPK magic");
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "Invalid NDPK magic");
         Unmount();
         return false;
     }
     if (version != kNdpkVersion) {
-        NC::LOGGING::Error("[VFS] Unsupported NDPK version: ", version);
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "Unsupported NDPK version: ", version);
         Unmount();
         return false;
     }
@@ -272,7 +272,7 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
     const size_t tocStart = kHeaderSize;
     const size_t tocEnd   = tocStart + static_cast<size_t>(chunkCount) * kTocEntrySize;
     if (tocEnd > baseSize_ || manifestOff + manifestSize > baseSize_) {
-        NC::LOGGING::Error("[VFS] NDPK layout out of bounds");
+        NC::LOGGING::Error(NC::LOGGING::Category::VFS, "NDPK layout out of bounds");
         Unmount();
         return false;
     }
@@ -296,7 +296,7 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
     if (manifestSize > 0) {
         if (!ParseManifestAssets(b + static_cast<size_t>(manifestOff),
                                  static_cast<size_t>(manifestSize), assets, manifestProfile)) {
-            NC::LOGGING::Error("[VFS] Failed to parse NDPK manifest");
+            NC::LOGGING::Error(NC::LOGGING::Category::VFS, "Failed to parse NDPK manifest");
             Unmount();
             return false;
         }
@@ -333,10 +333,10 @@ bool VFS::MountNdpk(const std::string& ndpkPath, std::string& outStartupMapPath)
 
     mounted_ = true;
     profile_ = manifestProfile;
-    NC::LOGGING::Log("[VFS] Mounted NDPK: ", ndpkPath,
-                     " profile=", static_cast<int>(profile_),
-                     " entries=", entries_.size(),
-                     " startupMap=", outStartupMapPath.empty() ? "<none>" : outStartupMapPath);
+    NC::LOGGING::Info(NC::LOGGING::Category::VFS, "Mounted NDPK: ", ndpkPath,
+                      " profile=", static_cast<int>(profile_),
+                      " entries=", entries_.size(),
+                      " startupMap=", outStartupMapPath.empty() ? "<none>" : outStartupMapPath);
     return true;
 }
 

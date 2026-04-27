@@ -5,10 +5,8 @@
 #include "Rendering/Camera.h"
 #include "Assets/Model/ModelInstance.h"
 #include "Assets/Map/MapLoader.h"
-#include "Assets/Particles/ParticleSystemNode.h"
-#include "Animation/AnimatorNodeInstance.h"
-#include "Rendering/Interfaces/IGraphicsDevice.h"
-#include "Rendering/Interfaces/IShaderManager.h"
+#include "Core/FrameArena.h"
+#include "Engine/SceneSnapshot.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,36 +14,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
-// ════════════════════════════════════════════════════════════════════════
-// SceneManager — Nebula-parity lifecycle overview
-//
-// Load path (maps 1:1 to Nebula's basegamefeatureunit → render-ready):
-//   LoadMap → BuildStreamingIndex → UpdateIncrementalStreaming
-//     → LoadMapInstances / LoadMapInstanceByIndex
-//       → create RuntimeEntityRecord (Created)
-//       → setTransform (Activated)
-//       → readiness gate: IsModelRenderReady?
-//           yes → markValidAndReplay → BuildDraws (ProxyCreated)
-//                 → classify draws (InternalAttached) → (Valid)
-//           no  → PendingValid, deferred updates queued in ModelInstance
-//
-// Per-frame (maps to Nebula's framesynchandlerthread + internalgraphicsserver):
-//   Tick:  streaming → TickPendingEntities (promote PendingValid→Valid)
-//          → transform change detection → propagate to scene draws
-//   PrepareDrawLists: copy scene draws to renderer buckets
-//
-// Streaming churn:
-//   UnloadInstanceByOwner erases draws + lifecycle record
-//   ApplySceneRebuildAfterStreamingChanges refreshes mega offsets
-//     and restores isStatic flags to node mobility source-of-truth
-// ════════════════════════════════════════════════════════════════════════
 class SceneManager {
 public:
-    // ── Nebula-parity lifecycle stage enum ──────────────────────────────
-    // Maps 1:1 to Nebula's entity lifecycle ordering:
-    //   basegamefeatureunit -> loaderserver -> categorymanager ->
-    //   entityloader -> factorymanager -> entitymanager ->
-    //   graphicsproperty -> internalmodelentity
     enum class ParityStage : int {
         Idle            = 0,  // No load in progress
         LevelLoad       = 1,  // loaderserver::LoadLevel
@@ -97,10 +67,6 @@ public:
     const std::unordered_map<void*, RuntimeEntityRecord>& GetRuntimeEntities() const
         { return runtimeEntities_; }
     int CountRuntimeEntitiesInState(EntityLifecycleState s) const;
-
-    // Called once after the GL context and MegaBuffer exist
-    void Initialize(NDEVC::Graphics::IGraphicsDevice* device,
-                    NDEVC::Graphics::IShaderManager* shaderMgr);
 
     // Scene mutation (called by game code or the renderer facade)
     void AppendModel(const std::string& path, const glm::vec3& pos,
@@ -157,10 +123,13 @@ public:
     bool IsSceneDirty() const { return activeSceneDirty_; }
     const std::vector<AuthoredEntity>& GetAuthoredEntities() const { return authoredEntities_; }
     SceneEntityId FindEntityIdByRuntimeOwner(void* owner) const;
-    size_t GetParticleNodeCount() const { return particleNodes.size(); }
 
-    // Per-frame update: streaming tick, animation, particle attachment
     void Tick(double dt, const Camera& camera);
+
+    // Converts the current draw lists into arena-allocated RenderProxy PODs.
+    // Call once per frame after Tick(). The returned snapshot is valid until
+    // the next FrameArena::Reset() on the supplied arena.
+    SceneSnapshot BuildSnapshot(FrameArena& arena, const Camera& camera) const;
 
     // Frame preparation: clears and repopulates all draw lists
     // The draw lists are owned by DeferredRenderer and passed in by pointer.
@@ -169,14 +138,12 @@ public:
         std::vector<DrawCmd>& solidDraws,
         std::vector<DrawCmd>& alphaTestDraws,
         std::vector<DrawCmd>& decalDraws,
-        std::vector<DrawCmd>& particleDraws,
         std::vector<DrawCmd>& environmentDraws,
         std::vector<DrawCmd>& environmentAlphaDraws,
         std::vector<DrawCmd>& simpleLayerDraws,
         std::vector<DrawCmd>& refractionDraws,
         std::vector<DrawCmd>& postAlphaUnlitDraws,
-        std::vector<DrawCmd>& waterDraws,
-        std::vector<DrawCmd*>& animatedDraws);
+        std::vector<DrawCmd>& waterDraws);
 
     // Returns true if scene draw lists changed since last PrepareDrawLists call.
     bool IsDrawListsDirty() const { return drawListsDirty_; }
@@ -212,36 +179,22 @@ public:
         std::vector<ExportSceneEntity> entities;
         std::vector<std::string> loadedModelPaths;
         std::vector<std::string> loadedMeshPaths;
-        std::vector<std::string> loadedAnimPaths;
         std::vector<std::string> loadedTexturePaths;
         std::vector<std::string> loadedShaderNames;
     };
 
     ExportSceneSnapshot BuildExportSceneSnapshot(bool includeUnloadedDependencies = false) const;
     friend class DeferredRenderer;
+    friend class ParticlePass;
 
 private:
-    NDEVC::Graphics::IGraphicsDevice* device_ = nullptr;
-    NDEVC::Graphics::IShaderManager* shaderMgr_ = nullptr;
-
-    // --- Instance / model tracking ---
-    struct ParticleAttach {
-        std::shared_ptr<Particles::ParticleSystemNode> node;
-        std::string nodeName;
-        const Node* sourceNode = nullptr;
-        glm::mat4 local{1.0f};
-        void* instance = nullptr;
-        bool dynamicTransform = false;
-    };
-    std::vector<ParticleAttach> particleNodes;
     std::unordered_map<std::string, Node*> nodeMap;
-    std::vector<std::shared_ptr<ModelInstance>> instances;
+    std::vector<std::unique_ptr<ModelInstance>> instances;
     std::unordered_map<void*, double> instanceSpawnTimes;
     std::unordered_map<void*, std::string> instanceModelPathByOwner_;
     std::unordered_map<void*, std::string> instanceMeshResourceByOwner_;
     std::unordered_map<std::string, int> loadedModelRefCountByPath_;
     std::unordered_map<std::string, std::string> loadedMeshByModelPath_;
-    std::vector<std::unique_ptr<AnimatorNodeInstance>> animatorInstances;
 
     // --- Map + streaming ---
     struct StreamWindowState {
@@ -276,7 +229,6 @@ private:
     std::vector<DrawCmd> sceneRefractionDraws_;
     std::vector<DrawCmd> scenePostAlphaUnlitDraws_;
     std::vector<DrawCmd> sceneWaterDraws_;
-    std::vector<DrawCmd> sceneParticleDraws_;
     bool drawListsDirty_ = true;
     bool megaBufferRebuiltThisTick_ = false;
     int pendingEntityCount_ = 0;

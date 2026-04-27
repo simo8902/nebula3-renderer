@@ -1,6 +1,8 @@
 #include "Core/EngineSystems.h"
 #include "Core/Logger.h"
 
+#include "Core/FrameArena.h"
+#include "Engine/SceneManager.h"
 #include "Rendering/Interfaces/IRenderer.h"
 #include "Rendering/Rendering.h"
 #include <chrono>
@@ -16,6 +18,8 @@ struct EngineSystems::Impl {
     using Clock = std::chrono::steady_clock;
 
     Config config;
+    SceneManager scene_;
+    FrameArena arena_;
     std::unique_ptr<NDEVC::Graphics::IRenderer> renderer;
     RuntimeState runtimeState = RuntimeState::Booting;
     Clock::time_point lastFrameTime = Clock::time_point{};
@@ -33,6 +37,7 @@ struct EngineSystems::Impl {
                          " maxFrameDelta=", config.maxFrameDeltaSeconds,
                          " maxFixedUpdates=", config.maxFixedUpdatesPerFrame);
         NC::LOGGING::Log("[ENGINE] Renderer create ", (renderer ? "ok" : "null"));
+        renderer->AttachScene(scene_);
         renderer->Initialize();
 
 
@@ -67,6 +72,7 @@ struct EngineSystems::Impl {
     }
 
     void BeginFrame() {
+        arena_.Reset();
         const Clock::time_point now = Clock::now();
         if (lastFrameTime.time_since_epoch().count() == 0) {
             frameDeltaTime = config.fixedUpdateStepSeconds;
@@ -74,6 +80,12 @@ struct EngineSystems::Impl {
             frameDeltaTime = std::chrono::duration<double>(now - lastFrameTime).count();
             if (frameDeltaTime < 0.0 || !std::isfinite(frameDeltaTime)) frameDeltaTime = config.fixedUpdateStepSeconds;
             if (frameDeltaTime > config.maxFrameDeltaSeconds) frameDeltaTime = config.maxFrameDeltaSeconds;
+            
+            // Frame snapping / VSync smoothing
+            const double target60 = 1.0 / 60.0;
+            if (std::abs(frameDeltaTime - target60) < 0.002) {
+                frameDeltaTime = target60;
+            }
         }
         lastFrameTime = now;
         fixedUpdateAccumulator += frameDeltaTime;
@@ -85,9 +97,12 @@ struct EngineSystems::Impl {
 
     void PumpInput() {
         if (renderer) {
+            renderer->UpdateFrameTime(); // Ensure deltaTime is fresh for input polling
             renderer->PollEvents();
         }
-        // NC::LOGGING::Log("[ENGINE] PumpInput systems=", inputSystems.size());
+        // Sync engine's frameDeltaTime with renderer's calculated deltaTime
+        // (Assuming IRenderer provides a way to get it, or we just trust the sync later)
+        
         for (const auto& system : inputSystems) {
             if (system) {
                 system();
@@ -183,7 +198,7 @@ NDEVC::Graphics::IRenderer* EngineSystems::GetRenderer() const {
 }
 
 SceneManager& EngineSystems::GetScene() const {
-    return pImpl->renderer->GetScene();
+    return pImpl->scene_;
 }
 
 EngineSystems::RuntimeState EngineSystems::GetRuntimeState() const {
@@ -236,16 +251,21 @@ void EngineSystems::RunOneFrame() const {
         return;
     }
 
+    pImpl->BeginFrame();
+
     pImpl->PumpInput();
     if (pImpl->runtimeState != RuntimeState::Running) {
         if (pImpl->runtimeState == RuntimeState::Stopping) {
             pImpl->runtimeState = RuntimeState::Stopped;
             NC::LOGGING::Log("[ENGINE] Runtime state Stopping -> Stopped (after PumpInput)");
         }
+        pImpl->EndFrame();
         return;
     }
-
-    pImpl->BeginFrame();
+    // Sync renderer's deltaTime with engine's clamped frameDeltaTime
+    if (pImpl->renderer) {
+        pImpl->renderer->SetFrameDeltaTime(pImpl->frameDeltaTime);
+    }
     pImpl->Update();
     pImpl->Render();
     pImpl->EndFrame();

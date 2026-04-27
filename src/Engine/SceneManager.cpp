@@ -1,4 +1,5 @@
 #include "Engine/SceneManager.h"
+#include "Assets/ResourceServer.h"
 #include "Rendering/Mesh.h"
 #include "Rendering/MegaBuffer.h"
 #include "Assets/Model/Model.h"
@@ -25,6 +26,8 @@
 #include <random>
 #include <sstream>
 #include <unordered_set>
+
+using namespace NC::LOGGING;
 
 namespace {
 glm::mat4 BuildLocalTransform(const Node* node) {
@@ -289,78 +292,51 @@ bool ResolveDecalReceiveSolid(const Node* node) {
     return false;
 }
 
-enum class DrawBucket {
-    Solid,
-    AlphaTest,
-    Decal,
-    Water,
-    Refraction,
-    PostAlphaUnlit,
-    SimpleLayer,
-    Environment,
-    EnvironmentAlpha
-};
-
-DrawBucket DetermineDrawBucket(const DrawCmd& dc) {
-    const std::string shaderLower = ToLower(dc.shdr);
-    const std::string nodeTypeLower = ToLower(dc.modelNodeType);
-    const std::string nodeNameLower = ToLower(dc.nodeName);
+DrawBucket DetermineDrawBucket(const Node* node, NDEVC::Graphics::ITexture* const tex[12], bool isDecal, bool alphaTest) {
+    const std::string& shader   = node->shader;
+    const std::string& nodeType = node->model_node_type;
+    const std::string& nodeName = node->node_name;
 
     auto hasTag = [&](std::initializer_list<const char*> tags) {
         for (const char* tag : tags) {
-            if (ContainsNoCase(shaderLower, tag) ||
-                ContainsNoCase(nodeTypeLower, tag) ||
-                ContainsNoCase(nodeNameLower, tag)) {
+            if (ContainsNoCase(shader, tag) ||
+                ContainsNoCase(nodeType, tag) ||
+                ContainsNoCase(nodeName, tag)) {
                 return true;
             }
         }
         return false;
     };
 
-    const bool simpleLayerBySemantics =
-        HasTextureSemanticNoCase(dc.shaderParamsTexture, {"MaskMap"}) &&
-        HasTextureSemanticNoCase(dc.shaderParamsTexture, {"DiffMap2", "DiffMap1", "BumpMap1", "SpecMap1"});
-    const bool environmentBySemantics =
-        dc.tex[9] != nullptr || HasTextureSemanticNoCase(dc.shaderParamsTexture, {"CubeMap0", "EnvironmentMap"});
+    // tex slots assigned in BuildDrawsWithTransform:
+    //  [4]=DiffMap2/1  [5]=SpecMap1  [6]=BumpMap1  [7]=MaskMap  [9]=CubeMap0/EnvironmentMap
+    const bool simpleLayerBySemantics = tex[7] != nullptr && (tex[4] != nullptr || tex[5] != nullptr || tex[6] != nullptr);
+    const bool environmentBySemantics = tex[9] != nullptr;
     const bool decalReceiverByTag =
-        ContainsNoCase(shaderLower, "decalreceive") ||
-        ContainsNoCase(shaderLower, "decal_receive") ||
-        ContainsNoCase(nodeTypeLower, "decalreceive") ||
-        ContainsNoCase(nodeTypeLower, "decal_receive") ||
-        ContainsNoCase(nodeNameLower, "decalreceive") ||
-        ContainsNoCase(nodeNameLower, "decal_receive");
+        ContainsNoCase(shader,   "decalreceive") || ContainsNoCase(shader,   "decal_receive") ||
+        ContainsNoCase(nodeType, "decalreceive") || ContainsNoCase(nodeType, "decal_receive") ||
+        ContainsNoCase(nodeName, "decalreceive") || ContainsNoCase(nodeName, "decal_receive");
 
-    if (!decalReceiverByTag &&
-        (dc.isDecal ||
-        ContainsNoCase(shaderLower, "decal") ||
-        ContainsNoCase(nodeTypeLower, "decal"))) {
+    if (!decalReceiverByTag && (isDecal || ContainsNoCase(shader, "decal") || ContainsNoCase(nodeType, "decal")))
         return DrawBucket::Decal;
-    }
-    if (hasTag({"water"})) {
+    if (hasTag({"water"}))
         return DrawBucket::Water;
-    }
-    if (hasTag({"refract", "refraction"})) {
+    if (hasTag({"refract", "refraction"}))
         return DrawBucket::Refraction;
-    }
-    if (hasTag({"postalphaunlit", "post_alpha_unlit"})) {
+    if (hasTag({"postalphaunlit", "post_alpha_unlit"}))
         return DrawBucket::PostAlphaUnlit;
-    }
-    if (hasTag({"simplelayer", "simple_layer"}) || simpleLayerBySemantics) {
+    if (hasTag({"simplelayer", "simple_layer"}) || simpleLayerBySemantics)
         return DrawBucket::SimpleLayer;
-    }
-    if (hasTag({"environmentalpha", "environment_alpha", "envalpha", "env_alpha"})) {
+    if (hasTag({"environmentalpha", "environment_alpha", "envalpha", "env_alpha"}))
         return DrawBucket::EnvironmentAlpha;
-    }
-    if (hasTag({"environment", "envmap"}) || environmentBySemantics) {
+    if (hasTag({"environment", "envmap"}) || environmentBySemantics)
         return DrawBucket::Environment;
-    }
-    if (dc.alphaTest || hasTag({"alphatest", "alpha_test", "cutout"})) {
+    if (alphaTest || hasTag({"alphatest", "alpha_test", "cutout"}))
         return DrawBucket::AlphaTest;
-    }
     return DrawBucket::Solid;
 }
 
-std::string ResolveModelPath(const std::string& rawPathOrResource) {
+std::string ResolveModelPath(const std::string& rawPathOrResource, const std::string& baseDir = "") {
     namespace fs = std::filesystem;
     if (rawPathOrResource.empty()) return {};
 
@@ -381,6 +357,13 @@ std::string ResolveModelPath(const std::string& rawPathOrResource) {
 
     if (isFile(candidate)) {
         return candidate.string();
+    }
+
+    if (!baseDir.empty() && !candidate.is_absolute()) {
+        fs::path local = fs::path(baseDir) / candidate;
+        if (isFile(local)) {
+            return local.string();
+        }
     }
 
     if (!candidate.is_absolute()) {
@@ -500,29 +483,29 @@ const char* SceneManager::ParityStageName(ParityStage s) {
 }
 
 void SceneManager::ParityLogStageTransition(ParityStage next) {
-    NC::LOGGING::Log("[PARITY] stage ", ParityStageName(parityStage_),
-                     " -> ", ParityStageName(next),
-                     " (mapLoad=", parityMapLoadSeq_, " frame=", parityFrameSeq_, ")");
+    Info(Category::Engine, "Parity stage ", ParityStageName(parityStage_),
+         " -> ", ParityStageName(next),
+         " (mapLoad=", parityMapLoadSeq_, " frame=", parityFrameSeq_, ")");
     parityStage_ = next;
 }
 
 void SceneManager::ParityLogCounters(const char* context) {
-    NC::LOGGING::Log("[PARITY][", (context ? context : "?"), "]"
-                     " categoryRows=",      parityCounters_.categoryRowsLoaded,
-                     " entitiesCreated=",    parityCounters_.runtimeEntitiesCreated,
-                     " entitiesActivated=",  parityCounters_.entitiesActivated,
-                     " gfxProxies=",         parityCounters_.graphicsProxiesCreated,
-                     " internalAttached=",   parityCounters_.internalAttached,
-                     " validRenderables=",   parityCounters_.validRenderables,
-                     " submittedDrawCmds=",  parityCounters_.submittedDrawCommands);
-    NC::LOGGING::Log("[PARITY][", (context ? context : "?"), "][LIFECYCLE]"
-                     " total=",             static_cast<int>(runtimeEntities_.size()),
-                     " Created=",           CountRuntimeEntitiesInState(EntityLifecycleState::Created),
-                     " Activated=",         CountRuntimeEntitiesInState(EntityLifecycleState::Activated),
-                     " ProxyCreated=",      CountRuntimeEntitiesInState(EntityLifecycleState::ProxyCreated),
-                     " InternalAttached=",  CountRuntimeEntitiesInState(EntityLifecycleState::InternalAttached),
-                     " PendingValid=",      CountRuntimeEntitiesInState(EntityLifecycleState::PendingValid),
-                     " Valid=",             CountRuntimeEntitiesInState(EntityLifecycleState::Valid));
+    Debug(Category::Engine, "Parity counters [", (context ? context : "?"), "]"
+          " categoryRows=",      parityCounters_.categoryRowsLoaded,
+          " entitiesCreated=",    parityCounters_.runtimeEntitiesCreated,
+          " entitiesActivated=",  parityCounters_.entitiesActivated,
+          " gfxProxies=",         parityCounters_.graphicsProxiesCreated,
+          " internalAttached=",   parityCounters_.internalAttached,
+          " validRenderables=",   parityCounters_.validRenderables,
+          " submittedDrawCmds=",  parityCounters_.submittedDrawCommands);
+    Debug(Category::Engine, "Parity lifecycle [", (context ? context : "?"), "]"
+          " total=",             static_cast<int>(runtimeEntities_.size()),
+          " Created=",           CountRuntimeEntitiesInState(EntityLifecycleState::Created),
+          " Activated=",         CountRuntimeEntitiesInState(EntityLifecycleState::Activated),
+          " ProxyCreated=",      CountRuntimeEntitiesInState(EntityLifecycleState::ProxyCreated),
+          " InternalAttached=",  CountRuntimeEntitiesInState(EntityLifecycleState::InternalAttached),
+          " PendingValid=",      CountRuntimeEntitiesInState(EntityLifecycleState::PendingValid),
+          " Valid=",             CountRuntimeEntitiesInState(EntityLifecycleState::Valid));
 }
 
 const char* SceneManager::EntityLifecycleStateName(EntityLifecycleState s) {
@@ -549,8 +532,8 @@ int SceneManager::CountRuntimeEntitiesInState(EntityLifecycleState s) const {
 }
 
 void SceneManager::ParityDumpRuntimeEntities() const {
-    NC::LOGGING::Log("[PARITY][DUMP] runtime entities total=",
-                     static_cast<int>(runtimeEntities_.size()));
+    Debug(Category::Engine, "Parity dump runtime entities total=",
+          static_cast<int>(runtimeEntities_.size()));
 
     for (int si = 0; si < static_cast<int>(EntityLifecycleState::Count); ++si) {
         const auto state = static_cast<EntityLifecycleState>(si);
@@ -558,18 +541,17 @@ void SceneManager::ParityDumpRuntimeEntities() const {
         for (const auto& [owner, rec] : runtimeEntities_) {
             if (rec.state != state) continue;
             if (printed == 0) {
-                NC::LOGGING::Log("[PARITY][DUMP]  state=",
-                                 EntityLifecycleStateName(state), ":");
+                Debug(Category::Engine, "  state=", EntityLifecycleStateName(state), ":");
             }
-            NC::LOGGING::Log("[PARITY][DUMP]    owner=", owner,
-                             " model=", rec.modelPath,
-                             " draws=", rec.drawCount);
+            Trace(Category::Engine, "    owner=", owner,
+                  " model=", rec.modelPath,
+                  " draws=", rec.drawCount);
             ++printed;
             if (printed >= 16) {
                 const int remaining = CountRuntimeEntitiesInState(state) - printed;
                 if (remaining > 0) {
-                    NC::LOGGING::Log("[PARITY][DUMP]    ... and ",
-                                     remaining, " more in ", EntityLifecycleStateName(state));
+                    Debug(Category::Engine, "    ... and ",
+                          remaining, " more in ", EntityLifecycleStateName(state));
                 }
                 break;
             }
@@ -597,12 +579,12 @@ void SceneManager::TransitionEntity(void* owner, EntityLifecycleState newState) 
                                           newState == EntityLifecycleState::ProxyCreated);
 
     if (newOrd < oldOrd && !isMaterializationReWalk) {
-        NC::LOGGING::Warning("[PARITY][TRANSITION] backward transition owner=", owner,
+        Warning(Category::Assets, "[PARITY][TRANSITION] backward transition owner=", owner,
                              " ", EntityLifecycleStateName(oldState),
                              "->", EntityLifecycleStateName(newState),
                              " model=", it->second.modelPath);
     } else if (newOrd > oldOrd + 1 && !isImmediateValid) {
-        NC::LOGGING::Warning("[PARITY][TRANSITION] skip transition owner=", owner,
+        Warning(Category::Assets, "[PARITY][TRANSITION] skip transition owner=", owner,
                              " ", EntityLifecycleStateName(oldState),
                              "->", EntityLifecycleStateName(newState),
                              " model=", it->second.modelPath);
@@ -636,7 +618,7 @@ void SceneManager::MaterializeEntityDraws(void* owner, const std::string& modelP
         }
         ++parityCounters_.internalAttached;
         ++entityDrawCount;
-        switch (DetermineDrawBucket(dc)) {
+        switch (dc.bucket) {
         case DrawBucket::Decal:       sceneDecalDraws_.push_back(std::move(dc)); break;
         case DrawBucket::Water:       sceneWaterDraws_.push_back(std::move(dc)); break;
         case DrawBucket::Refraction:  sceneRefractionDraws_.push_back(std::move(dc)); break;
@@ -690,14 +672,54 @@ void SceneManager::TickPendingEntities() {
     }
 }
 
-void SceneManager::Initialize(NDEVC::Graphics::IGraphicsDevice* device,
-                              NDEVC::Graphics::IShaderManager* shaderMgr) {
-    device_ = device;
-    shaderMgr_ = shaderMgr;
-    if (activeSceneGuid_.empty()) {
-        activeSceneGuid_ = GenerateSceneGuid();
-    }
-    NC::LOGGING::Log("[SCENE] Initialize device=", (device_ ? 1 : 0), " shaderMgr=", (shaderMgr_ ? 1 : 0));
+SceneSnapshot SceneManager::BuildSnapshot(FrameArena& arena, const Camera& camera) const {
+    const size_t total = sceneSolidDraws_.size()
+                       + sceneAlphaTestDraws_.size()
+                       + sceneDecalDraws_.size()
+                       + sceneEnvironmentDraws_.size()
+                       + sceneEnvironmentAlphaDraws_.size()
+                       + sceneSimpleLayerDraws_.size()
+                       + sceneRefractionDraws_.size()
+                       + scenePostAlphaUnlitDraws_.size()
+                       + sceneWaterDraws_.size();
+
+    SceneSnapshot snap{};
+    if (total == 0) return snap;
+
+    RenderProxy* proxies = arena.Alloc<RenderProxy>(total);
+    if (!proxies) return snap;
+
+    uint32_t i = 0;
+    auto convert = [&](const std::vector<DrawCmd>& list, uint32_t flags) {
+        for (const DrawCmd& dc : list) {
+            RenderProxy& p   = proxies[i++];
+            p.worldMatrix    = dc.worldMatrix;
+            p.modelId        = ResourceServer::instance().Resolve(dc.mesh);
+            p.materialId     = dc.gpuMaterialIndex;
+            p.megaVertexOffset = dc.megaVertexOffset;
+            p.megaIndexOffset  = dc.megaIndexOffset;
+            p.flags          = flags
+                             | (dc.isStatic                         ? kProxyStatic    : 0u)
+                             | (dc.disabled || dc.userDisabled      ? kProxyDisabled  : 0u);
+        }
+    };
+
+    convert(sceneSolidDraws_,            0u);
+    convert(sceneAlphaTestDraws_,        kProxyAlphaTest);
+    convert(sceneDecalDraws_,            kProxyDecal);
+    convert(sceneEnvironmentDraws_,      kProxyEnvironment);
+    convert(sceneEnvironmentAlphaDraws_, kProxyEnvironment | kProxyAlphaTest);
+    convert(sceneSimpleLayerDraws_,      kProxySimpleLayer);
+    convert(sceneRefractionDraws_,       kProxyRefraction);
+    convert(scenePostAlphaUnlitDraws_,   kProxyAlphaTest);
+    convert(sceneWaterDraws_,            kProxyWater);
+
+    snap.proxies    = proxies;
+    snap.count      = i;
+    snap.cameraPos  = glm::vec3(camera.getPosition());
+    snap.view       = camera.getViewMatrix();
+    snap.projection = camera.getProjectionMatrix();
+    return snap;
 }
 
 SceneManager::AuthoredEntity* SceneManager::FindAuthoredEntity(SceneEntityId id) {
@@ -778,7 +800,7 @@ void SceneManager::CreateScene(const std::string& sceneName) {
 bool SceneManager::SaveSceneToPath(const std::string& path) {
     const std::string normalizedPath = EnsureScenePathHasExtension(path);
     if (normalizedPath.empty()) {
-        NC::LOGGING::Error("[SCENE] SaveScene failed: empty output path");
+        Error(Category::Engine, "SaveScene failed: empty output path");
         return false;
     }
 
@@ -787,7 +809,7 @@ bool SceneManager::SaveSceneToPath(const std::string& path) {
     if (fsPath.has_parent_path()) {
         std::filesystem::create_directories(fsPath.parent_path(), ec);
         if (ec) {
-            NC::LOGGING::Error("[SCENE] SaveScene failed creating directories path=", normalizedPath,
+            Error(Category::Engine, "SaveScene failed creating directories path=", normalizedPath,
                                " err=", ec.message());
             return false;
         }
@@ -795,7 +817,7 @@ bool SceneManager::SaveSceneToPath(const std::string& path) {
 
     std::ofstream out(fsPath, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
-        NC::LOGGING::Error("[SCENE] SaveScene failed opening file path=", normalizedPath);
+        Error(Category::Engine, "SaveScene failed opening file path=", normalizedPath);
         return false;
     }
     if (activeSceneGuid_.empty()) {
@@ -841,7 +863,7 @@ bool SceneManager::SaveSceneToPath(const std::string& path) {
     }
     out.flush();
     if (!out.good()) {
-        NC::LOGGING::Error("[SCENE] SaveScene failed writing file path=", normalizedPath);
+        Error(Category::Engine, "SaveScene failed writing file path=", normalizedPath);
         return false;
     }
 
@@ -855,7 +877,7 @@ bool SceneManager::SaveSceneToPath(const std::string& path) {
 
 bool SceneManager::SaveScene() {
     if (activeScenePath_.empty()) {
-        NC::LOGGING::Warning("[SCENE] SaveScene called without a scene path");
+        Warning(Category::Engine, "SaveScene called without a scene path");
         return false;
     }
     return SaveSceneToPath(activeScenePath_);
@@ -868,7 +890,7 @@ bool SceneManager::SaveScene(const std::string& path) {
 bool SceneManager::SaveSceneAs(const std::string& path) {
     const std::string normalizedPath = EnsureScenePathHasExtension(path);
     if (normalizedPath.empty()) {
-        NC::LOGGING::Warning("[SCENE] SaveSceneAs called with empty path");
+        Warning(Category::Engine, "SaveSceneAs called with empty path");
         return false;
     }
     activeScenePath_ = normalizedPath;
@@ -911,7 +933,7 @@ SceneManager::SceneEntityId SceneManager::CreateModelEntity(const std::string& m
         if (ModelInstance* instance = appendN3WTransform(entity.modelPath, pos, rot, scale)) {
             entity.runtimeOwner = static_cast<void*>(instance);
         } else {
-            NC::LOGGING::Warning("[SCENE] CreateModelEntity failed to materialize runtime model path=", entity.modelPath);
+            Warning(Category::Engine, "CreateModelEntity failed to materialize runtime model path=", entity.modelPath);
         }
     }
     authoredEntities_.push_back(std::move(entity));
@@ -1002,19 +1024,19 @@ void SceneManager::RebindAuthoredRuntimeOwners() {
 bool SceneManager::OpenScene(const std::string& path) {
     const std::string normalizedPath = EnsureScenePathHasExtension(path);
     if (normalizedPath.empty()) {
-        NC::LOGGING::Error("[SCENE] OpenScene failed: empty path");
+        Error(Category::Engine, "OpenScene failed: empty path");
         return false;
     }
 
     std::ifstream in(normalizedPath, std::ios::binary);
     if (!in.is_open()) {
-        NC::LOGGING::Error("[SCENE] OpenScene failed opening path=", normalizedPath);
+        Error(Category::Engine, "OpenScene failed opening path=", normalizedPath);
         return false;
     }
 
     std::string line;
     if (!std::getline(in, line) || Trim(line) != "NDSCENE1") {
-        NC::LOGGING::Error("[SCENE] OpenScene invalid header path=", normalizedPath);
+        Error(Category::Engine, "OpenScene invalid header path=", normalizedPath);
         return false;
     }
 
@@ -1131,7 +1153,7 @@ bool SceneManager::OpenScene(const std::string& path) {
         MapLoader loader;
         std::unique_ptr<MapData> loadedMap = loader.load_map(loadedMapPath);
         if (!loadedMap) {
-            NC::LOGGING::Warning("[SCENE] OpenScene map load failed path=", loadedMapPath);
+            Warning(Category::Engine, "OpenScene map load failed path=", loadedMapPath);
         } else {
             LoadMap(loadedMap.get(), loadedMapPath);
         }
@@ -1147,7 +1169,7 @@ bool SceneManager::SetActiveScene(const std::string& path) {
 
 void SceneManager::AppendModel(const std::string& path, const glm::vec3& pos,
                                const glm::quat& rot, const glm::vec3& scale) {
-    NC::LOGGING::Log("[SCENE] AppendModel path=", path,
+    Info(Category::Assets, "AppendModel path=", path,
                      " pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
                      " rot=(", rot.x, ",", rot.y, ",", rot.z, ",", rot.w, ")",
                      " scale=(", scale.x, ",", scale.y, ",", scale.z, ")");
@@ -1166,10 +1188,10 @@ SceneManager::SceneEntityId SceneManager::FindEntityIdByRuntimeOwner(void* owner
 
 void SceneManager::ImportMapAsEditableScene(const MapData* map, const std::string& sourcePath) {
     if (!map) {
-        NC::LOGGING::Warning("[SCENE] ImportMapAsEditableScene called with null map");
+        Warning(Category::Assets, "ImportMapAsEditableScene called with null map");
         return;
     }
-    NC::LOGGING::Log("[SCENE] ImportMapAsEditableScene begin instances=", map->instances.size(),
+    Info(Category::Assets, "ImportMapAsEditableScene begin instances=", map->instances.size(),
                      " groups=", map->groups.size(), " path=", sourcePath);
 
     suppressSceneDirty_ = true;
@@ -1186,6 +1208,8 @@ void SceneManager::ImportMapAsEditableScene(const MapData* map, const std::strin
     }
     activeScenePath_.clear();
     activeSceneGuid_ = GenerateSceneGuid();
+
+    const std::string mapDir = std::filesystem::path(sourcePath).parent_path().string();
 
     // Build group entities (empty GameObjects as hierarchy containers)
     std::vector<SceneEntityId> groupEntityIds(map->groups.size(), 0);
@@ -1229,7 +1253,7 @@ void SceneManager::ImportMapAsEditableScene(const MapData* map, const std::strin
             continue;
         }
         const std::string& mapModelId = map->string_table[tmpl.gfx_res_id];
-        const std::string modelPath = ResolveModelPath(mapModelId);
+        const std::string modelPath = ResolveModelPath(mapModelId, mapDir);
         if (modelPath.empty()) {
             ++skipped;
             continue;
@@ -1269,9 +1293,21 @@ void SceneManager::ImportMapAsEditableScene(const MapData* map, const std::strin
         authoredEntities_.push_back(std::move(entity));
     }
 
+    MeshServer::instance().buildMegaBuffer();
+    megaBufferRebuiltThisTick_ = true;
+    RefreshMegaOffsets(sceneSolidDraws_);
+    RefreshMegaOffsets(sceneAlphaTestDraws_);
+    RefreshMegaOffsets(sceneDecalDraws_);
+    RefreshMegaOffsets(sceneEnvironmentDraws_);
+    RefreshMegaOffsets(sceneEnvironmentAlphaDraws_);
+    RefreshMegaOffsets(sceneSimpleLayerDraws_);
+    RefreshMegaOffsets(sceneRefractionDraws_);
+    RefreshMegaOffsets(scenePostAlphaUnlitDraws_);
+    RefreshMegaOffsets(sceneWaterDraws_);
+
     suppressSceneDirty_ = false;
     activeSceneDirty_ = true;
-    NC::LOGGING::Log("[SCENE] ImportMapAsEditableScene done entities=", authoredEntities_.size(),
+    Info(Category::Assets, "ImportMapAsEditableScene done entities=", authoredEntities_.size(),
                      " skipped=", skipped);
 }
 
@@ -1280,7 +1316,7 @@ void SceneManager::LoadMap(const MapData* map) {
 }
 
 void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
-    NC::LOGGING::Log("[SCENE] LoadMap begin ptr=", (map ? 1 : 0));
+    Info(Category::Assets, "LoadMap begin ptr=", (map ? 1 : 0));
     if (currentMapSourcePath_ != sourcePath) {
         currentMapSourcePath_ = sourcePath;
         if (!authoredEntities_.empty() || !activeScenePath_.empty()) {
@@ -1294,9 +1330,8 @@ void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
     ParityLogStageTransition(ParityStage::LevelLoad);
 
     ResetStreamingState();
+    MeshServer::instance().clearCache();
     instances.clear();
-    particleNodes.clear();
-    animatorInstances.clear();
     nodeMap.clear();
     instanceSpawnTimes.clear();
     instanceModelPathByOwner_.clear();
@@ -1313,7 +1348,6 @@ void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
     sceneRefractionDraws_.clear();
     scenePostAlphaUnlitDraws_.clear();
     sceneWaterDraws_.clear();
-    sceneParticleDraws_.clear();
     instanceTransformCache_.clear();
     movedInstanceOwners_.clear();
     transformsStable_ = false;
@@ -1325,7 +1359,7 @@ void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
         ownedCurrentMap_.reset();
         currentMap = nullptr;
         drawListsDirty_ = true;
-        NC::LOGGING::Warning("[SCENE] LoadMap cleared current map (null input)");
+        Warning(Category::Assets, "LoadMap cleared current map (null input)");
         return;
     }
     ownedCurrentMap_ = std::make_unique<MapData>(*map);
@@ -1395,7 +1429,7 @@ void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
         for (const auto& dc : scenePostAlphaUnlitDraws_) scanDraw(dc);
         for (const auto& dc : sceneWaterDraws_) scanDraw(dc);
 
-        NC::LOGGING::Log("[SCENE][DECAL_RECEIVE] draws=", totalDraws,
+        Debug(Category::Engine, "DecalReceive: draws=", totalDraws,
                          " receivers=", receivers,
                          " decalDraws=", decalDraws,
                          " exactInt=", exactInt,
@@ -1410,25 +1444,25 @@ void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
                          " decalStringKeys=", decalStringKeys.size());
 
         if (exactInt == 0 && exactFloat == 0 && exactString == 0 && modelTypeExact == 0) {
-            NC::LOGGING::Warning("[SCENE][DECAL_RECEIVE] DecalReceiveSolid key was not found in parsed node params.");
+            Warning(Category::Engine, "DecalReceive: DecalReceiveSolid key was not found in parsed node params.");
         }
 
         int printed = 0;
         for (const auto& [key, hits] : decalIntKeys) {
             if (printed >= 8) break;
-            NC::LOGGING::Log("[SCENE][DECAL_RECEIVE] intKey=", key, " hits=", hits);
+            Debug(Category::Engine, "DecalReceive: intKey=", key, " hits=", hits);
             ++printed;
         }
         printed = 0;
         for (const auto& [key, hits] : decalFloatKeys) {
             if (printed >= 8) break;
-            NC::LOGGING::Log("[SCENE][DECAL_RECEIVE] floatKey=", key, " hits=", hits);
+            Debug(Category::Engine, "DecalReceive: floatKey=", key, " hits=", hits);
             ++printed;
         }
         printed = 0;
         for (const auto& [key, hits] : decalStringKeys) {
             if (printed >= 8) break;
-            NC::LOGGING::Log("[SCENE][DECAL_RECEIVE] stringKey=", key, " hits=", hits);
+            Debug(Category::Engine, "DecalReceive: stringKey=", key, " hits=", hits);
             ++printed;
         }
     }
@@ -1452,7 +1486,7 @@ void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
     ParityLogStageTransition(ParityStage::Valid);
     ParityLogCounters("MAP_LOAD_END");
 
-    NC::LOGGING::Log("[SCENE] LoadMap end instances=", instances.size(),
+    Info(Category::Assets, "LoadMap end instances=", instances.size(),
                      " solid=", sceneSolidDraws_.size(),
                      " alpha=", sceneAlphaTestDraws_.size(),
                      " decals=", sceneDecalDraws_.size(),
@@ -1461,32 +1495,29 @@ void SceneManager::LoadMap(const MapData* map, const std::string& sourcePath) {
                      " simpleLayer=", sceneSimpleLayerDraws_.size(),
                      " refraction=", sceneRefractionDraws_.size(),
                      " postAlpha=", scenePostAlphaUnlitDraws_.size(),
-                     " water=", sceneWaterDraws_.size(),
-                     " particles=", sceneParticleDraws_.size());
+                     " water=", sceneWaterDraws_.size());
 }
 
 void SceneManager::ReloadMap() {
     if (currentMapSourcePath_.empty()) {
-        NC::LOGGING::Warning("[SCENE] ReloadMap requested with empty source path");
+        Warning(Category::Assets, "ReloadMap requested with empty source path");
         return;
     }
-    NC::LOGGING::Log("[SCENE] ReloadMap begin path=", currentMapSourcePath_);
+    Info(Category::Assets, "ReloadMap begin path=", currentMapSourcePath_);
     MapLoader loader;
     auto reloaded = loader.load_map(currentMapSourcePath_);
     if (!reloaded) {
-        NC::LOGGING::Error("[SCENE] ReloadMap failed path=", currentMapSourcePath_);
+        Error(Category::Assets, "ReloadMap failed path=", currentMapSourcePath_);
         return;
     }
     LoadMap(reloaded.get(), currentMapSourcePath_);
-    NC::LOGGING::Log("[SCENE] ReloadMap end path=", currentMapSourcePath_);
+    Info(Category::Assets, "ReloadMap end path=", currentMapSourcePath_);
 }
 
 void SceneManager::Clear() {
-    NC::LOGGING::Log("[SCENE] Clear begin");
+    Debug(Category::Engine, "Clear begin");
     ClearAuthoredRuntimeOwners();
     instances.clear();
-    particleNodes.clear();
-    animatorInstances.clear();
     nodeMap.clear();
     ResetStreamingState();
     ownedCurrentMap_.reset();
@@ -1507,14 +1538,13 @@ void SceneManager::Clear() {
     sceneRefractionDraws_.clear();
     scenePostAlphaUnlitDraws_.clear();
     sceneWaterDraws_.clear();
-    sceneParticleDraws_.clear();
     instanceTransformCache_.clear();
     movedInstanceOwners_.clear();
     transformsStable_ = false;
     runtimeEntities_.clear();
     pendingEntityCount_ = 0;
     drawListsDirty_ = true;
-    NC::LOGGING::Log("[SCENE] Clear end");
+    Debug(Category::Engine, "Clear end");
 }
 
 void SceneManager::Tick(double dt, const Camera& camera) {
@@ -1567,22 +1597,32 @@ void SceneManager::PrepareDrawLists(
     std::vector<DrawCmd>& solidDraws,
     std::vector<DrawCmd>& alphaTestDraws,
     std::vector<DrawCmd>& decalDraws,
-    std::vector<DrawCmd>& particleDraws,
     std::vector<DrawCmd>& environmentDraws,
     std::vector<DrawCmd>& environmentAlphaDraws,
     std::vector<DrawCmd>& simpleLayerDraws,
     std::vector<DrawCmd>& refractionDraws,
     std::vector<DrawCmd>& postAlphaUnlitDraws,
-    std::vector<DrawCmd>& waterDraws,
-    std::vector<DrawCmd*>& animatedDraws) {
+    std::vector<DrawCmd>& waterDraws) {
     (void)camera;
+
+    // AAA Strategy: Ensure lists are ALWAYS populated since callers clear them.
+    // drawListsDirty_ should only control expensive rebuilds/materialization.
+    
+    solidDraws = sceneSolidDraws_;
+    alphaTestDraws = sceneAlphaTestDraws_;
+    decalDraws = sceneDecalDraws_;
+    environmentDraws = sceneEnvironmentDraws_;
+    environmentAlphaDraws = sceneEnvironmentAlphaDraws_;
+    simpleLayerDraws = sceneSimpleLayerDraws_;
+    refractionDraws = sceneRefractionDraws_;
+    postAlphaUnlitDraws = scenePostAlphaUnlitDraws_;
+    waterDraws = sceneWaterDraws_;
 
     if (!drawListsDirty_) {
         if (!movedInstanceOwners_.empty()) {
             PropagateMovedInstanceTransforms(solidDraws);
             PropagateMovedInstanceTransforms(alphaTestDraws);
             PropagateMovedInstanceTransforms(decalDraws);
-            PropagateMovedInstanceTransforms(particleDraws);
             PropagateMovedInstanceTransforms(environmentDraws);
             PropagateMovedInstanceTransforms(environmentAlphaDraws);
             PropagateMovedInstanceTransforms(simpleLayerDraws);
@@ -1594,17 +1634,6 @@ void SceneManager::PrepareDrawLists(
     }
     drawListsDirty_ = false;
 
-    solidDraws = sceneSolidDraws_;
-    alphaTestDraws = sceneAlphaTestDraws_;
-    decalDraws = sceneDecalDraws_;
-    particleDraws = sceneParticleDraws_;
-    environmentDraws = sceneEnvironmentDraws_;
-    environmentAlphaDraws = sceneEnvironmentAlphaDraws_;
-    simpleLayerDraws = sceneSimpleLayerDraws_;
-    refractionDraws = sceneRefractionDraws_;
-    postAlphaUnlitDraws = scenePostAlphaUnlitDraws_;
-    waterDraws = sceneWaterDraws_;
-
     RefreshMegaOffsets(solidDraws);
     RefreshMegaOffsets(alphaTestDraws);
     RefreshMegaOffsets(decalDraws);
@@ -1614,13 +1643,11 @@ void SceneManager::PrepareDrawLists(
     RefreshMegaOffsets(refractionDraws);
     RefreshMegaOffsets(postAlphaUnlitDraws);
     RefreshMegaOffsets(waterDraws);
-    RefreshMegaOffsets(particleDraws);
 
     if (!movedInstanceOwners_.empty()) {
         PropagateMovedInstanceTransforms(solidDraws);
         PropagateMovedInstanceTransforms(alphaTestDraws);
         PropagateMovedInstanceTransforms(decalDraws);
-        PropagateMovedInstanceTransforms(particleDraws);
         PropagateMovedInstanceTransforms(environmentDraws);
         PropagateMovedInstanceTransforms(environmentAlphaDraws);
         PropagateMovedInstanceTransforms(simpleLayerDraws);
@@ -1629,45 +1656,23 @@ void SceneManager::PrepareDrawLists(
         PropagateMovedInstanceTransforms(waterDraws);
     }
 
-    animatedDraws.clear();
-    auto collectAnimated = [&animatedDraws](std::vector<DrawCmd>& draws) {
-        for (auto& dc : draws) {
-            if (dc.hasPotentialTransformAnimation || dc.hasShaderVarAnimations) {
-                animatedDraws.push_back(&dc);
-            }
-        }
-    };
-    collectAnimated(solidDraws);
-    collectAnimated(alphaTestDraws);
-    collectAnimated(decalDraws);
-    collectAnimated(environmentDraws);
-    collectAnimated(environmentAlphaDraws);
-    collectAnimated(simpleLayerDraws);
-    collectAnimated(refractionDraws);
-    collectAnimated(postAlphaUnlitDraws);
-    collectAnimated(waterDraws);
-    collectAnimated(particleDraws);
-
-    // ── Parity: count submitted draw commands for this frame ──
     ++parityFrameSeq_;
     parityCounters_.submittedDrawCommands =
         static_cast<int>(solidDraws.size() + alphaTestDraws.size() +
                          decalDraws.size() + environmentDraws.size() +
                          environmentAlphaDraws.size() + simpleLayerDraws.size() +
                          refractionDraws.size() + postAlphaUnlitDraws.size() +
-                         waterDraws.size() + particleDraws.size());
+                         waterDraws.size());
 
-    NC::LOGGING::Log("[SCENE] PrepareDrawLists solid=", solidDraws.size(),
+    Debug(Category::Engine, "PrepareDrawLists solid=", solidDraws.size(),
                      " alpha=", alphaTestDraws.size(),
                      " decals=", decalDraws.size(),
-                     " particles=", particleDraws.size(),
                      " env=", environmentDraws.size(),
                      " envAlpha=", environmentAlphaDraws.size(),
                      " simpleLayer=", simpleLayerDraws.size(),
                      " refraction=", refractionDraws.size(),
                      " postAlpha=", postAlphaUnlitDraws.size(),
-                     " water=", waterDraws.size(),
-                     " animated=", animatedDraws.size());
+                     " water=", waterDraws.size());
 }
 
 SceneManager::ExportSceneSnapshot SceneManager::BuildExportSceneSnapshot(bool includeUnloadedDependencies) const {
@@ -1720,6 +1725,7 @@ SceneManager::ExportSceneSnapshot SceneManager::BuildExportSceneSnapshot(bool in
     }
 
     if (includeUnloadedDependencies && currentMap) {
+        const std::string mapDir = currentMapSourcePath_.empty() ? "" : std::filesystem::path(currentMapSourcePath_).parent_path().string();
         for (const Instance& inst : currentMap->instances) {
             if (inst.templ_index < 0 || static_cast<size_t>(inst.templ_index) >= currentMap->templates.size()) {
                 continue;
@@ -1729,7 +1735,7 @@ SceneManager::ExportSceneSnapshot SceneManager::BuildExportSceneSnapshot(bool in
                 continue;
             }
             const std::string& mapModelId = currentMap->string_table[tmpl.gfx_res_id];
-            const std::string resolvedModelPath = ResolveModelPath(mapModelId);
+            const std::string resolvedModelPath = ResolveModelPath(mapModelId, mapDir);
             InsertIfNotEmpty(modelSet, resolvedModelPath);
         }
     }
@@ -1746,7 +1752,7 @@ SceneManager::ExportSceneSnapshot SceneManager::BuildExportSceneSnapshot(bool in
             const auto model = ModelServer::instance().loadModel(modelPath, rep, opt);
             if (!model) {
                 ++failedModelCount;
-                NC::LOGGING::Warning("[SCENE][EXPORT] Failed to resolve model dependencies path=", modelPath);
+                Warning(Category::Engine, "Export: Failed to resolve model dependencies path=", modelPath);
                 continue;
             }
             ++scannedModelCount;
@@ -1760,7 +1766,7 @@ SceneManager::ExportSceneSnapshot SceneManager::BuildExportSceneSnapshot(bool in
                 }
             }
         }
-        NC::LOGGING::Log("[SCENE][EXPORT] Deep snapshot models=", modelSet.size(),
+        Info(Category::Engine, "Export: Deep snapshot models=", modelSet.size(),
                          " scanned=", scannedModelCount,
                          " failed=", failedModelCount,
                          " meshes=", meshSet.size(),
@@ -1786,32 +1792,15 @@ SceneManager::ExportSceneSnapshot SceneManager::BuildExportSceneSnapshot(bool in
 
     snapshot.loadedModelPaths = SortedStrings(modelSet);
     snapshot.loadedMeshPaths = SortedStrings(meshSet);
-    snapshot.loadedAnimPaths = SortedStrings(animSet);
     snapshot.loadedTexturePaths = SortedStrings(textureSet);
     snapshot.loadedShaderNames = SortedStrings(shaderSet);
     return snapshot;
 }
 
-// Propagates runtime transform changes into scene draw worldMatrix/rootMatrix.
-// Also resets invWorldMatrixHash to force GBuffer inverse recomputation.
 void SceneManager::PropagateMovedInstanceTransforms(std::vector<DrawCmd>& draws) {
     if (draws.empty() || movedInstanceOwners_.empty()) {
         return;
     }
-
-    std::unordered_map<const Node*, glm::mat4> localToModelCache;
-    std::function<glm::mat4(const Node*)> modelSpaceTransform = [&](const Node* node) -> glm::mat4 {
-        if (!node) return glm::mat4(1.0f);
-        auto it = localToModelCache.find(node);
-        if (it != localToModelCache.end()) {
-            return it->second;
-        }
-        const glm::mat4 local = BuildLocalTransform(node);
-        const glm::mat4 parent = node->node_parent ? modelSpaceTransform(node->node_parent) : glm::mat4(1.0f);
-        const glm::mat4 result = parent * local;
-        localToModelCache.emplace(node, result);
-        return result;
-    };
 
     for (DrawCmd& dc : draws) {
         if (!dc.instance) continue;
@@ -1825,7 +1814,7 @@ void SceneManager::PropagateMovedInstanceTransforms(std::vector<DrawCmd>& draws)
         glm::mat4 localTransform(1.0f);
         bool hasLocalTransform = false;
         if (dc.sourceNode) {
-            localTransform = modelSpaceTransform(dc.sourceNode);
+            localTransform = dc.cachedModelSpaceTransform;
             hasLocalTransform = true;
         } else {
             glm::mat4 inverseRoot(1.0f);
@@ -1842,7 +1831,6 @@ void SceneManager::PropagateMovedInstanceTransforms(std::vector<DrawCmd>& draws)
         dc.cullBoundsValid = false;
         dc.cullTransformHash = 0ull;
         dc.invWorldMatrixHash = ~0ull;
-        dc.frustumCulled = false;
         if (dc.isStatic) {
             // Avoid stale static-batch matrices after runtime transform changes.
             dc.isStatic = false;
@@ -1854,7 +1842,6 @@ void SceneManager::PropagateMovedInstanceTransformsToAllSceneDraws() {
     PropagateMovedInstanceTransforms(sceneSolidDraws_);
     PropagateMovedInstanceTransforms(sceneAlphaTestDraws_);
     PropagateMovedInstanceTransforms(sceneDecalDraws_);
-    PropagateMovedInstanceTransforms(sceneParticleDraws_);
     PropagateMovedInstanceTransforms(sceneEnvironmentDraws_);
     PropagateMovedInstanceTransforms(sceneEnvironmentAlphaDraws_);
     PropagateMovedInstanceTransforms(sceneSimpleLayerDraws_);
@@ -1865,9 +1852,10 @@ void SceneManager::PropagateMovedInstanceTransformsToAllSceneDraws() {
 
 ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
     const glm::vec3& pos, const glm::quat& rot, const glm::vec3& scale) {
-    const std::string modelPath = ResolveModelPath(path);
+    const std::string mapDir = currentMapSourcePath_.empty() ? "" : std::filesystem::path(currentMapSourcePath_).parent_path().string();
+    const std::string modelPath = ResolveModelPath(path, mapDir);
     if (modelPath.empty()) {
-        NC::LOGGING::Error("[SCENE] appendN3WTransform empty model path input=", path);
+        Error(Category::Assets, "appendN3WTransform empty model path input=", path);
         return nullptr;
     }
 
@@ -1877,13 +1865,13 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
     opt.n3filepath = modelPath;
     auto model = ModelServer::instance().loadModel(modelPath, rep, opt);
     if (!model) {
-        NC::LOGGING::Error("[SCENE] appendN3WTransform failed to load model path=", modelPath);
+        Error(Category::Assets, "appendN3WTransform failed to load model path=", modelPath);
         return nullptr;
     }
 
     auto instance = ModelServer::instance().createInstance(model);
     if (!instance) {
-        NC::LOGGING::Error("[SCENE] appendN3WTransform failed to create instance path=", modelPath);
+        Error(Category::Assets, "appendN3WTransform failed to create instance path=", modelPath);
         return nullptr;
     }
 
@@ -1899,7 +1887,7 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
     runtimeEntities_[owner] = std::move(rec);
     TransitionEntity(owner, EntityLifecycleState::Activated);
 
-    instances.push_back(instance);
+    instances.push_back(std::move(instance));
     instanceSpawnTimes[owner] = 0.0;
     instanceModelPathByOwner_[owner] = modelPath;
     ++loadedModelRefCountByPath_[modelPath];
@@ -1908,7 +1896,7 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
     if (!ModelServer::instance().IsModelRenderReady(modelPath)) {
         TransitionEntity(owner, EntityLifecycleState::PendingValid);
         drawListsDirty_ = true;
-        NC::LOGGING::Log("[SCENE] appendN3WTransform pending path=", modelPath);
+        Info(Category::Assets, "appendN3WTransform pending path=", modelPath);
         return rawInstance;
     }
 
@@ -1923,7 +1911,7 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
     int entityDrawCount = 0;
     auto classifyDraw = [this, &entityDrawCount](DrawCmd&& dc) {
         ++entityDrawCount;
-        switch (DetermineDrawBucket(dc)) {
+        switch (dc.bucket) {
         case DrawBucket::Decal:
             sceneDecalDraws_.push_back(std::move(dc));
             break;
@@ -1974,7 +1962,7 @@ ModelInstance* SceneManager::appendN3WTransform(const std::string& path,
     TransitionEntity(owner, EntityLifecycleState::Valid);
 
     drawListsDirty_ = true;
-    NC::LOGGING::Log("[SCENE] appendN3WTransform success path=", modelPath,
+    Info(Category::Assets, "appendN3WTransform success path=", modelPath,
                      " draws=", newDraws.size(),
                      " totalInstances=", instances.size());
 
@@ -1996,7 +1984,7 @@ NDEVC::Graphics::ITexture* SceneManager::GetOrCreateTextureRef(
 
     const GLuint handle = TextureServer::instance().loadTexture(textureResourceId);
     if (handle == 0) {
-        NC::LOGGING::Error("[SCENE] TextureRef load failed id=", textureResourceId, " type=", static_cast<int>(type));
+        Error(Category::Assets, "TextureRef load failed id=", textureResourceId, " type=", static_cast<int>(type));
         return nullptr;
     }
 
@@ -2010,35 +1998,56 @@ NDEVC::Graphics::ITexture* SceneManager::GetOrCreateTextureRef(
 void SceneManager::BuildDrawsWithTransform(const Model& model,
     const glm::mat4& instanceTransform, void* instance,
     std::vector<DrawCmd>& out) {
+    const std::vector<Node*>& allNodes = model.getNodes();
     std::unordered_map<const Node*, glm::mat4> localToModelCache;
     std::function<glm::mat4(const Node*)> modelSpaceTransform = [&](const Node* node) -> glm::mat4 {
         if (!node) return glm::mat4(1.0f);
         auto it = localToModelCache.find(node);
-        if (it != localToModelCache.end()) {
-            return it->second;
-        }
+        if (it != localToModelCache.end()) return it->second;
         const glm::mat4 local = BuildLocalTransform(node);
-        const glm::mat4 parent = node->node_parent ? modelSpaceTransform(node->node_parent) : glm::mat4(1.0f);
+        const glm::mat4 parent = (node->parentIndex != 0xFFFFFFFFu && node->parentIndex < allNodes.size())
+            ? modelSpaceTransform(allNodes[node->parentIndex])
+            : glm::mat4(1.0f);
         const glm::mat4 result = parent * local;
         localToModelCache.emplace(node, result);
         return result;
     };
 
-    for (const Node* node : model.getNodes()) {
-        if (!node || node->mesh_ressource_id.empty()) continue;
+    size_t nodesSkipped = 0;
+    size_t meshLoadFailed = 0;
+    for (const Node* node : allNodes) {
+        if (!node || node->mesh_ressource_id.empty()) {
+            ++nodesSkipped;
+            continue;
+        }
 
         Mesh* mesh = MeshServer::instance().loadMesh(node->mesh_ressource_id);
-        if (!mesh) continue;
+        if (!mesh) {
+            printf("[MESH_LOAD_FAILED] node=%s meshId=%s\n", node->node_name.c_str(), node->mesh_ressource_id.c_str());
+            ++meshLoadFailed;
+            continue;
+        }
 
         DrawCmd dc;
         dc.mesh = mesh;
-        dc.shdr = node->shader;
-        dc.shadowFiltered = (dc.shdr == "shd:water" || dc.shdr == "shd:decal" ||
-                             dc.shdr == "shd:simplelayer" || dc.shdr == "shd:uvanimated");
-        dc.nodeName = node->node_name;
-        dc.modelNodeType = node->model_node_type;
+        dc.shaderHash   = DrawCmdHash(node->shader);
+        dc.shadowFiltered = (node->shader == "shd:water" || node->shader == "shd:decal" ||
+                             node->shader == "shd:simplelayer" || node->shader == "shd:uvanimated");
+        dc.nodeNameHash = DrawCmdHash(node->node_name);
+        dc.nodeTypeHash = DrawCmdHash(node->model_node_type);
         dc.rootMatrix = instanceTransform;
         dc.worldMatrix = instanceTransform * modelSpaceTransform(node);
+
+        static int dbgCount = 0;
+        if (dbgCount++ < 20) {
+            printf("[DRAW_CMD %d] node=%s worldMatrix position: (%.2f, %.2f, %.2f)\n",
+                   dbgCount-1, node->node_name.c_str(),
+                   dc.worldMatrix[3][0], dc.worldMatrix[3][1], dc.worldMatrix[3][2]);
+            printf("[DRAW_CMD %d] instanceTransform position: (%.2f, %.2f, %.2f)\n",
+                   dbgCount-1,
+                   instanceTransform[3][0], instanceTransform[3][1], instanceTransform[3][2]);
+        }
+
         dc.localBoxMin = node->local_box_min;
         dc.localBoxMax = node->local_box_max;
         dc.position = node->position;
@@ -2049,7 +2058,6 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
         dc.sourceNode = node;
         dc.receivesDecals = ResolveDecalReceiveSolid(node);
 
-        dc.shaderParamsTexture = node->shader_params_texture;
         auto assignTextureSemantic = [&](int slot,
                                          std::initializer_list<const char*> semantics,
                                          NDEVC::Graphics::TextureType type) {
@@ -2086,14 +2094,6 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
                                   NDEVC::Graphics::TextureType::Texture2D);
         }
 
-        for (const auto& [k, v] : node->shader_params_int) {
-            dc.shaderParamsInt[k] = static_cast<int>(v);
-        }
-        for (const auto& [k, v] : node->shader_params_float) {
-            dc.shaderParamsFloat[k] = v;
-        }
-        dc.shaderParamsVec4 = node->shader_params_vec4;
-
         dc.cachedHasSpecMap = dc.tex[1] != nullptr || HasNonEmptyTexture(node, "SpecMap0");
         dc.cachedIsAdditive = GetIntParam(node->shader_params_int, "isAdditive",
                             GetIntParam(node->shader_params_int, "additive", 0)) != 0;
@@ -2110,9 +2110,23 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
         dc.cachedMatSpecularPower = GetFloatParam(node->shader_params_float, "MatSpecularPower", 32.0f);
         dc.cachedBumpScale = GetFloatParam(node->shader_params_float, "BumpScale", 1.0f);
         dc.cachedAlphaBlendFactor = GetFloatParam(node->shader_params_float, "alphaBlendFactor", 1.0f);
+        dc.cachedMayaAnimableAlpha = GetFloatParam(node->shader_params_float, "mayaAnimableAlpha", 1.0f);
+        dc.cachedEncodefactor = GetFloatParam(node->shader_params_float, "encodefactor", 1.0f);
         dc.cachedTwoSided = GetIntParam(node->shader_params_int, "twoSided", GetIntParam(node->shader_params_int, "TwoSided", 0));
         dc.cachedIsFlatNormal = GetIntParam(node->shader_params_int, "isFlatNormal", 0);
         dc.cullMode = GetIntParam(node->shader_params_int, "cullMode", 0);
+        if (const glm::vec4* customColor2 = FindVec4ParamNoCase(node->shader_params_vec4, "customColor2")) {
+            dc.cachedCustomColor2 = *customColor2;
+        }
+        if (const glm::vec4* tintingColour = FindVec4ParamNoCase(node->shader_params_vec4, "tintingColour")) {
+            dc.cachedTintingColour = *tintingColour;
+        }
+        if (const glm::vec4* highlightColor = FindVec4ParamNoCase(node->shader_params_vec4, "highlightColor")) {
+            dc.cachedHighlightColor = *highlightColor;
+        }
+        if (const glm::vec4* luminance = FindVec4ParamNoCase(node->shader_params_vec4, "luminance")) {
+            dc.cachedLuminance = *luminance;
+        }
 
         const float floatAlphaCutoff = GetFloatParam(node->shader_params_float, "alphaCutoff", -1.0f);
         float alphaCutoff;
@@ -2121,7 +2135,7 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
         } else {
             const int intAlphaRef = GetIntParam(node->shader_params_int, "AlphaRef", -1);
             if (intAlphaRef >= 0) {
-                alphaCutoff = static_cast<float>(intAlphaRef) / 255.0f;
+                alphaCutoff = static_cast<float>(intAlphaRef) / 256.0f;
             } else {
                 alphaCutoff = GetFloatParam(node->shader_params_float, "AlphaRef", 0.5f);
             }
@@ -2130,27 +2144,27 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
         const int alphaTestInt = GetIntParam(node->shader_params_int, "alphaTest", 0);
         const float alphaTestFloat = GetFloatParam(node->shader_params_float, "alphaTest", 0.0f);
         const bool alphaCutByName =
-            ContainsNoCase(dc.shdr, "alphatest") || ContainsNoCase(dc.shdr, "alpha_test") ||
-            ContainsNoCase(dc.modelNodeType, "alphatest") || ContainsNoCase(dc.modelNodeType, "alpha_test") ||
-            ContainsNoCase(dc.nodeName, "alphatest") || ContainsNoCase(dc.nodeName, "alpha_test");
+            ContainsNoCase(node->shader, "alphatest") || ContainsNoCase(node->shader, "alpha_test") ||
+            ContainsNoCase(node->model_node_type, "alphatest") || ContainsNoCase(node->model_node_type, "alpha_test") ||
+            ContainsNoCase(node->node_name, "alphatest") || ContainsNoCase(node->node_name, "alpha_test");
         const bool isAlphaBlendPass =
-            ContainsNoCase(dc.shdr, "postalphaunlit") ||
-            ContainsNoCase(dc.shdr, "environmentalpha") ||
-            ContainsNoCase(dc.modelNodeType, "postalphaunlit") ||
-            ContainsNoCase(dc.modelNodeType, "environmentalpha");
+            ContainsNoCase(node->shader, "postalphaunlit") ||
+            ContainsNoCase(node->shader, "environmentalpha") ||
+            ContainsNoCase(node->model_node_type, "postalphaunlit") ||
+            ContainsNoCase(node->model_node_type, "environmentalpha");
         dc.alphaTest = alphaTestInt != 0 || alphaTestFloat > 0.5f ||
                        (!isAlphaBlendPass && alphaCutByName);
 
         const bool isDecalReceiver =
-            ContainsNoCase(dc.shdr, "decalreceive") ||
-            ContainsNoCase(dc.shdr, "decal_receive") ||
-            ContainsNoCase(dc.modelNodeType, "decalreceive") ||
-            ContainsNoCase(dc.modelNodeType, "decal_receive") ||
-            ContainsNoCase(dc.nodeName, "decalreceive") ||
-            ContainsNoCase(dc.nodeName, "decal_receive");
+            ContainsNoCase(node->shader, "decalreceive") ||
+            ContainsNoCase(node->shader, "decal_receive") ||
+            ContainsNoCase(node->model_node_type, "decalreceive") ||
+            ContainsNoCase(node->model_node_type, "decal_receive") ||
+            ContainsNoCase(node->node_name, "decalreceive") ||
+            ContainsNoCase(node->node_name, "decal_receive");
         dc.isDecal = !isDecalReceiver &&
-                     (ContainsNoCase(dc.shdr, "decal") ||
-                      ContainsNoCase(dc.modelNodeType, "decal"));
+                     (ContainsNoCase(node->shader, "decal") ||
+                      ContainsNoCase(node->model_node_type, "decal"));
         if (dc.isDecal) {
             if (!dc.tex[0]) {
                 assignTextureSemantic(0, {"DiffMap1", "DecalMap"}, NDEVC::Graphics::TextureType::Texture2D);
@@ -2160,10 +2174,6 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
                                       NDEVC::Graphics::TextureType::Texture2D);
             }
         }
-        dc.hasPotentialTransformAnimation = !node->animSections.empty();
-        dc.hasShaderVarAnimations = std::any_of(
-            node->animSections.begin(), node->animSections.end(),
-            [](const AnimSection& section) { return !section.shaderVarSemantic.empty(); });
         const NodeMobilityHint mobilityHint = ResolveNodeMobilityHint(node);
         if (mobilityHint == NodeMobilityHint::Dynamic) {
             dc.isStatic = false;
@@ -2175,13 +2185,18 @@ void SceneManager::BuildDrawsWithTransform(const Model& model,
             dc.isStatic = true;
         }
 
+        dc.cachedModelSpaceTransform = modelSpaceTransform(node);
+        dc.bucket = DetermineDrawBucket(node, dc.tex, dc.isDecal, dc.alphaTest);
         out.push_back(std::move(dc));
     }
+    printf("[BUILD_DRAWS_SUMMARY] Created %zu DrawCmd objects, skipped %zu nodes (no mesh), %zu mesh load failures\n",
+           out.size(), nodesSkipped, meshLoadFailed);
+    fflush(stdout);
 }
 
 void SceneManager::LoadMapInstances(const MapData* map) {
     if (!map) {
-        NC::LOGGING::Warning("[SCENE] LoadMapInstances skipped (null map)");
+        Warning(Category::Assets, "LoadMapInstances skipped (null map)");
         return;
     }
 
@@ -2194,10 +2209,14 @@ void SceneManager::LoadMapInstances(const MapData* map) {
     size_t skippedModelLoad = 0;
     size_t skippedInstanceCreate = 0;
     size_t loadedInstances = 0;
-    NC::LOGGING::Log("[SCENE] LoadMapInstances begin mapInstances=", map->instances.size());
+    size_t skippedNotRenderReady = 0;
+    size_t createdDrawCommands = 0;
+    Info(Category::Assets, "LoadMapInstances begin mapInstances=", map->instances.size());
 
     // ── Parity: EntityCreate stage (≡ entityloader row iteration) ──
     ParityLogStageTransition(ParityStage::EntityCreate);
+
+    const std::string mapDir = currentMapSourcePath_.empty() ? "" : std::filesystem::path(currentMapSourcePath_).parent_path().string();
 
     for (const auto& inst : map->instances) {
         ++parityCounters_.categoryRowsLoaded;
@@ -2214,7 +2233,7 @@ void SceneManager::LoadMapInstances(const MapData* map) {
         }
 
         const std::string& mapModelId = map->string_table[tmpl.gfx_res_id];
-        const std::string modelPath = ResolveModelPath(mapModelId);
+        const std::string modelPath = ResolveModelPath(mapModelId, mapDir);
         if (modelPath.empty()) {
             ++skippedEmptyPath;
             continue;
@@ -2255,16 +2274,23 @@ void SceneManager::LoadMapInstances(const MapData* map) {
         ++parityCounters_.entitiesActivated;
         TransitionEntity(owner, EntityLifecycleState::Activated);
 
-        instances.push_back(modelInstance);
+        instances.push_back(std::move(modelInstance));
         instanceSpawnTimes[owner] = 0.0;
         instanceModelPathByOwner_[owner] = modelPath;
         ++loadedModelRefCountByPath_[modelPath];
 
         // ── Readiness gate: only build draws for render-ready models ──
         if (!ModelServer::instance().IsModelRenderReady(modelPath)) {
+            if (skippedNotRenderReady < 5) {
+                printf("[LOAD_MAP] Instance skipped (not render-ready): %s\n", modelPath.c_str());
+            }
+            ++skippedNotRenderReady;
             TransitionEntity(owner, EntityLifecycleState::PendingValid);
             ++loadedInstances;
             continue;
+        }
+        if (skippedNotRenderReady + createdDrawCommands < 5) {
+            printf("[LOAD_MAP] Instance IS render-ready: %s\n", modelPath.c_str());
         }
 
         // Model ready — consume deferred queue, build draws
@@ -2280,7 +2306,7 @@ void SceneManager::LoadMapInstances(const MapData* map) {
         auto classifyDraw = [this, &entityDrawCount](DrawCmd&& dc) {
             ++parityCounters_.internalAttached;
             ++entityDrawCount;
-            switch (DetermineDrawBucket(dc)) {
+            switch (dc.bucket) {
             case DrawBucket::Decal:
                 sceneDecalDraws_.push_back(std::move(dc));
                 break;
@@ -2318,6 +2344,7 @@ void SceneManager::LoadMapInstances(const MapData* map) {
                 loadedMeshByModelPath_[modelPath] = dc.sourceNode->mesh_ressource_id;
             }
             classifyDraw(std::move(dc));
+            ++createdDrawCommands;
         }
 
         // ── Lifecycle: InternalAttached → Valid (readiness gate passed) ──
@@ -2332,7 +2359,7 @@ void SceneManager::LoadMapInstances(const MapData* map) {
 
         ++loadedInstances;
         if ((loadedInstances % 256) == 0) {
-            NC::LOGGING::Log("[SCENE] LoadMapInstances progress loaded=", loadedInstances);
+            Debug(Category::Assets, "LoadMapInstances progress loaded=", loadedInstances);
         }
     }
 
@@ -2340,13 +2367,18 @@ void SceneManager::LoadMapInstances(const MapData* map) {
     ParityLogStageTransition(ParityStage::ProxyCreate);
     ParityLogStageTransition(ParityStage::InternalAttach);
 
-    NC::LOGGING::Log("[SCENE] LoadMapInstances end loaded=", loadedInstances,
+    Info(Category::Assets, "LoadMapInstances end loaded=", loadedInstances,
                      " skippedInvalidTemplate=", skippedInvalidTemplate,
                      " skippedInvalidResource=", skippedInvalidResource,
                      " skippedEmptyPath=", skippedEmptyPath,
                      " skippedModelLoad=", skippedModelLoad,
                      " skippedInstanceCreate=", skippedInstanceCreate,
+                     " skippedNotRenderReady=", skippedNotRenderReady,
+                     " createdDrawCommands=", createdDrawCommands,
                      " totalInstances=", instances.size());
+    printf("[LOAD_MAP_SUMMARY] Total instances loaded: %zu, render-ready: %zu, not render-ready: %zu, draw commands created: %zu\n",
+           map->instances.size(), loadedInstances - skippedNotRenderReady, skippedNotRenderReady, createdDrawCommands);
+    fflush(stdout);
     ParityLogCounters("LOAD_INSTANCES_END");
 }
 
@@ -2388,7 +2420,7 @@ void SceneManager::BuildStreamingIndex(const MapData* map) {
     }
     streamState_.lastTickTime = 0.0;
     streamState_.initialized = true;
-    NC::LOGGING::Log("[SCENE][STREAM] BuildStreamingIndex cells=", streamState_.cellToInstances.size(),
+    Debug(Category::Engine, "Stream: BuildStreamingIndex cells=", streamState_.cellToInstances.size(),
                      " mapInstances=", map->instances.size(),
                      " grid=", streamState_.gridW, "x", streamState_.gridH);
 }
@@ -2416,6 +2448,7 @@ ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t m
     if (!map || mapIndex >= map->instances.size()) {
         return nullptr;
     }
+    const std::string mapDir = currentMapSourcePath_.empty() ? "" : std::filesystem::path(currentMapSourcePath_).parent_path().string();
     auto loadedIt = streamState_.loadedOwnersByMapIndex.find(mapIndex);
     if (loadedIt != streamState_.loadedOwnersByMapIndex.end()) {
         void* owner = loadedIt->second;
@@ -2437,9 +2470,8 @@ ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t m
     }
 
     const std::string& mapModelId = map->string_table[tmpl.gfx_res_id];
-    const std::string modelPath = ResolveModelPath(mapModelId);
-    if (modelPath.empty()) {
-        return nullptr;
+    const std::string modelPath = ResolveModelPath(mapModelId, mapDir);
+    if (modelPath.empty()) {        return nullptr;
     }
 
     Reporter rep;
@@ -2477,7 +2509,7 @@ ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t m
     ++parityCounters_.entitiesActivated;
     TransitionEntity(owner, EntityLifecycleState::Activated);
 
-    instances.push_back(modelInstance);
+    instances.push_back(std::move(modelInstance));
     instanceSpawnTimes[owner] = 0.0;
     instanceModelPathByOwner_[owner] = modelPath;
     ++loadedModelRefCountByPath_[modelPath];
@@ -2503,7 +2535,7 @@ ModelInstance* SceneManager::LoadMapInstanceByIndex(const MapData* map, size_t m
     auto classifyDraw = [this, &entityDrawCount](DrawCmd&& dc) {
         ++parityCounters_.internalAttached;
         ++entityDrawCount;
-        switch (DetermineDrawBucket(dc)) {
+        switch (dc.bucket) {
         case DrawBucket::Decal:
             sceneDecalDraws_.push_back(std::move(dc));
             break;
@@ -2595,24 +2627,10 @@ void SceneManager::UnloadInstanceByOwner(void* owner) {
     removed |= eraseDrawsByOwner(sceneRefractionDraws_);
     removed |= eraseDrawsByOwner(scenePostAlphaUnlitDraws_);
     removed |= eraseDrawsByOwner(sceneWaterDraws_);
-    removed |= eraseDrawsByOwner(sceneParticleDraws_);
-
-    const size_t particleBefore = particleNodes.size();
-    particleNodes.erase(std::remove_if(particleNodes.begin(), particleNodes.end(),
-        [owner](const ParticleAttach& entry) { return entry.instance == owner; }),
-        particleNodes.end());
-    removed |= particleNodes.size() != particleBefore;
-
-    const size_t animatorBefore = animatorInstances.size();
-    animatorInstances.erase(std::remove_if(animatorInstances.begin(), animatorInstances.end(),
-        [owner](const std::unique_ptr<AnimatorNodeInstance>& anim) {
-            return anim && anim->GetOwner() == owner;
-        }), animatorInstances.end());
-    removed |= animatorInstances.size() != animatorBefore;
 
     const size_t instancesBefore = instances.size();
     instances.erase(std::remove_if(instances.begin(), instances.end(),
-        [owner](const std::shared_ptr<ModelInstance>& instance) {
+        [owner](const std::unique_ptr<ModelInstance>& instance) {
             return instance && static_cast<void*>(instance.get()) == owner;
         }), instances.end());
     removed |= instances.size() != instancesBefore;
@@ -2698,13 +2716,8 @@ void SceneManager::ApplySceneRebuildAfterStreamingChanges(bool meshLayoutChanged
         RefreshMegaOffsets(sceneRefractionDraws_);
         RefreshMegaOffsets(scenePostAlphaUnlitDraws_);
         RefreshMegaOffsets(sceneWaterDraws_);
-        RefreshMegaOffsets(sceneParticleDraws_);
     }
 
-    // Restore isStatic flags to source-of-truth values.
-    // PropagateMovedInstanceTransforms demotes isStatic→false on runtime
-    // transform changes.  After streaming churn, re-evaluate from the
-    // authoritative node mobility hint so static draws regain batch eligibility.
     auto restoreStaticFlags = [](std::vector<DrawCmd>& draws) {
         for (auto& dc : draws) {
             if (!dc.sourceNode) continue;
@@ -2863,7 +2876,7 @@ void SceneManager::UpdateIncrementalStreaming(bool forceFullSync) {
     if (loadedCount > 0 || unloadedCount > 0) {
         streamState_.stable = false;
         ApplySceneRebuildAfterStreamingChanges(meshLayoutChanged);
-        NC::LOGGING::Log("[SCENE][STREAM] Update loaded=", loadedCount,
+        Debug(Category::Engine, "Stream: Update loaded=", loadedCount,
                          " unloaded=", unloadedCount,
                          " loadedNow=", streamState_.loadedOwnersByMapIndex.size(),
                          " target=", targetSet.size(),
@@ -2878,10 +2891,14 @@ void SceneManager::UpdateIncrementalStreaming(bool forceFullSync) {
 
 void SceneManager::NotifyWebModelLoaded(const std::string& modelPath,
     const std::string& meshResourceId) {
-    NC::LOGGING::Log("[SCENE][WEB] model loaded path=", modelPath, " mesh=", meshResourceId);
+    Info(Category::Assets, "Web: model loaded path=", modelPath, " mesh=", meshResourceId);
 }
 
 void SceneManager::NotifyWebModelUnloaded(const std::string& modelPath,
     const std::string& meshResourceId) {
-    NC::LOGGING::Log("[SCENE][WEB] model unloaded path=", modelPath, " mesh=", meshResourceId);
+    Info(Category::Assets, "Web: model unloaded path=", modelPath, " mesh=", meshResourceId);
 }
+
+
+
+

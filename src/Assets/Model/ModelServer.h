@@ -55,8 +55,8 @@ public:
         return model;
     }
 
-    std::shared_ptr<ModelInstance> createInstance(std::shared_ptr<Model> model) {
-        return std::make_shared<ModelInstance>(model);
+    std::unique_ptr<ModelInstance> createInstance(std::shared_ptr<Model> model) {
+        return std::make_unique<ModelInstance>(model);
     }
 
     // ── Readiness query API ────────────────────────────────────────────

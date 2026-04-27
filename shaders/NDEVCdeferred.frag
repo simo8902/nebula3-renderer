@@ -1,137 +1,94 @@
 #version 460 core
 
-#ifdef BINDLESS
 #extension GL_ARB_bindless_texture : require
 #extension GL_ARB_gpu_shader_int64 : require
+#extension GL_ARB_shader_storage_buffer_object : require
+
+#ifndef ALPHA_CLIP
+#define ALPHA_CLIP 0
 #endif
 
-#ifndef BINDLESS
-uniform sampler2D DiffMap0;
-uniform sampler2D SpecMap0;
-uniform sampler2D BumpMap0;
-uniform sampler2D EmsvMap0;
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 1) in vec3 vTangentVS;
+layout(location = 2) in vec3 vNormalVS;
+layout(location = 3) in vec3 vBinormalVS;
+layout(location = 4) in vec3 vViewPos;
+layout(location = 5) flat in uint vMaterialIndex;
 
-uniform float MatEmissiveIntensity;
-uniform float MatSpecularIntensity;
-uniform float MatSpecularPower;
+layout(location = 0) out vec4 outPackedGBuffer;
+layout(location = 1) out vec4 outAlbedo;
 
-uniform int ReceivesDecals;
-uniform int alphaTest;
-uniform float alphaCutoff;
-uniform int twoSided;
-uniform int isFlatNormal;
-#endif
-
-#ifdef BINDLESS
+// MaterialGPU struct matching C++ std430 layout
 struct MaterialGPU {
-    uint64_t diffuseHandle;
-    uint64_t specularHandle;
-    uint64_t normalHandle;
-    uint64_t emissiveHandle;
-    float emissiveIntensity;
-    float specularIntensity;
-    float specularPower;
-    float alphaCutoff;
-    uint flags;
-    float bumpScale;
-    float intensity0;
-    float alphaBlendFactor;
-    uint64_t diffMap1Handle;
-    uint64_t specMap1Handle;
-    uint64_t bumpMap1Handle;
-    uint64_t maskMapHandle;
-    uint64_t alphaMapHandle;
-    uint64_t cubeMapHandle;
-    float velocityX;
-    float velocityY;
-    float scale;
-    float pad0;
+    uint64_t diffuseHandle;     // 0
+    uint64_t specularHandle;    // 8
+    uint64_t normalHandle;      // 16
+    uint64_t emissiveHandle;    // 24
+    float emissiveIntensity;    // 32
+    float specularIntensity;    // 36
+    float specularPower;        // 40
+    float alphaCutoff;          // 44
+    uint flags;                 // 48
+    float bumpScale;            // 52
+    float intensity0;           // 56
+    float alphaBlendFactor;     // 60
+    uint64_t diffMap1Handle;    // 64
+    uint64_t specMap1Handle;    // 72
+    uint64_t bumpMap1Handle;    // 80
+    uint64_t maskMapHandle;     // 88
+    uint64_t alphaMapHandle;    // 96
+    uint64_t cubeMapHandle;     // 104
+    float velocityX;            // 112
+    float velocityY;            // 116
+    float scale;                // 120
+    float pad0;                 // 124
 };
 
-layout(std430, binding = 2) readonly buffer MaterialBuffer {
+layout(std140, binding = 1) uniform PSRegisters {
+    vec4 pc[4];
+};
+
+// SSBO for bindless materials
+layout(std430, binding = 2) readonly buffer Materials {
     MaterialGPU materials[];
 };
 
-flat in uint vMaterialID;
+sampler2D bindlessSampler2D(uint64_t handle)
+{
+    return sampler2D(unpackUint2x32(handle));
+}
+
+void main()
+{
+    MaterialGPU mat = materials[vMaterialIndex];
+
+    vec4 diffuse = texture(bindlessSampler2D(mat.diffuseHandle), vTexCoord);
+
+#if ALPHA_CLIP
+    float alphaRef = pc[1].x * (1.0 / 256.0);
+    if (diffuse.w - alphaRef < 0.0) {
+        discard;
+    }
 #endif
 
-in vec3 sWorldPos;
-in vec3 sViewPos;
-in vec2 sUV;
-in vec2 sUV1;
-in vec3 sTangent;
-in vec3 sNormal;
-in vec3 sBinormal;
+    // DXT5nm: normal.xy stored in .wy channels
+    vec4 bump = texture(bindlessSampler2D(mat.normalHandle), vTexCoord);
+    vec2 nxy = bump.wy * 2.0 - 1.0;
 
-// 6-output standard G-buffer layout (matches environment.frag)
-layout(location=0) out vec4 gPositionVS;
-layout(location=1) out vec4 gNormalDepthPacked;
-layout(location=2) out vec4 gAlbedoSpec;
-layout(location=3) out vec4 gPositionWS;
-layout(location=4) out vec4 gEmissive;
-layout(location=5) out vec4 gNormalDepthEncoded_out;
+    // Perturb normal using view-space TBN
+    vec3 N = nxy.x * vTangentVS + nxy.y * vBinormalVS;
+    float nz = sqrt(clamp(1.0 - dot(nxy, nxy), 0.0, 1.0));
+    N += nz * vNormalVS;
 
-void main() {
-    const float MipBias = -0.5;
+    // Dual-paraboloid normal encoding
+    vec2 encoded = N.xy / (N.z + 1.0) * 0.281262308 + 0.5;
 
-#ifdef BINDLESS
-    MaterialGPU mat = materials[vMaterialID];
-    vec4 diffColor = texture(sampler2D(mat.diffuseHandle), sUV, MipBias);
-    bool doAlphaTest = (mat.flags & 1u) != 0u;
-    float cutoff = mat.alphaCutoff;
-#else
-    vec4 diffColor = texture(DiffMap0, sUV, MipBias);
-    bool doAlphaTest = alphaTest > 0;
-    float cutoff = alphaCutoff;
-#endif
-    if (doAlphaTest && diffColor.a < cutoff) discard;
+    // 16-bit linear depth (split into high/low bytes)
+    float dist = length(vViewPos);
+    float depthVal = dist * pc[0].x * (1.0 / 256.0);
+    float depthHigh = floor(depthVal) * (1.0 / 256.0);
+    float depthLow = fract(depthVal);
 
-    vec3 T = normalize(sTangent);
-    vec3 B = normalize(sBinormal);
-    vec3 N = normalize(sNormal);
-
-#ifdef BINDLESS
-    if ((mat.flags & 2u) != 0u && !gl_FrontFacing) { N = -N; T = -T; B = -B; }
-#else
-    if (twoSided > 0 && !gl_FrontFacing) { N = -N; T = -T; B = -B; }
-#endif
-
-#ifdef BINDLESS
-    vec4 bump = texture(sampler2D(mat.normalHandle), sUV, MipBias);
-#else
-    vec4 bump = texture(BumpMap0, sUV, MipBias);
-#endif
-    // DXT5nm unpack (.w and .y channels like original)
-    vec2 n2   = bump.wy * 2.0 - 1.0;
-    float nz  = sqrt(max(1.0 - dot(n2, n2), 0.0));
-
-#ifdef BINDLESS
-    bool flatN = (mat.flags & 4u) != 0u;
-#else
-    bool flatN = isFlatNormal > 0;
-#endif
-    // World-space normal via TBN (TBN is now world-space from vertex shader)
-    vec3 worldSpaceNormal = flatN ? N : normalize(n2.x * T + n2.y * B + nz * N);
-
-#ifdef BINDLESS
-    vec4 specColor    = texture(sampler2D(mat.specularHandle), sUV, MipBias);
-    float specIntensity  = clamp(specColor.r * mat.specularIntensity, 0.0, 1.0);
-    float specPowerPacked = clamp(mat.specularPower / 255.0, 0.0, 1.0);
-    vec3 emsvColor = texture(sampler2D(mat.emissiveHandle), sUV, MipBias).rgb * mat.emissiveIntensity;
-    float decalFlag = ((mat.flags & 8u) != 0u) ? 1.0 : 0.0;
-#else
-    vec4 specColor    = texture(SpecMap0, sUV, MipBias);
-    float specIntensity  = clamp(specColor.r * MatSpecularIntensity, 0.0, 1.0);
-    float specPowerPacked = clamp(MatSpecularPower / 255.0, 0.0, 1.0);
-    vec3 emsvColor = texture(EmsvMap0, sUV, MipBias).rgb * MatEmissiveIntensity;
-    float decalFlag = (ReceivesDecals > 0) ? 1.0 : 0.0;
-#endif
-
-    // Standard G-buffer outputs (matches environment.frag)
-    gPositionVS           = vec4(sViewPos, 1.0);
-    gNormalDepthPacked    = vec4(worldSpaceNormal * 0.5 + 0.5, specPowerPacked);
-    gAlbedoSpec           = vec4(diffColor.rgb, specIntensity);
-    gPositionWS           = vec4(sWorldPos, decalFlag);
-    gEmissive             = vec4(emsvColor, 0.0);
-    gNormalDepthEncoded_out = vec4(0.0);
+    outPackedGBuffer = vec4(encoded, depthHigh, depthLow);
+    outAlbedo = diffuse;
 }

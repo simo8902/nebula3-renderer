@@ -34,13 +34,12 @@ private:
     std::mutex shaderMutex_;
     std::unordered_map<std::string, std::filesystem::file_time_type> fileTimestamps_;
     std::unordered_set<std::string> pendingReloads_;
-    std::unordered_map<std::string, std::unordered_set<std::string>> pathToMaterialsMap_;
+    bool watcherPrimed_ = false;
 
     void FileWatchLoop();
     void UpdateFileMonitoring();
     void LoadShader(const std::filesystem::path& path);
     void ReloadShader(const std::string& name);
-    void RegisterShaderFileDependencies(const std::string& materialName, const std::shared_ptr<IShader>& shader);
     std::string ReadFile(const std::string& filePath);
 };
 

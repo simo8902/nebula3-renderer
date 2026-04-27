@@ -41,8 +41,6 @@ GLFWWindow::GLFWWindow(const std::string& title, int width, int height)
                 glfwWindowHint(GLFW_GREEN_BITS, mode->greenBits);
                 glfwWindowHint(GLFW_BLUE_BITS, mode->blueBits);
                 glfwWindowHint(GLFW_REFRESH_RATE, mode->refreshRate);
-                width = mode->width;
-                height = mode->height;
                 std::cout << "[WINDOW] Exclusive fullscreen " << width << "x" << height
                           << " @ " << mode->refreshRate << "Hz\n";
             }
@@ -89,6 +87,10 @@ void GLFWWindow::MakeCurrent() const {
     glfwMakeContextCurrent(handle_);
 }
 
+void GLFWWindow::ReleaseContext() const {
+    glfwMakeContextCurrent(nullptr);
+}
+
 void GLFWWindow::SwapBuffers() {
     glfwSwapBuffers(handle_);
 }
@@ -131,6 +133,10 @@ bool GLFWWindow::IsKeyPressed(int key) const {
     return glfwGetKey(handle_, key) == GLFW_PRESS;
 }
 
+bool GLFWWindow::IsMouseButtonPressed(int button) const {
+    return glfwGetMouseButton(handle_, button) == GLFW_PRESS;
+}
+
 void GLFWWindow::GetCursorPos(double& x, double& y) const {
     glfwGetCursorPos(handle_, &x, &y);
 }
@@ -141,6 +147,10 @@ void GLFWWindow::SetCursorPos(double x, double y) {
 
 void GLFWWindow::SetInputMode(int mode, int value) {
     glfwSetInputMode(handle_, mode, value);
+}
+
+void GLFWWindow::SetSwapInterval(int interval) {
+    glfwSwapInterval(interval);
 }
 
 void GLFWWindow::FramebufferSizeCallback(GLFWwindow* window, int width, int height) {

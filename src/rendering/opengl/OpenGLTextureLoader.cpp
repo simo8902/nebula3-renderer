@@ -178,15 +178,12 @@ std::shared_ptr<ITexture> OpenGLTextureLoader::LoadDDS(const std::string& path) 
         texDesc.mipLevels = 1;
         auto texture = std::make_shared<OpenGLTexture>(texDesc);
         GLuint tex = *(GLuint*)texture->GetNativeHandle();
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, isSRGB ? GL_SRGB8_ALPHA8 : GL_RGBA8,
-            (GLsizei)src->width, (GLsizei)src->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, src->pixels);
-        glGenerateMipmap(GL_TEXTURE_2D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-        glBindTexture(GL_TEXTURE_2D, 0);
+        glTextureSubImage2D(tex, 0, 0, 0, (GLsizei)src->width, (GLsizei)src->height, GL_RGBA, GL_UNSIGNED_BYTE, src->pixels);
+        glGenerateTextureMipmap(tex);
+        glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
         return texture;
     } else {
@@ -233,11 +230,9 @@ std::shared_ptr<ITexture> OpenGLTextureLoader::CreateFallbackTexture(uint8_t r, 
     uint8_t data[] = {r, g, b, a};
     auto texture = std::make_shared<OpenGLTexture>(desc);
     GLuint tex = *(GLuint*)texture->GetNativeHandle();
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    glTextureSubImage2D(tex, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     return texture;
 }

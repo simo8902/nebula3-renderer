@@ -7,9 +7,12 @@
 #include <cstdint>
 #include "Rendering/Interfaces/RenderingTypes.h"
 
+#include <string>
+
 namespace NDEVC::Graphics {
 
 struct TextureDesc {
+    std::string debugName;
     TextureType type = TextureType::Texture2D;
     Format format = Format::RGBA8_UNORM;
     uint32_t width = 1;

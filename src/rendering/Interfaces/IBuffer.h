@@ -7,9 +7,12 @@
 #include <cstdint>
 #include "Rendering/Interfaces/RenderingTypes.h"
 
+#include <string>
+
 namespace NDEVC::Graphics {
 
 struct BufferDesc {
+    std::string debugName;
     BufferType type = BufferType::Vertex;
     uint32_t size = 0;
     const void* initialData = nullptr;

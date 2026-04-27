@@ -1,7 +1,4 @@
 build/
 cmake-build-debug/
-cmake-build-syntax/
-review-build/
-review-build-core/
-.github/copilot-instructions.md
-.github/agents/simo.agent.md
+cmake-build-release/
+bin/

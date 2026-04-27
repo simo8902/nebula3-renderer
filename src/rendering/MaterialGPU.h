@@ -31,8 +31,16 @@ struct MaterialGPU {
     float velocityY;            //116
     float scale;                //120
     float pad0;                 //124
+    float mayaAnimableAlpha;    //128
+    float encodefactor;         //132
+    float pad1;                 //136
+    float pad2;                 //140
+    float customColor2[4];      //144
+    float tintingColour[4];     //160
+    float highlightColor[4];    //176
+    float luminance[4];         //192
 };
-static_assert(sizeof(MaterialGPU) == 128, "MaterialGPU must be 128 bytes for std430");
+static_assert(sizeof(MaterialGPU) == 208, "MaterialGPU must be 208 bytes for std430");
 
 enum MaterialFlags : uint32_t {
     MATFLAG_ALPHA_TEST      = 1u << 0,

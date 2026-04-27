@@ -33,6 +33,10 @@ void OpenGLSampler::CreateSampler(const SamplerDesc& desc) {
     glSamplerParameterf(handle_, GL_TEXTURE_MIN_LOD, desc.minLod);
     glSamplerParameterf(handle_, GL_TEXTURE_MAX_LOD, desc.maxLod);
     glSamplerParameterf(handle_, GL_TEXTURE_LOD_BIAS, desc.lodBias);
+
+    if (!desc.debugName.empty()) {
+        glObjectLabel(GL_SAMPLER, handle_, static_cast<GLsizei>(desc.debugName.size()), desc.debugName.c_str());
+    }
 }
 
 GLenum OpenGLSampler::SamplerFilter2GL(SamplerFilter filter) {

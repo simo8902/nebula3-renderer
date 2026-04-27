@@ -88,7 +88,7 @@ enum class CullMode {
 struct DepthState {
     bool depthTest = true;
     bool depthWrite = true;
-    CompareFunc depthFunc = CompareFunc::Less;
+    CompareFunc depthFunc = CompareFunc::Greater;
 };
 
 struct BlendState {

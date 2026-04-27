@@ -32,8 +32,9 @@ public:
 
     virtual void Initialize() = 0;
     virtual void Shutdown() = 0;
-    virtual void PollEvents() = 0;
-    virtual void RenderFrame() = 0;
+    virtual void UpdateFrameTime() = 0;
+    virtual void SetFrameDeltaTime(double dt) = 0;
+    virtual void PollEvents() = 0;    virtual void RenderFrame() = 0;
     virtual void RenderSingleFrame() = 0;
     virtual bool ShouldClose() const = 0;
     virtual void Resize(int width, int height) = 0;
@@ -42,6 +43,7 @@ public:
     virtual bool GetCheckGLErrors() const = 0;
     virtual void SetRenderLog(bool enabled) = 0;
 
+    virtual void AttachScene(SceneManager& scene) = 0;
     virtual SceneManager& GetScene() = 0;
     virtual Camera& GetCamera() = 0;
     virtual const Camera& GetCamera() const = 0;

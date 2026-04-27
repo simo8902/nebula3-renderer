@@ -24,6 +24,8 @@ public:
     void BindStorageBuffer(IBuffer* buffer, uint32_t bindingPoint) override;
     void SetViewport(const Viewport& viewport) override;
     void BindFramebuffer(IFramebuffer* fbo) override;
+    void SetDefaultFramebuffer(uint32_t fbo) override { defaultFBO_ = fbo; }
+    uint32_t GetDefaultFramebuffer() const override { return defaultFBO_; }
     void BindTexture(ITexture* texture, uint32_t slot) override;
     void BindSampler(ISampler* sampler, uint32_t slot) override;
     void ApplyRenderState(IRenderState* state) override;
@@ -31,13 +33,14 @@ public:
 
     void Clear(bool color, bool depth, bool stencil,
         const glm::vec4& clearColor = glm::vec4(0),
-        float clearDepth = 1.0f,
+        float clearDepth = 0.0f,
         uint8_t clearStencil = 0) override;
 
     const char* GetRendererName() const override;
 
 private:
-    GLuint boundFBO_;
+    GLuint boundFBO_ = 0;
+    uint32_t defaultFBO_ = 0;
     GLuint boundProgram_;
     GLuint boundTextures_[32];
     GLenum boundTextureTargets_[32];

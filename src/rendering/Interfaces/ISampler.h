@@ -6,9 +6,12 @@
 
 #include "Rendering/Interfaces/RenderingTypes.h"
 
+#include <string>
+
 namespace NDEVC::Graphics {
 
 struct SamplerDesc {
+    std::string debugName;
     SamplerFilter minFilter = SamplerFilter::Linear;
     SamplerFilter magFilter = SamplerFilter::Linear;
     SamplerWrap wrapS = SamplerWrap::Repeat;

@@ -6,50 +6,6 @@
 
 #include "glm.hpp"
 #include "Platform/NDEVcHeaders.h"
-#include "Assets/Particles/EnvelopeCurve.h"
-
-// Animation enums
-enum AnimNodeType {
-    IntAnimator = 0,
-    FloatAnimator = 1,
-    Float4Animator = 2,
-    TransformAnimator = 3,
-    TransformCurveAnimator = 4,
-    UvAnimator = 5,
-    InvalidAnimNodeType = 6
-};
-
-enum AnimLoopType {
-    Clamp = 0,
-    Loop = 1
-};
-
-// Animation key template
-template<typename T>
-struct AnimKey {
-    float time = 0.0f;
-    T value;
-
-    void SetTime(float t) { time = t; }
-    void SetValue(const T& v) { value = v; }
-};
-
-// Animation section structure
-struct AnimSection {
-    AnimNodeType animationNodeType = TransformAnimator;
-    AnimLoopType loopType = Clamp;
-    std::vector<std::string> animatedNodesPath;
-    std::string shaderVarSemantic;
-    std::vector<AnimKey<glm::vec4>> posArray;
-    std::vector<AnimKey<glm::vec4>> eulerArray;
-    std::vector<AnimKey<glm::vec4>> scaleArray;
-    std::vector<AnimKey<float>> floatKeyArray;
-    std::vector<AnimKey<glm::vec4>> float4KeyArray;
-    std::vector<AnimKey<int32_t>> intKeyArray;
-    std::vector<int32_t> layer;
-    std::string animationName;
-    int32_t animationGroup = 0;
-};
 
 struct Joint {
     int32_t joint_idx = 0;
@@ -68,8 +24,7 @@ struct SkinFragment {
 struct Node {
     std::string node_name;
     std::string node_type;
-    Node* node_parent = nullptr;
-    std::vector<Node*> node_children;
+    uint32_t parentIndex = 0xFFFFFFFFu;
 
     glm::vec4 position{0.0f, 0.0f, 0.0f, 1.0f};
     glm::vec4 rotation{0.0f, 0.0f, 0.0f, 1.0f};
@@ -108,49 +63,6 @@ struct Node {
     std::vector<Joint> joints;
     int32_t num_skin_fragments = 0;
     std::unordered_map<int32_t, std::vector<int32_t>> skin_fragments;
-
-    Particles::EnvelopeCurve emission_frequency;
-    Particles::EnvelopeCurve lifetime;
-    Particles::EnvelopeCurve spread_min;
-    Particles::EnvelopeCurve spread_max;
-    Particles::EnvelopeCurve start_velocity;
-    Particles::EnvelopeCurve rotation_velocity;
-    Particles::EnvelopeCurve particle_size;
-    Particles::EnvelopeCurve particle_mass;
-    Particles::EnvelopeCurve time_manipulator;
-    Particles::EnvelopeCurve velocity_factor;
-    Particles::EnvelopeCurve air_resistance;
-    Particles::EnvelopeCurve color_red;
-    Particles::EnvelopeCurve color_green;
-    Particles::EnvelopeCurve color_blue;
-    Particles::EnvelopeCurve color_alpha;
-
-    // ParticleSystemNode floats
-    float particle_emission_duration = 0.0f;
-    float particle_activity_distance = 0.0f;
-    float start_rotation_min = 0.0f;
-    float start_rotation_max = 0.0f;
-    float particle_gravity = 0.0f;
-    float particle_stretch = 0.0f;
-    float texture_tile = 1.0f;
-    float velocity_randomize = 0.0f;
-    float rotation_randomize = 0.0f;
-    float size_randomize = 0.0f;
-    float precalc_time = 0.0f;
-    float start_delay = 0.0f;
-
-    // ParticleSystemNode bools/ints
-    bool particle_looping = false;
-    bool render_oldest_first = false;
-    bool particle_billboard = false;
-    bool stretch_to_start = false;
-    bool randomize_rotation = false;
-    bool view_angle_fade = false;
-    bool curve_looping = false;
-    int32_t stretch_detail = 0;
-
-    // Animation data
-    std::vector<AnimSection> animSections;
 };
 
 struct Reporter {

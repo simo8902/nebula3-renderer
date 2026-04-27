@@ -4,7 +4,6 @@
 #ifndef NDEVC_MODEL_H
 #define NDEVC_MODEL_H
 
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -32,7 +31,7 @@ public:
 private:
     Node* rootNode = nullptr;
     std::vector<Node*> nodeList;
-    std::vector<std::unique_ptr<Node>> nodeStorage;
+    std::vector<Node> nodeStorage;
 
     std::string modelType;
     std::string modelName;

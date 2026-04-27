@@ -15,8 +15,32 @@
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <string_view>
 
 namespace NC::LOGGING {
+
+    enum class Level {
+        Trace = 0,   // High-volume noise (per-frame, individual compilation steps)
+        Debug,       // Detailed info for developers
+        Info,        // General engine status (Scene loaded, window created)
+        Warning,     // Recoverable issues
+        Error,       // Critical failures
+        Fatal        // Unrecoverable crash
+    };
+
+    enum class Category {
+        Generic,
+        Engine,
+        Graphics,
+        Shader,
+        VFS,
+        Assets,
+        Animation,
+        Input,
+        Platform,
+        Editor
+    };
+
 #ifdef NDEVC_DISABLE_LOGGING
     static constexpr bool ENABLED = false;
 #else
@@ -26,6 +50,58 @@ namespace NC::LOGGING {
     inline std::mutex& LogMutex() {
         static std::mutex m;
         return m;
+    }
+
+    inline std::string_view LevelToString(Level level) {
+        switch (level) {
+            case Level::Trace:   return "TRACE";
+            case Level::Debug:   return "DEBUG";
+            case Level::Info:    return "INFO ";
+            case Level::Warning: return "WARN ";
+            case Level::Error:   return "ERROR";
+            case Level::Fatal:   return "FATAL";
+            default:             return "UNKN ";
+        }
+    }
+
+    inline std::string_view CategoryToString(Category cat) {
+        switch (cat) {
+            case Category::Generic:   return "GEN";
+            case Category::Engine:    return "ENG";
+            case Category::Graphics:  return "GFX";
+            case Category::Shader:    return "SHD";
+            case Category::VFS:       return "VFS";
+            case Category::Assets:    return "AST";
+            case Category::Animation: return "ANI";
+            case Category::Input:     return "INP";
+            case Category::Platform:  return "PLT";
+            case Category::Editor:    return "EDT";
+            default:                  return "???";
+        }
+    }
+
+    inline std::ostream& operator<<(std::ostream& os, Category cat) {
+        return os << CategoryToString(cat);
+    }
+
+    inline std::ostream& operator<<(std::ostream& os, Level level) {
+        return os << LevelToString(level);
+    }
+
+
+    inline Level GetMinLogLevel() {
+        static Level minLevel = []() {
+            const char* env = std::getenv("NDEVC_LOG_LEVEL");
+            if (!env) return Level::Info; // Default to INFO (Shader TRACE/DEBUG will be hidden)
+            std::string_view s(env);
+            if (s == "TRACE") return Level::Trace;
+            if (s == "DEBUG") return Level::Debug;
+            if (s == "INFO")  return Level::Info;
+            if (s == "WARN")  return Level::Warning;
+            if (s == "ERROR") return Level::Error;
+            return Level::Info;
+        }();
+        return minLevel;
     }
 
     inline std::string TimestampNow() {
@@ -59,53 +135,87 @@ namespace NC::LOGGING {
             if (logPath.has_parent_path()) {
                 std::filesystem::create_directories(logPath.parent_path(), ec);
             }
-            file.open(logPath, std::ios::out | std::ios::app);
+            file.open(logPath, std::ios::out | std::ios::trunc);
             if (file.is_open()) {
-                const std::filesystem::path absPath = std::filesystem::absolute(logPath, ec);
-                file << "===== SESSION START " << TimestampNow() << " PATH=" << absPath.string() << " =====\n";
+                file << "===== NDEVC SESSION START " << TimestampNow() << " =====\n";
+                file << "Log Level: " << LevelToString(GetMinLogLevel()) << "\n";
                 file.flush();
-                // NOTE: stdout/stderr redirect removed — it causes any stray
-                // cout/cerr anywhere (including libraries) to trigger disk I/O,
-                // killing frame rate.  All engine logging goes through Log/Warning/Error
-                // which write to the file directly.
             }
         }
         return file;
     }
 
     template<typename... Args>
-    inline void WriteFileLineUnlocked(const char* level, Args&&... args) {
+    inline void WriteFormatted(Level level, Category category, Args&&... args) {
+        if (level < GetMinLogLevel()) return;
+
         auto& file = LogFile();
-        if (!file.is_open()) {
-            return;
+        const std::lock_guard<std::mutex> lock(LogMutex());
+        
+        std::string ts = TimestampNow();
+        std::string lvl = std::string(LevelToString(level));
+        std::string cat = std::string(CategoryToString(category));
+
+        if (file.is_open()) {
+            file << "[" << ts << "] [" << lvl << "] [" << cat << "] ";
+            (file << ... << args);
+            file << "\n";
+            file.flush();
         }
-        file << "[" << TimestampNow() << "] [T:" << std::this_thread::get_id() << "] [" << level << "] ";
-        (file << ... << args);
-        file << "\n";
+
+        // Mirror to console for immediate visibility and flush it
+        if (level >= Level::Info) {
+            std::ostream& os = (level >= Level::Error) ? std::cerr : std::cout;
+            os << "[" << ts << "] [" << lvl << "] [" << cat << "] ";
+            (os << ... << args);
+            os << "\n";
+            os.flush();
+        }
+    }
+
+    // --- Modern Level-Based API ---
+
+    template<typename... Args>
+    inline void Trace(Category cat, Args&&... args) {
+        if constexpr (ENABLED) WriteFormatted(Level::Trace, cat, std::forward<Args>(args)...);
     }
 
     template<typename... Args>
+    inline void Debug(Category cat, Args&&... args) {
+        if constexpr (ENABLED) WriteFormatted(Level::Debug, cat, std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    inline void Info(Category cat, Args&&... args) {
+        if constexpr (ENABLED) WriteFormatted(Level::Info, cat, std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    inline void Warn(Category cat, Args&&... args) {
+        if constexpr (ENABLED) WriteFormatted(Level::Warning, cat, std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    inline void Error(Category cat, Args&&... args) {
+        if constexpr (ENABLED) WriteFormatted(Level::Error, cat, std::forward<Args>(args)...);
+    }
+
+    // --- Legacy Compatibility Shim ---
+    
+    template<typename... Args>
     inline void Log(Args&&... args) {
-        if constexpr (ENABLED) {
-            const std::lock_guard<std::mutex> lock(LogMutex());
-            WriteFileLineUnlocked("INFO", std::forward<Args>(args)...);
-        }
+        if constexpr (ENABLED) WriteFormatted(Level::Info, Category::Generic, std::forward<Args>(args)...);
     }
 
     template<typename... Args>
     inline void Warning(Args&&... args) {
-        if constexpr (ENABLED) {
-            const std::lock_guard<std::mutex> lock(LogMutex());
-            WriteFileLineUnlocked("WARNING", std::forward<Args>(args)...);
-        }
+        if constexpr (ENABLED) WriteFormatted(Level::Warning, Category::Generic, std::forward<Args>(args)...);
     }
 
     template<typename... Args>
     inline void Error(Args&&... args) {
-        if constexpr (ENABLED) {
-            const std::lock_guard<std::mutex> lock(LogMutex());
-            WriteFileLineUnlocked("ERROR", std::forward<Args>(args)...);
-        }
+        if constexpr (ENABLED) WriteFormatted(Level::Error, Category::Generic, std::forward<Args>(args)...);
     }
 }
+
 #endif

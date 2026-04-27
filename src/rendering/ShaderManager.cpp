@@ -27,8 +27,10 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Constructor shaderBaseDir=", GetShaderBaseDir());
 
     shaderProgram = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               ShdrPath("NDEVCdeferred.vert").c_str(),
-               ShdrPath("NDEVCdeferred.frag").c_str()
+               ShdrPath("standard.vert").c_str(),
+               ShdrPath("standard.frag").c_str(),
+               "#define STANDARD_GEOMETRY_STATIC 1\n#define STANDARD_PASS_BUMP_GBUFFER 1\n",
+               "#define STANDARD_PASS_BUMP_GBUFFER 1\n"
            );
 
     if (!shaderProgram->IsValid()) {
@@ -37,16 +39,6 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready NDEVCdeferred");
 
     NC::LOGGING::Log("[SHADER_MGR] NDEVCdeferred program ID: ", *(GLuint*)shaderProgram->GetNativeHandle());
-
-    auto standardShaderProgram = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
-               ShdrPath("standard.vert").c_str(),
-               ShdrPath("standard.frag").c_str()
-           );
-
-    if (!standardShaderProgram->IsValid()) {
-        throw NC::Errors::LoggedRuntimeError("Standard shader init failed");
-    }
-    NC::LOGGING::Log("[SHADER_MGR] Ready standard");
 
     auto particleShader = std::make_shared<NDEVC::Graphics::OpenGL::OpenGLShader>(
                ShdrPath("particle.vert").c_str(),
@@ -222,7 +214,6 @@ ShaderManager::ShaderManager() {
     NC::LOGGING::Log("[SHADER_MGR] Ready blit");
 
     shaders["NDEVCdeferred"] = shaderProgram;
-    shaders["standard"] = standardShaderProgram;
     shaders["particle"] = particleShader;
     shaders["environment"] = environmentShader;
     shaders["environmentAlpha"] = environmentAlphaShader;
@@ -498,4 +489,3 @@ std::shared_ptr<NDEVC::Graphics::IShader> ShaderManager::GetShader(const std::st
     NC::LOGGING::Log("[SHADER_MGR] GetShader hit name=", name, " program=", (handle ? *handle : 0u));
     return it->second;
 }
-

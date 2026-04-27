@@ -10,34 +10,33 @@
 #include <sstream>
 
 void Mesh::SetupVAO(Mesh& out) {
-    if (out.vao == 0) glGenVertexArrays(1, out.vao.put());
-    if (out.vbo == 0) glGenBuffers(1, out.vbo.put());
-    if (out.ebo == 0) glGenBuffers(1, out.ebo.put());
-    glBindVertexArray(out.vao); glBindBuffer(GL_ARRAY_BUFFER, out.vbo);
-    glBufferData(GL_ARRAY_BUFFER, out.verts.size() * sizeof(ObjVertex), out.verts.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, out.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, out.idx.size() * sizeof(uint32_t), out.idx.data(), GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, px));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, nx));
-    glEnableVertexAttribArray(2); glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, u0));
-    glEnableVertexAttribArray(3); glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, w0));
-    glEnableVertexAttribArray(4); glVertexAttribIPointer(4, 4, GL_UNSIGNED_BYTE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, j0));
+    // AAA Strategy: Correct handle creation + No-bind attribute setup.
+     if (out.vao == 0) glCreateVertexArrays(1, out.vao.put());
+     if (out.vbo == 0) glCreateBuffers(1, out.vbo.put());
+     if (out.ebo == 0) glCreateBuffers(1, out.ebo.put());
 
-    glEnableVertexAttribArray(5);
-    glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, u1));
+     glNamedBufferStorage(out.vbo, out.verts.size() * sizeof(ObjVertex), out.verts.data(), 0);
+     glNamedBufferStorage(out.ebo, out.idx.size() * sizeof(uint32_t), out.idx.data(), 0);
 
-    glEnableVertexAttribArray(6);
-    glVertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, tx));
+     glVertexArrayVertexBuffer(out.vao, 0, out.vbo, 0, sizeof(ObjVertex));
+     glVertexArrayElementBuffer(out.vao, out.ebo);
 
-    glEnableVertexAttribArray(7);
-    glVertexAttribPointer(7, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, bx));
+    auto SetupAttr = [&](GLuint idx, GLint size, GLenum type, GLsizei offset, bool isInt = false) {
+        glEnableVertexArrayAttrib(out.vao, idx);
+        if (isInt) glVertexArrayAttribIFormat(out.vao, idx, size, type, offset);
+        else glVertexArrayAttribFormat(out.vao, idx, size, type, GL_FALSE, offset);
+        glVertexArrayAttribBinding(out.vao, idx, 0);
+    };
 
-    glEnableVertexAttribArray(8);
-    glVertexAttribPointer(8, 4, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, cr));
-
-    glBindVertexArray(0);
+    SetupAttr(0, 3, GL_FLOAT, offsetof(ObjVertex, px));
+    SetupAttr(1, 3, GL_FLOAT, offsetof(ObjVertex, nx));
+    SetupAttr(2, 2, GL_FLOAT, offsetof(ObjVertex, u0));
+    SetupAttr(3, 3, GL_FLOAT, offsetof(ObjVertex, tx));
+    SetupAttr(4, 3, GL_FLOAT, offsetof(ObjVertex, bx));
+    SetupAttr(5, 4, GL_FLOAT, offsetof(ObjVertex, w0));
+    SetupAttr(6, 4, GL_UNSIGNED_BYTE, offsetof(ObjVertex, j0), true);
+    SetupAttr(7, 2, GL_FLOAT, offsetof(ObjVertex, u1));
+    SetupAttr(8, 4, GL_FLOAT, offsetof(ObjVertex, cr));
 }
 
 bool Mesh::LoadNVX2(const std::string& path, Mesh& out) {
@@ -201,13 +200,11 @@ void Mesh::SetupMultiDraw(Mesh& out) {
         out.draw_commands.push_back(cmd);
     }
 
-    if (out.indirect_buffer == 0) glGenBuffers(1, out.indirect_buffer.put());
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, out.indirect_buffer);
-    glBufferData(GL_DRAW_INDIRECT_BUFFER,
+    if (out.indirect_buffer == 0) glCreateBuffers(1, out.indirect_buffer.put());
+    glNamedBufferStorage(out.indirect_buffer,
                  out.draw_commands.size() * sizeof(DrawCommand),
                  out.draw_commands.data(),
-                 GL_STATIC_DRAW);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+                 0);
 }
 
 void Mesh::drawMulti() const {

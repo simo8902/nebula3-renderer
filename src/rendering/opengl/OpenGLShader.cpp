@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
+#include "glad/glad.h"
 #include "Rendering/OpenGL/OpenGLShader.h"
 #include "Core/Errors.h"
 #include "Core/Logger.h"
@@ -16,6 +17,8 @@
 
 namespace NDEVC::Graphics::OpenGL {
 
+using namespace NC::LOGGING;
+
 OpenGLShader::OpenGLShader(const char* vertexPath, const char* fragmentPath)
     : OpenGLShader(vertexPath, fragmentPath, std::string(), std::string()) {}
 
@@ -24,26 +27,30 @@ OpenGLShader::OpenGLShader(const char* vertexPath, const char* fragmentPath,
     : vertexDefines_(vertexDefines), fragmentDefines_(fragmentDefines) {
     const std::string vertexPathStr = vertexPath ? std::string(vertexPath) : std::string();
     const std::string fragmentPathStr = fragmentPath ? std::string(fragmentPath) : std::string();
-    NC::LOGGING::Log("[SHADER] Create request V=", vertexPathStr,
-                     " F=", fragmentPathStr,
-                     " VDef=", vertexDefines_.size(),
-                     " FDef=", fragmentDefines_.size());
-    const bool combinedPath = !vertexPathStr.empty() &&
-                              vertexPathStr == fragmentPathStr &&
-                              std::filesystem::path(vertexPathStr).extension() == ".glsl";
+    
+    Debug(Category::Shader, "Constructor start V=", vertexPathStr);
+
+    bool combinedPath = false;
+    try {
+        combinedPath = !vertexPathStr.empty() &&
+                       vertexPathStr == fragmentPathStr &&
+                       std::filesystem::path(vertexPathStr).extension() == ".glsl";
+    } catch (...) {
+        Error(Category::Shader, "std::filesystem path check failed for V=", vertexPathStr);
+    }
 
     if (combinedPath) {
         if (!std::filesystem::exists(vertexPathStr) && !NC::VFS::Instance().Exists(vertexPathStr)) {
             throw NC::Errors::LoggedRuntimeError("Combined shader file does not exist: " + vertexPathStr);
         }
-        NC::LOGGING::Log("[SHADER] Using combined file ", vertexPathStr);
+        Debug(Category::Shader, "Using combined file ", vertexPathStr);
         auto [vertexCode, fragmentCode] = ParseCombinedShader(vertexPathStr);
         CompileAndLink(
             InjectDefines(vertexCode, vertexDefines_),
             InjectDefines(fragmentCode, fragmentDefines_));
         currentPaths_ = {vertexPathStr, fragmentPathStr};
         isCombined_ = true;
-        NC::LOGGING::Log("[SHADER] Create completed combined Program=", program_.id);
+        Info(Category::Shader, "Created combined Program=", program_.id);
         return;
     }
 
@@ -54,16 +61,18 @@ OpenGLShader::OpenGLShader(const char* vertexPath, const char* fragmentPath,
         throw NC::Errors::LoggedRuntimeError("Fragment shader file does not exist: " + fragmentPathStr);
     }
 
-    NC::LOGGING::Log("[SHADER] Using separate files V=", vertexPathStr, " F=", fragmentPathStr);
+    Debug(Category::Shader, "Loading separate files V=", vertexPathStr, " F=", fragmentPathStr);
+    std::string vCode = ReadFile(vertexPathStr);
+    std::string fCode = ReadFile(fragmentPathStr);
     CompileAndLink(
-        InjectDefines(ReadFile(vertexPathStr), vertexDefines_),
-        InjectDefines(ReadFile(fragmentPathStr), fragmentDefines_));
+        InjectDefines(vCode, vertexDefines_),
+        InjectDefines(fCode, fragmentDefines_));
     currentPaths_ = {vertexPathStr, fragmentPathStr};
-    NC::LOGGING::Log("[SHADER] Create completed separate Program=", program_.id);
+    Info(Category::Shader, "Created separate Program=", program_.id);
 }
 
 void OpenGLShader::LoadCombinedShader(const char* path) {
-    NC::LOGGING::Log("[SHADER] Reload combined ", (path ? path : "<null>"));
+    Info(Category::Shader, "Reload combined ", (path ? path : "<null>"));
     auto [vertexCode, fragmentCode] = ParseCombinedShader(path);
     CompileAndLink(vertexCode, fragmentCode);
     currentPaths_ = {path, path};
@@ -71,7 +80,7 @@ void OpenGLShader::LoadCombinedShader(const char* path) {
 }
 
 void OpenGLShader::LoadSeparateShaders(const char* vertexPath, const char* fragmentPath) {
-    NC::LOGGING::Log("[SHADER] Reload separate V=", (vertexPath ? vertexPath : "<null>"),
+    Info(Category::Shader, "Reload separate V=", (vertexPath ? vertexPath : "<null>"),
                      " F=", (fragmentPath ? fragmentPath : "<null>"));
     std::string vertexCode = ReadFile(vertexPath);
     std::string fragmentCode = ReadFile(fragmentPath);
@@ -83,7 +92,7 @@ void OpenGLShader::LoadSeparateShaders(const char* vertexPath, const char* fragm
 }
 
 std::pair<std::string, std::string> OpenGLShader::ParseCombinedShader(const std::string& filePath) {
-    NC::LOGGING::Log("[SHADER] Parse combined file ", filePath);
+    Trace(Category::Shader, "Parse combined file ", filePath);
 
     std::istringstream vfsStream;
     std::ifstream diskFile;
@@ -115,13 +124,13 @@ std::pair<std::string, std::string> OpenGLShader::ParseCombinedShader(const std:
         if (line.find("#type vertex") != std::string::npos) {
             isVertex = true;
             isFragment = false;
-            NC::LOGGING::Log("[SHADER] Parse marker #type vertex");
+            Trace(Category::Shader, "Parse marker #type vertex");
             continue;
         }
         if (line.find("#type fragment") != std::string::npos) {
             isFragment = true;
             isVertex = false;
-            NC::LOGGING::Log("[SHADER] Parse marker #type fragment");
+            Trace(Category::Shader, "Parse marker #type fragment");
             continue;
         }
 
@@ -132,23 +141,23 @@ std::pair<std::string, std::string> OpenGLShader::ParseCombinedShader(const std:
         }
     }
 
-    NC::LOGGING::Log("[SHADER] Parsed combined sections V=", vertexCode.size(), " bytes F=", fragmentCode.size(), " bytes");
+    Trace(Category::Shader, "Parsed combined sections V=", vertexCode.size(), " bytes F=", fragmentCode.size(), " bytes");
     return {vertexCode, fragmentCode};
 }
 
 void OpenGLShader::Reload() {
-    NC::LOGGING::Log("[SHADER] Reload begin V=", currentPaths_.vertex, " F=", currentPaths_.fragment, " combined=", isCombined_);
+    Debug(Category::Shader, "Reload begin V=", currentPaths_.vertex, " F=", currentPaths_.fragment, " combined=", isCombined_);
     std::scoped_lock lk(reloadMutex_);
     if (isCombined_) {
         LoadCombinedShader(currentPaths_.vertex.c_str());
     } else {
         LoadSeparateShaders(currentPaths_.vertex.c_str(), currentPaths_.fragment.c_str());
     }
-    NC::LOGGING::Log("[SHADER] Reload end Program=", program_.id);
+    Debug(Category::Shader, "Reload end Program=", program_.id);
 }
 
 void OpenGLShader::ReloadFromPath(const std::string& path) {
-    NC::LOGGING::Log("[SHADER] ReloadFromPath ", path);
+    Info(Category::Shader, "ReloadFromPath ", path);
     std::scoped_lock lk(reloadMutex_);
     if (path.ends_with(".glsl")) {
         LoadCombinedShader(path.c_str());
@@ -159,13 +168,18 @@ void OpenGLShader::ReloadFromPath(const std::string& path) {
         currentPaths_.fragment = path;
         LoadSeparateShaders(currentPaths_.vertex.c_str(), currentPaths_.fragment.c_str());
     } else {
-        NC::LOGGING::Warning("[SHADER] ReloadFromPath ignored unsupported extension path=", path);
+        Warn(Category::Shader, "ReloadFromPath ignored unsupported extension path=", path);
     }
-    NC::LOGGING::Log("[SHADER] ReloadFromPath end Program=", program_.id, " V=", currentPaths_.vertex, " F=", currentPaths_.fragment);
+    Debug(Category::Shader, "ReloadFromPath end Program=", program_.id);
+}
+
+OpenGLShader::Paths OpenGLShader::GetPaths() const {
+    std::scoped_lock lk(reloadMutex_);
+    return currentPaths_;
 }
 
 void OpenGLShader::CompileAndLink(const std::string& vertexCode, const std::string& fragmentCode) {
-    NC::LOGGING::Log("[SHADER] CompileAndLink begin V=", vertexCode.size(), " bytes F=", fragmentCode.size(), " bytes");
+    Trace(Category::Shader, "CompileAndLink begin V=", vertexCode.size(), " bytes F=", fragmentCode.size(), " bytes");
     GLuint vertexShader = CompileShader(vertexCode, GL_VERTEX_SHADER);
     GLuint fragmentShader = CompileShader(fragmentCode, GL_FRAGMENT_SHADER);
 
@@ -183,7 +197,7 @@ void OpenGLShader::CompileAndLink(const std::string& vertexCode, const std::stri
     if (!success) {
         GLchar infoLog[512];
         glGetProgramInfoLog(newProgram, 512, nullptr, infoLog);
-        NC::LOGGING::Error("[SHADER] Program link failed: ", infoLog);
+        Error(Category::Shader, "Program link failed: ", infoLog);
         glDeleteProgram(newProgram);
         throw NC::Errors::LoggedRuntimeError("Shader program linking failed.");
     }
@@ -195,7 +209,16 @@ void OpenGLShader::CompileAndLink(const std::string& vertexCode, const std::stri
     uniformNamesById_.clear();
     missingUniformWarnings_.clear();
     missingUniformIdWarnings_.clear();
-    NC::LOGGING::Log("[SHADER] Link success Program=", program_.id);
+
+    if (GLAD_GL_KHR_debug) {
+        const std::string label = currentPaths_.vertex.empty()
+            ? std::string("prog#") + std::to_string(newProgram)
+            : std::filesystem::path(currentPaths_.vertex).filename().string();
+        glObjectLabel(GL_PROGRAM, newProgram,
+                      static_cast<GLsizei>(label.size()), label.c_str());
+    }
+
+    Debug(Category::Shader, "Link success Program=", program_.id);
     ValidateActiveUniforms();
 }
 
@@ -204,7 +227,7 @@ GLuint OpenGLShader::CompileShader(const std::string& source, GLenum type) {
         throw NC::Errors::LoggedRuntimeError("Empty shader source");
     }
 
-    NC::LOGGING::Log("[SHADER] Compile stage ", (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT"),
+    Trace(Category::Shader, "Compile stage ", (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT"),
                      " size=", source.size(), " bytes");
     const char* src = source.c_str();
     GLuint shader = glCreateShader(type);
@@ -218,7 +241,7 @@ GLuint OpenGLShader::CompileShader(const std::string& source, GLenum type) {
         GLchar infoLog[1024];
         glGetShaderInfoLog(shader, 1024, nullptr, infoLog);
 
-        NC::LOGGING::Error("[SHADER] Compile failed stage=",
+        Error(Category::Shader, "Compile failed stage=",
                            (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT"),
                            " error=", infoLog);
 
@@ -226,26 +249,26 @@ GLuint OpenGLShader::CompileShader(const std::string& source, GLenum type) {
         throw NC::Errors::LoggedRuntimeError("Shader compilation failed.");
     }
 
-    NC::LOGGING::Log("[SHADER] Compile success stage=", (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT"),
+    Trace(Category::Shader, "Compile success stage=", (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT"),
                      " id=", shader);
     return shader;
 }
 
 std::string OpenGLShader::InjectDefines(const std::string& source, const std::string& defines) {
     if (defines.empty()) {
-        NC::LOGGING::Log("[SHADER] InjectDefines skipped (empty defines)");
+        Trace(Category::Shader, "InjectDefines skipped (empty defines)");
         return source;
     }
 
     const size_t versionPos = source.find("#version");
     if (versionPos == std::string::npos) {
-        NC::LOGGING::Log("[SHADER] InjectDefines prepend (no #version) defineBytes=", defines.size(), " sourceBytes=", source.size());
+        Trace(Category::Shader, "InjectDefines prepend (no #version) defineBytes=", defines.size());
         return defines + "\n" + source;
     }
 
     const size_t lineEnd = source.find('\n', versionPos);
     if (lineEnd == std::string::npos) {
-        NC::LOGGING::Log("[SHADER] InjectDefines append (single-line #version) defineBytes=", defines.size(), " sourceBytes=", source.size());
+        Trace(Category::Shader, "InjectDefines append (single-line #version) defineBytes=", defines.size());
         return source + "\n" + defines + "\n";
     }
 
@@ -257,16 +280,16 @@ std::string OpenGLShader::InjectDefines(const std::string& source, const std::st
         out.push_back('\n');
     }
     out.append(source, lineEnd + 1, std::string::npos);
-    NC::LOGGING::Log("[SHADER] InjectDefines inserted after #version defineBytes=", defines.size(), " resultBytes=", out.size());
+    Trace(Category::Shader, "InjectDefines inserted after #version resultBytes=", out.size());
     return out;
 }
 
 std::string OpenGLShader::ReadFile(const std::string& path) {
-    NC::LOGGING::Log("[SHADER] ReadFile ", path);
+    Trace(Category::Shader, "ReadFile ", path);
     // VFS first — zero disk I/O in standalone/packed mode.
     const NC::VFS::View vfsView = NC::VFS::Instance().Read(path);
     if (vfsView.valid()) {
-        NC::LOGGING::Log("[SHADER] ReadFile from VFS bytes=", vfsView.size, " path=", path);
+        Trace(Category::Shader, "ReadFile from VFS bytes=", vfsView.size, " path=", path);
         return std::string(reinterpret_cast<const char*>(vfsView.data), vfsView.size);
     }
     // When a package is mounted, shaders must come from VFS — no disk fallback.
@@ -283,7 +306,7 @@ std::string OpenGLShader::ReadFile(const std::string& path) {
     file.seekg(0);
     file.read(&buffer[0], static_cast<std::streamsize>(fileSize));
     file.close();
-    NC::LOGGING::Log("[SHADER] ReadFile bytes=", fileSize, " path=", path);
+    Trace(Category::Shader, "ReadFile bytes=", fileSize, " path=", path);
     return buffer;
 }
 
@@ -307,7 +330,7 @@ GLint OpenGLShader::GetCachedUniformLocation(const std::string& name) const {
     GLint location = glGetUniformLocation(program_, name.c_str());
     uniformCache_[name] = location;
     if (location == -1 && missingUniformWarnings_.insert(name).second) {
-        NC::LOGGING::Warning("[SHADER][UNIFORM] Missing uniform Program=", program_.id, " name=", name);
+        Warn(Category::Shader, "[UNIFORM] Missing uniform Program=", program_.id, " name=", name);
     }
     return location;
 }
@@ -321,7 +344,7 @@ GLint OpenGLShader::GetCachedUniformLocation(UniformID id) const {
     auto nameIt = uniformNamesById_.find(id);
     if (nameIt == uniformNamesById_.end()) {
         if (missingUniformIdWarnings_.insert(id).second) {
-            NC::LOGGING::Warning("[SHADER][UNIFORM] UniformID unresolved Program=", program_.id, " id=", static_cast<int>(id));
+            Warn(Category::Shader, "[UNIFORM] UniformID unresolved Program=", program_.id, " id=", static_cast<int>(id));
         }
         return -1;
     }
@@ -333,7 +356,7 @@ GLint OpenGLShader::GetCachedUniformLocation(UniformID id) const {
 
 void OpenGLShader::PrecacheUniform(UniformID id, const char* name) const {
     if (!name || !name[0]) {
-        NC::LOGGING::Warning("[SHADER] PrecacheUniform ignored empty name id=", static_cast<int>(id));
+        Warn(Category::Shader, "PrecacheUniform ignored empty name id=", static_cast<int>(id));
         return;
     }
 
@@ -374,7 +397,7 @@ void OpenGLShader::ValidateActiveUniforms() const {
     // Warn for every string-keyed cached uniform that the GPU doesn't expose
     for (const auto& [name, loc] : uniformCache_) {
         if (activeNames.find(name) == activeNames.end()) {
-            NC::LOGGING::Warning("[SHADER][VALIDATE] Uniform cached but not active Program=",
+            Warn(Category::Shader, "[VALIDATE] Uniform cached but not active Program=",
                                  program_.id, " name=", name);
         }
     }
@@ -495,42 +518,42 @@ void OpenGLShader::SetVec2(UniformID id, const glm::vec2& value) const {
 }
 
 void OpenGLShader::SetInt64(const std::string& name, int64_t value) const {
-    if (!glUniform1i64ARB) {
+    if (!glad_glUniform1i64ARB) {
         if (missingUniformWarnings_.insert("__ext_int64__").second)
-            NC::LOGGING::Warning("[SHADER] SetInt64 called but GL_ARB_gpu_shader_int64 is not available Program=", program_.id);
+            Warn(Category::Shader, "SetInt64 called but GL_ARB_gpu_shader_int64 is not available Program=", program_.id);
         return;
     }
     GLint location = GetCachedUniformLocation(name);
     if (location != -1) {
-        glUniform1i64ARB(location, value);
+        glad_glUniform1i64ARB(location, value);
     }
 }
 
 void OpenGLShader::SetInt64(UniformID id, int64_t value) const {
-    if (!glUniform1i64ARB) return;
+    if (!glad_glUniform1i64ARB) return;
     GLint location = GetCachedUniformLocation(id);
     if (location != -1) {
-        glUniform1i64ARB(location, value);
+        glad_glUniform1i64ARB(location, value);
     }
 }
 
 void OpenGLShader::SetUint64(const std::string& name, uint64_t value) const {
-    if (!glUniform1ui64ARB) {
+    if (!glad_glUniformHandleui64ARB) {
         if (missingUniformWarnings_.insert("__ext_uint64__").second)
-            NC::LOGGING::Warning("[SHADER] SetUint64 called but GL_ARB_gpu_shader_int64 is not available Program=", program_.id);
+            Warn(Category::Shader, "SetUint64 called but GL_ARB_bindless_texture is not available Program=", program_.id);
         return;
     }
     GLint location = GetCachedUniformLocation(name);
     if (location != -1) {
-        glUniform1ui64ARB(location, value);
+        glad_glUniformHandleui64ARB(location, value);
     }
 }
 
 void OpenGLShader::SetUint64(UniformID id, uint64_t value) const {
-    if (!glUniform1ui64ARB) return;
+    if (!glad_glUniformHandleui64ARB) return;
     GLint location = GetCachedUniformLocation(id);
     if (location != -1) {
-        glUniform1ui64ARB(location, value);
+        glad_glUniformHandleui64ARB(location, value);
     }
 }
 

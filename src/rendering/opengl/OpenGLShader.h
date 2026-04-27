@@ -64,7 +64,7 @@ public:
     void PrecacheUniform(UniformID id, const char* name) const override;
 
     void ReloadFromPath(const std::string& path);
-    const Paths& GetPaths() const { return currentPaths_; }
+    Paths GetPaths() const;
 
 private:
     static std::string InjectDefines(const std::string& source, const std::string& defines);

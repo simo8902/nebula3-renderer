@@ -12,40 +12,25 @@ MegaBuffer& MegaBuffer::instance() {
 
 void MegaBuffer::build(const std::vector<ObjVertex>& allVerts,
                         const std::vector<uint32_t>& allIndices) {
-    glGenVertexArrays(1, vao.put());
-    glGenBuffers(1, vbo.put());
-    glGenBuffers(1, ebo.put());
+         glVertexArrayVertexBuffer(vao, 0, vbo, 0, sizeof(ObjVertex));
+         glVertexArrayElementBuffer(vao, ebo);
 
-    glBindVertexArray(vao);
+         auto SetupAttr = [&](GLuint idx, GLint size, GLenum type, GLsizei offset, bool isInt = false) {
+                 glEnableVertexArrayAttrib(vao, idx);
+                 if (isInt) glVertexArrayAttribIFormat(vao, idx, size, type, offset);
+                 else glVertexArrayAttribFormat(vao, idx, size, type, GL_FALSE, offset);
+                 glVertexArrayAttribBinding(vao, idx, 0);
+             };
 
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, allVerts.size() * sizeof(ObjVertex),
-                 allVerts.data(), GL_STATIC_DRAW);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, allIndices.size() * sizeof(uint32_t),
-                 allIndices.data(), GL_STATIC_DRAW);
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, px));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, nx));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, u0));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, w0));
-    glEnableVertexAttribArray(4);
-    glVertexAttribIPointer(4, 4, GL_UNSIGNED_BYTE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, j0));
-    glEnableVertexAttribArray(5);
-    glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, u1));
-    glEnableVertexAttribArray(6);
-    glVertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, tx));
-    glEnableVertexAttribArray(7);
-    glVertexAttribPointer(7, 3, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, bx));
-    glEnableVertexAttribArray(8);
-    glVertexAttribPointer(8, 4, GL_FLOAT, GL_FALSE, sizeof(ObjVertex), (void*)offsetof(ObjVertex, cr));
-
-    glBindVertexArray(0);
+         SetupAttr(0, 3, GL_FLOAT, offsetof(ObjVertex, px));
+         SetupAttr(1, 3, GL_FLOAT, offsetof(ObjVertex, nx));
+         SetupAttr(2, 2, GL_FLOAT, offsetof(ObjVertex, u0));
+         SetupAttr(3, 3, GL_FLOAT, offsetof(ObjVertex, tx));
+         SetupAttr(4, 3, GL_FLOAT, offsetof(ObjVertex, bx));
+         SetupAttr(5, 4, GL_FLOAT, offsetof(ObjVertex, w0));
+         SetupAttr(6, 4, GL_UNSIGNED_BYTE, offsetof(ObjVertex, j0), true);
+         SetupAttr(7, 2, GL_FLOAT, offsetof(ObjVertex, u1));
+         SetupAttr(8, 4, GL_FLOAT, offsetof(ObjVertex, cr));
 }
 
 void MegaBuffer::bind() const {

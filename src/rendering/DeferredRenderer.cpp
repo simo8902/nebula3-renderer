@@ -1,18 +1,12 @@
-// Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
+﻿// Copyright (c) 2026 Simeon Mladenov and DSO Reconstruction Team. All rights reserved.
 // Unauthorized copying, modification, distribution, or use is strictly prohibited.
 
+#include "Rendering/Rendering.h"
 #include "Rendering/DeferredRenderer.h"
-#include "Rendering/DeferredRendererAnimation.h"
-#include "Rendering/SelectionRaycaster.h"
-#include "Assets/Parser.h"
 #include "Rendering/GLStateDebug.h"
-#include "Animation/AnimationSystem.h"
 
 #include "glad/glad.h"
 #include "GLFW/glfw3.h"
-#include "imgui.h"
-#include "backends/imgui_impl_glfw.h"
-#include "backends/imgui_impl_opengl3.h"
 #include "Rendering/OpenGL/OpenGLDevice.h"
 #include "Platform/GLFWPlatform.h"
 #include "Rendering/OpenGL/OpenGLShaderManager.h"
@@ -26,96 +20,43 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <fstream>
 #include <filesystem>
 #include <system_error>
 #include <unordered_set>
 
 #define GLM_ENABLE_EXPERIMENTAL
-#include "Rendering/DrawBatchSystem.h"
 #include "Rendering/MegaBuffer.h"
 #include "glm.hpp"
 #include "gtc/matrix_transform.hpp"
 #include "gtc/quaternion.hpp"
 #include "gtx/string_cast.hpp"
 #include "Assets/Model/ModelServer.h"
+#include "Assets/Map/MapLoader.h"
 #include "Assets/Servers/MeshServer.h"
 #include "Assets/Servers/TextureServer.h"
 #include "Assets/Map/MapHeader.h"
-#include "Assets/Particles/ParticleServer.h"
 #include "Core/Logger.h"
 #include "Core/VFS.h"
 #include "gtx/norm.hpp"
 
-static const glm::vec3 kLightDirToSun = glm::normalize(glm::vec3(0.0f, 0.5f, -0.8f));
+using namespace NC::LOGGING;
+
+// ── Qt external-platform injection (set before Initialize() runs) ─────────
+static std::unique_ptr<NDEVC::Platform::IPlatform> s_pendingPlatform;
+static std::shared_ptr<NDEVC::Platform::IWindow>   s_pendingWindow;
+static GLADloadproc                                s_pendingLoader = nullptr;
+
+void DeferredRenderer::SetPendingExternalPlatform(
+        std::unique_ptr<NDEVC::Platform::IPlatform> platform,
+        std::shared_ptr<NDEVC::Platform::IWindow>   window,
+        GLADloadproc                                loader) {
+    s_pendingPlatform = std::move(platform);
+    s_pendingWindow   = std::move(window);
+    s_pendingLoader   = loader;
+}
 
 extern bool gEnableGLErrorChecking;
-
-using UniformID = NDEVC::Graphics::IShader::UniformID;
-static constexpr UniformID U_PROJECTION = NDEVC::Graphics::IShader::MakeUniformID("projection");
-static constexpr UniformID U_VIEW = NDEVC::Graphics::IShader::MakeUniformID("view");
-static constexpr UniformID U_MODEL = NDEVC::Graphics::IShader::MakeUniformID("model");
-static constexpr UniformID U_TEXTURE_TRANSFORM0 = NDEVC::Graphics::IShader::MakeUniformID("textureTransform0");
-static constexpr UniformID U_MAT_EMISSIVE_INTENSITY = NDEVC::Graphics::IShader::MakeUniformID("MatEmissiveIntensity");
-static constexpr UniformID U_MAT_SPECULAR_INTENSITY = NDEVC::Graphics::IShader::MakeUniformID("MatSpecularIntensity");
-static constexpr UniformID U_MAT_SPECULAR_POWER = NDEVC::Graphics::IShader::MakeUniformID("MatSpecularPower");
-static constexpr UniformID U_USE_SKINNING = NDEVC::Graphics::IShader::MakeUniformID("UseSkinning");
-static constexpr UniformID U_USE_INSTANCING = NDEVC::Graphics::IShader::MakeUniformID("UseInstancing");
-static constexpr UniformID U_ALPHA_TEST = NDEVC::Graphics::IShader::MakeUniformID("alphaTest");
-static constexpr UniformID U_ALPHA_CUTOFF = NDEVC::Graphics::IShader::MakeUniformID("alphaCutoff");
-static constexpr UniformID U_DIFF_MAP0 = NDEVC::Graphics::IShader::MakeUniformID("DiffMap0");
-static constexpr UniformID U_SPEC_MAP0 = NDEVC::Graphics::IShader::MakeUniformID("SpecMap0");
-static constexpr UniformID U_BUMP_MAP0 = NDEVC::Graphics::IShader::MakeUniformID("BumpMap0");
-static constexpr UniformID U_EMSV_MAP0 = NDEVC::Graphics::IShader::MakeUniformID("EmsvMap0");
-static constexpr UniformID U_TWO_SIDED = NDEVC::Graphics::IShader::MakeUniformID("twoSided");
-static constexpr UniformID U_IS_FLAT_NORMAL = NDEVC::Graphics::IShader::MakeUniformID("isFlatNormal");
-static constexpr UniformID U_RECEIVES_DECALS = NDEVC::Graphics::IShader::MakeUniformID("ReceivesDecals");
-static constexpr UniformID U_CAMERA_POS = NDEVC::Graphics::IShader::MakeUniformID("CameraPos");
-static constexpr UniformID U_LIGHT_DIR_WS = NDEVC::Graphics::IShader::MakeUniformID("LightDirWS");
-static constexpr UniformID U_LIGHT_COLOR = NDEVC::Graphics::IShader::MakeUniformID("LightColor");
-static constexpr UniformID U_AMBIENT_COLOR = NDEVC::Graphics::IShader::MakeUniformID("AmbientColor");
-static constexpr UniformID U_BACK_LIGHT_COLOR = NDEVC::Graphics::IShader::MakeUniformID("BackLightColor");
-static constexpr UniformID U_BACK_LIGHT_OFFSET = NDEVC::Graphics::IShader::MakeUniformID("BackLightOffset");
-static constexpr UniformID U_GPOSITION = NDEVC::Graphics::IShader::MakeUniformID("gPosition");
-static constexpr UniformID U_GNORMAL_DEPTH_PACKED = NDEVC::Graphics::IShader::MakeUniformID("gNormalDepthPacked");
-static constexpr UniformID U_GPOSITION_WS = NDEVC::Graphics::IShader::MakeUniformID("gPositionWS");
-static constexpr UniformID U_SHADOW_MAP_CASCADE0 = NDEVC::Graphics::IShader::MakeUniformID("shadowMapCascade0");
-static constexpr UniformID U_SHADOW_MAP_CASCADE1 = NDEVC::Graphics::IShader::MakeUniformID("shadowMapCascade1");
-static constexpr UniformID U_SHADOW_MAP_CASCADE2 = NDEVC::Graphics::IShader::MakeUniformID("shadowMapCascade2");
-static constexpr UniformID U_SHADOW_MAP_CASCADE3 = NDEVC::Graphics::IShader::MakeUniformID("shadowMapCascade3");
-static constexpr UniformID U_NUM_CASCADES = NDEVC::Graphics::IShader::MakeUniformID("numCascades");
-static constexpr UniformID U_SCREEN_SIZE = NDEVC::Graphics::IShader::MakeUniformID("screenSize");
-static constexpr UniformID U_MVP = NDEVC::Graphics::IShader::MakeUniformID("mvp");
-static constexpr UniformID U_LIGHT_POS_RANGE = NDEVC::Graphics::IShader::MakeUniformID("lightPosRange");
-static constexpr UniformID U_LIGHT_COLOR_IN = NDEVC::Graphics::IShader::MakeUniformID("lightColorIn");
-static constexpr UniformID U_FOG_START = NDEVC::Graphics::IShader::MakeUniformID("fogStart");
-static constexpr UniformID U_FOG_END = NDEVC::Graphics::IShader::MakeUniformID("fogEnd");
-static constexpr UniformID U_FOG_COLOR = NDEVC::Graphics::IShader::MakeUniformID("fogColor");
-static constexpr UniformID U_FOG_DISTANCES = NDEVC::Graphics::IShader::MakeUniformID("fogDistances");
-static constexpr UniformID U_GALBEDO_SPEC = NDEVC::Graphics::IShader::MakeUniformID("gAlbedoSpec");
-static constexpr UniformID U_LIGHT_BUFFER_TEX = NDEVC::Graphics::IShader::MakeUniformID("lightBufferTex");
-static constexpr UniformID U_GPOSITION_VS = NDEVC::Graphics::IShader::MakeUniformID("gPositionVS");
-static constexpr UniformID U_GEMISSIVE_TEX = NDEVC::Graphics::IShader::MakeUniformID("gEmissiveTex");
-static constexpr UniformID U_USE_INSTANCED_POINT_LIGHTS = NDEVC::Graphics::IShader::MakeUniformID("UseInstancedPointLights");
-static constexpr bool kDisableShadows = false;
-static constexpr bool kDisableLighting = false;
-static constexpr bool kDisableShadowPass = true;
-static constexpr bool kDisableGeometryPass = false;
-static constexpr bool kDisableLightingPass = false;
-static constexpr bool kDisablePointLightPass = false;
-static constexpr bool kDisableCompositionPass = false;
-static constexpr bool kDisableDecalPass = false;
-static constexpr bool kDisableForwardPass = false;
-static constexpr bool kDisableComposePass = false;
-static constexpr bool kDisableEnvironmentAlphaPass = false;
-static constexpr bool kDisableWaterPass = false;
-static constexpr bool kDisablePostAlphaUnlitPass = false;
-static constexpr bool kDisableParticlePass = false;
-static constexpr bool kDisableFog = false;
-static constexpr bool kDisableViewDependentSpecular = false;
-static constexpr bool kDisableViewDependentReflections = false;
-static constexpr bool kForceEnvironmentThroughStandardGeometryPath = false;
-static constexpr bool kLogGroundDecalReceiveSolidDiffuse = false;
-static constexpr bool kParticleEmitterTransformsAreStatic = false;
 
 namespace {
 bool ReadEnvToggle(const char* name) {
@@ -152,9 +93,25 @@ std::string ReadEnvString(const char* name) {
 #endif
 }
 
+bool CameraTraceEnabledByDefault() {
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, "NDEVC_CAMERA_TRACE") != 0 || value == nullptr) {
+        return true;
+    }
+    const bool enabled = value[0] != '0';
+    std::free(value);
+    return enabled;
+#else
+    const char* value = std::getenv("NDEVC_CAMERA_TRACE");
+    return value == nullptr || value[0] != '0';
+#endif
+}
+
 bool MountPackageFromEnvironment() {
     if (NC::VFS::Instance().IsMounted()) {
-        NC::LOGGING::Log("[DEFERRED][PACKAGE] VFS mounted, assets served in-memory");
+        Debug(Category::Graphics, "VFS mounted, assets served in-memory");
         return true;
     }
     // Dev mode: no package present, assets loaded from disk via env-var paths.
@@ -166,7 +123,7 @@ bool IsMapFilePath(const std::string& path) {
     std::string ext = std::filesystem::path(path).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return ext == ".map";
+    return ext == ".map" || ext == ".n3w";
 }
 
 constexpr const char* StartupBaseMapName() {
@@ -197,7 +154,7 @@ std::string ResolveStartupMapPath() {
 
     const std::string envPath = ReadEnvString("NDEVC_STARTUP_MAP");
     if (envPath.empty()) {
-        NC::LOGGING::Log("[DEFERRED][INIT] Startup map autoload disabled (NDEVC_STARTUP_MAP empty)");
+        Debug(Category::Graphics, "Startup map autoload disabled (NDEVC_STARTUP_MAP empty)");
         return {};
     }
     if (!envPath.empty()) {
@@ -241,20 +198,10 @@ std::string ResolveStartupMapPath() {
                 return dirAnyMap;
             }
         }
-        NC::LOGGING::Error("[Init] NDEVC_STARTUP_MAP not found/usable: ", envPath);
+        Error(Category::Graphics, "NDEVC_STARTUP_MAP not found/usable: ", envPath);
         return {};
     }
     return {};
-}
-
-bool ParticlesDisabled() {
-    static const bool disabled = ReadEnvToggle("NDEVC_DISABLE_PARTICLES");
-    return disabled;
-}
-
-bool AnimationsDisabled() {
-    static const bool disabled = ReadEnvToggle("NDEVC_DISABLE_ANIMATIONS");
-    return disabled;
 }
 
 bool MaterialInputDebugEnabled() {
@@ -318,192 +265,189 @@ void DebugPrintNearestInstances(const MapData* map, const glm::vec3& target, siz
     }
 }
 
+bool IsFiniteVec3(const glm::vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+bool BuildMapCameraFit(const MapInfo& info, glm::vec3& outPos, glm::vec3& outTarget) {
+    const glm::vec3 center(info.center.x, info.center.y, info.center.z);
+    const glm::vec3 extents(std::abs(info.extents.x), std::abs(info.extents.y), std::abs(info.extents.z));
+    if (!IsFiniteVec3(center) || !IsFiniteVec3(extents)) {
+        return false;
+    }
+
+    const float halfDiag = glm::length(glm::vec2(extents.x, extents.z));
+    if (!std::isfinite(halfDiag) || halfDiag <= 0.001f) {
+        return false;
+    }
+
+    outTarget = center;
+    // Position camera at an angle looking at the center
+    outPos = center + glm::vec3(halfDiag * 0.8f, halfDiag * 0.5f, halfDiag * 0.8f);
+    return true;
+}
+
 }
 
 static void checkGLError(const char* label) {
     if (!gEnableGLErrorChecking) return;
     GLenum err;
     while ((err = glGetError()) != GL_NO_ERROR) {
-        NC::LOGGING::Error("[GL] Error at ", (label ? label : "<unknown>"), ": 0x", std::hex, static_cast<unsigned int>(err), std::dec);
+        Error(Category::Graphics, "GL Error at ", (label ? label : "<unknown>"), ": 0x", std::hex, static_cast<unsigned int>(err), std::dec);
         switch (err) {
-            case GL_INVALID_ENUM:                  NC::LOGGING::Error("[GL] Reason INVALID_ENUM"); break;
-            case GL_INVALID_VALUE:                 NC::LOGGING::Error("[GL] Reason INVALID_VALUE"); break;
-            case GL_INVALID_OPERATION:             NC::LOGGING::Error("[GL] Reason INVALID_OPERATION"); break;
-            case GL_OUT_OF_MEMORY:                 NC::LOGGING::Error("[GL] Reason OUT_OF_MEMORY"); break;
-            case GL_INVALID_FRAMEBUFFER_OPERATION: NC::LOGGING::Error("[GL] Reason INVALID_FRAMEBUFFER_OPERATION"); break;
+            case GL_INVALID_ENUM:                  Error(Category::Graphics, "GL Reason INVALID_ENUM"); break;
+            case GL_INVALID_VALUE:                 Error(Category::Graphics, "GL Reason INVALID_VALUE"); break;
+            case GL_INVALID_OPERATION:             Error(Category::Graphics, "GL Reason INVALID_OPERATION"); break;
+            case GL_OUT_OF_MEMORY:                 Error(Category::Graphics, "GL Reason OUT_OF_MEMORY"); break;
+            case GL_INVALID_FRAMEBUFFER_OPERATION: Error(Category::Graphics, "GL Reason INVALID_FRAMEBUFFER_OPERATION"); break;
         }
     }
 }
 
-DeferredRenderer::DeferredRenderer() : shadowMapCascades{}, shadowFBOCascades{}
+DeferredRenderer::DeferredRenderer()
 {
-    NC::LOGGING::Log("[DEFERRED] ctor");
+    Trace(Category::Graphics, "ctor");
+}
+
+double DeferredRenderer::GetTimeSeconds() const {
+    return std::chrono::duration<double>(RendererClock::now() - rendererClockStart_).count();
 }
 
 void DeferredRenderer::releaseOwnedGLResources() {
-    NC::LOGGING::Log("[DEFERRED] releaseOwnedGLResources begin");
-    shadowMatrixSSBO_.reset();
-    shadowMatrixSSBOCapacity_ = 0;
-    shadowIndirectBuffer_.reset();
-    shadowIndirectBufferCapacity_ = 0;
-
-    pointLightInstanceVBO.reset();
-    pointLightInstanceCapacity = 0;
+    Debug(Category::Graphics, "releaseOwnedGLResources begin");
 
     quadVAO.reset();
     quadVBO.reset();
     screenVAO.id = 0;
-
-    sphereVAO.reset();
-    sphereIndexCount = 0;
-
-    debugCellVAO_.reset();
-    debugCellVBO_.reset();
-    debugLineProgram_.reset();
-
-    gDepthCopyReadFBO.reset();
-    gDepthDecalFBO.reset();
-
-    gBuffer.reset();
-    lightFBO.reset();
-    sceneFBO.reset();
-    sceneFBO2.reset();
-
-    for (int i = 0; i < NUM_CASCADES; ++i) {
-        shadowFBOCascades[i].reset();
-        shadowMapCascades[i].id = 0;
-    }
-
-    gPositionVS.reset();
-    gPositionWS.reset();
-    gPosition.reset();
-    gNormalDepthPacked.reset();
-    gAlbedoSpec.reset();
-    gDepth.reset();
-    gEmissive.reset();
-    gPositionWSRead.reset();
 
     if (samplerShadow_abstracted) {
         gSamplerShadow.id = 0;
     } else {
         gSamplerShadow.reset();
     }
-    NC::LOGGING::Log("[DEFERRED] releaseOwnedGLResources end");
+    Debug(Category::Graphics, "releaseOwnedGLResources end");
 }
 
 DeferredRenderer::~DeferredRenderer() {
-    NC::LOGGING::Log("[DEFERRED] dtor");
+    Trace(Category::Graphics, "dtor");
     Shutdown();
 }
 
 void DeferredRenderer::initGLFW() {
-    NC::LOGGING::Log("[DEFERRED] initGLFW begin w=", width, " h=", height);
-    using GLFWPlatformType = NDEVC::Platform::GLFW::GLFWPlatform;
-    platform_ = std::make_unique<GLFWPlatformType>();
-    if (platform_->Initialize()) {
-        window_ = platform_->CreateApplicationWindow("NDEVC", width, height);
-        if (window_) inputSystem_ = platform_->CreateInputSystem();
+    Info(Category::Graphics, "initGLFW begin w=", width, " h=", height);
+
+    // ── Platform / window selection ───────────────────────────────────────
+    const bool useExternalPlatform = (s_pendingPlatform != nullptr);
+    if (useExternalPlatform) {
+        platform_ = std::move(s_pendingPlatform);
+        window_   = std::move(s_pendingWindow);
+        if (platform_) inputSystem_ = platform_->CreateInputSystem();
+        Info(Category::Graphics, "initGLFW using external platform (Qt)");
+    } else {
+        using GLFWPlatformType = NDEVC::Platform::GLFW::GLFWPlatform;
+        platform_ = std::make_unique<GLFWPlatformType>();
+        if (platform_->Initialize()) {
+            window_ = platform_->CreateApplicationWindow("NDEVC", width, height);
+            if (window_) inputSystem_ = platform_->CreateInputSystem();
+        }
+        if (!window_) {
+            Error(Category::Graphics, "initGLFW failed: Window creation failed");
+            throw std::runtime_error("Window creation failed");
+        }
     }
-    if (!window_) {
-        NC::LOGGING::Error("[DEFERRED] initGLFW failed: Window creation failed");
-        throw std::runtime_error("Window creation failed");
-    }
+
     window_->MakeCurrent();
-    if (GLFWwindow* glfwWin = static_cast<GLFWwindow*>(window_->GetNativeHandle())) {
-        glfwSetWindowUserPointer(glfwWin, this);
-        window_->SetFramebufferSizeCallback([this](int w, int h) {
-            if (w <= 0 || h <= 0) return;
-            this->Resize(w, h);
-        });
-        window_->SetScrollCallback([this](double, double scrollY) {
-            if (editorModeEnabled_ && editorViewportInputRouting_) {
-                double cursorX = 0.0;
-                double cursorY = 0.0;
-                if (window_) {
-                    window_->GetCursorPos(cursorX, cursorY);
+
+    // ── GLFW-specific native callbacks ────────────────────────────────────
+    if (!useExternalPlatform) {
+        if (GLFWwindow* glfwWin = static_cast<GLFWwindow*>(window_->GetNativeHandle())) {
+            glfwSetWindowUserPointer(glfwWin, this);
+            glfwSetDropCallback(glfwWin, [](GLFWwindow* w, int count, const char** paths) {
+                auto* self = static_cast<DeferredRenderer*>(glfwGetWindowUserPointer(w));
+                if (!self || count <= 0 || !paths) return;
+                self->pendingDroppedPaths_.reserve(self->pendingDroppedPaths_.size() + static_cast<size_t>(count));
+                for (int i = 0; i < count; ++i) {
+                    if (paths[i] && paths[i][0] != '\0') {
+                        self->pendingDroppedPaths_.emplace_back(paths[i]);
+                    }
                 }
-                if (!IsSceneViewportPointerInside(cursorX, cursorY)) return;
-            } else if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
-                return;
-            }
-            this->camera_.processMouseScroll(static_cast<float>(scrollY));
-        });
-        glfwSetDropCallback(glfwWin, [](GLFWwindow* w, int count, const char** paths) {
-            auto* self = static_cast<DeferredRenderer*>(glfwGetWindowUserPointer(w));
-            if (!self || count <= 0 || !paths) return;
-            self->pendingDroppedPaths_.reserve(self->pendingDroppedPaths_.size() + static_cast<size_t>(count));
-            for (int i = 0; i < count; ++i) {
-                if (paths[i] && paths[i][0] != '\0') {
-                    self->pendingDroppedPaths_.emplace_back(paths[i]);
-                }
-            }
-        });
-        glfwSetCursorPosCallback(glfwWin, [](GLFWwindow* w, double x, double y) {
-            static double lastX = x;
-            static double lastY = y;
-            static bool first = true;
-
-            auto* self = static_cast<DeferredRenderer*>(glfwGetWindowUserPointer(w));
-            if (!self) return;
-
-            if (self->editorModeEnabled_ && self->editorViewportInputRouting_) {
-                if (!self->IsSceneViewportPointerInside(x, y)) {
-                    lastX = x;
-                    lastY = y;
-                    first = true;
-                    return;
-                }
-            } else if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
-                // Reset camera-look delta state while UI is consuming mouse input.
-                lastX = x;
-                lastY = y;
-                first = true;
-                return;
-            }
-
-            if (glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_RIGHT) != GLFW_PRESS) {
-                lastX = x;
-                lastY = y;
-                first = true;
-                return;
-            }
-
-            if (first) {
-                lastX = x;
-                lastY = y;
-                first = false;
-                return;
-            }
-
-            const float dx = static_cast<float>(x - lastX);
-            const float dy = static_cast<float>(lastY - y);
-            lastX = x;
-            lastY = y;
-            self->camera_.processMouseMovement(dx, dy);
-        });
+            });
+        }
     }
 
-    if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
-        NC::LOGGING::Error("[DEFERRED] initGLFW failed: Failed to init GLAD");
+    // ── Portable window callbacks (both GLFW and Qt paths) ───────────────
+    window_->SetFramebufferSizeCallback([this](int w, int h) {
+        if (w <= 0 || h <= 0) return;
+        this->Resize(w, h);
+    });
+    window_->SetScrollCallback([this](double, double scrollY) {
+        this->accumulatedScrollDelta_ += static_cast<float>(scrollY);
+    });
+
+    // ── GLAD ─────────────────────────────────────────────────────────────
+    GLADloadproc loader = useExternalPlatform
+        ? s_pendingLoader
+        : reinterpret_cast<GLADloadproc>(glfwGetProcAddress);
+    s_pendingLoader = nullptr;
+    if (!gladLoadGLLoader(loader)) {
+        Error(Category::Graphics, "initGLFW failed: Failed to init GLAD");
         throw std::runtime_error("Failed to init GLAD");
     }
 
-    if (!InitializeImGui()) {
-        NC::LOGGING::Error("[DEFERRED] initGLFW failed: Failed to initialize ImGui");
-        throw std::runtime_error("Failed to initialize ImGui");
+    // ── GL_KHR_debug ─────────────────────────────────────────────────────
+    if (GLAD_GL_KHR_debug) {
+        glEnable(GL_DEBUG_OUTPUT);
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        glDebugMessageCallback([](GLenum source, GLenum type, GLuint id, GLenum severity,
+                                  GLsizei /*length*/, const GLchar* message, const void* /*userParam*/) {
+            if (severity == GL_DEBUG_SEVERITY_NOTIFICATION) return;
+
+            const char* src = source == GL_DEBUG_SOURCE_API             ? "API"
+                            : source == GL_DEBUG_SOURCE_SHADER_COMPILER ? "SHADER_COMPILER"
+                            : source == GL_DEBUG_SOURCE_APPLICATION      ? "APPLICATION"
+                            : source == GL_DEBUG_SOURCE_WINDOW_SYSTEM    ? "WINDOW_SYSTEM"
+                            : source == GL_DEBUG_SOURCE_THIRD_PARTY      ? "THIRD_PARTY"
+                            : "OTHER";
+            const char* tp  = type == GL_DEBUG_TYPE_ERROR               ? "ERROR"
+                            : type == GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR   ? "UNDEFINED_BEHAVIOR"
+                            : type == GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR  ? "DEPRECATED"
+                            : type == GL_DEBUG_TYPE_PERFORMANCE          ? "PERFORMANCE"
+                            : "INFO";
+            const char* sev = severity == GL_DEBUG_SEVERITY_HIGH   ? "HIGH"
+                            : severity == GL_DEBUG_SEVERITY_MEDIUM  ? "MEDIUM"
+                            : "LOW";
+
+            if (severity == GL_DEBUG_SEVERITY_HIGH || type == GL_DEBUG_TYPE_ERROR || type == GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR) {
+                Error(Category::Graphics, "[KHR] src=", src, " type=", tp, " sev=", sev, " id=", id, " ", message);
+            } else {
+                Warn(Category::Graphics, "[KHR] src=", src, " type=", tp, " sev=", sev, " id=", id, " ", message);
+            }
+        }, nullptr);
+        // Suppress the driver's own "buffer memory info" spam (NVIDIA 131185 / AMD 20072)
+        glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_NOTIFICATION, 0, nullptr, GL_FALSE);
+        Info(Category::Graphics, "GL_KHR_debug enabled (synchronous)");
+    } else {
+        Warn(Category::Graphics, "GL_KHR_debug not available on this driver — no debug callback");
     }
 
     device_ = std::make_unique<NDEVC::Graphics::OpenGL::OpenGLDevice>();
+    if (window_) {
+        device_->SetDefaultFramebuffer(window_->GetDefaultFramebuffer());
+    }
 
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
     glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS);
+    glDepthFunc(GL_GREATER);
+    glClearDepth(0.0f);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
     glDisable(GL_BLEND);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
     window_->GetFramebufferSize(width, height);
-    camera_.updateAspectRatio(width, height);
+    if (width  <= 0) width  = 1;
+    if (height <= 0) height = 1;
+    camera.updateAspectRatio(width, height);
     glViewport(0, 0, width, height);
 
     if (optRenderLOG) std::cout << "[Init] Window framebuffer: alpha bits requested\n";
@@ -517,22 +461,10 @@ void DeferredRenderer::initGLFW() {
     try {
         shaderManager = std::make_unique<NDEVC::Graphics::OpenGL::OpenGLShaderManager>();
         shaderManager->Initialize();
-        NC::LOGGING::Log("[DEFERRED] ShaderManager initialized");
+        Info(Category::Graphics, "ShaderManager initialized");
     } catch(const std::exception& e) {
-        NC::LOGGING::Error("[DEFERRED] ShaderManager init failed: ", e.what());
+        Error(Category::Graphics, "ShaderManager init failed: ", e.what());
         throw;
-    }
-
-    if (!ParticlesDisabled()) {
-        Particles::ParticleServer::Instance().Open(shaderManager.get());
-        if (!Particles::ParticleServer::Instance().GetParticleRenderer()) {
-            NC::LOGGING::Error("[DEFERRED] ParticleServer failed to provide renderer");
-        } else {
-            if (optRenderLOG) std::cout << "[Init] ParticleServer renderer ready\n";
-            NC::LOGGING::Log("[DEFERRED] ParticleServer renderer ready");
-        }
-    } else if (optRenderLOG) {
-        std::cout << "[Init] Particle system disabled via NDEVC_DISABLE_PARTICLES\n";
     }
 
     using namespace NDEVC::Graphics;
@@ -546,8 +478,7 @@ void DeferredRenderer::initGLFW() {
     whiteTex_abstracted = device_->CreateTexture(whiteDesc);
     if (whiteTex_abstracted) {
         whiteTex.id = *(GLuint*)whiteTex_abstracted->GetNativeHandle();
-        glBindTexture(GL_TEXTURE_2D, whiteTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+        glTextureSubImage2D(whiteTex.id, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, white);
     }
 
     unsigned char black[] = {0, 0, 0, 255};
@@ -559,8 +490,7 @@ void DeferredRenderer::initGLFW() {
     blackTex_abstracted = device_->CreateTexture(blackDesc);
     if (blackTex_abstracted) {
         blackTex.id = *(GLuint*)blackTex_abstracted->GetNativeHandle();
-        glBindTexture(GL_TEXTURE_2D, blackTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, black);
+        glTextureSubImage2D(blackTex.id, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, black);
     }
 
     // Normal maps in this renderer decode XY from A/G channels.
@@ -574,8 +504,7 @@ void DeferredRenderer::initGLFW() {
     normalTex_abstracted = device_->CreateTexture(normalDesc);
     if (normalTex_abstracted) {
         normalTex.id = *(GLuint*)normalTex_abstracted->GetNativeHandle();
-        glBindTexture(GL_TEXTURE_2D, normalTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, normal);
+        glTextureSubImage2D(normalTex.id, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, normal);
     }
 
     if (!blackCubeTex) {
@@ -588,10 +517,9 @@ void DeferredRenderer::initGLFW() {
         blackCubeTex_abstracted = device_->CreateTexture(cubemapDesc);
         if (blackCubeTex_abstracted) {
             blackCubeTex.id = *(GLuint*)blackCubeTex_abstracted->GetNativeHandle();
-            glBindTexture(GL_TEXTURE_CUBE_MAP, blackCubeTex);
             for (int face = 0; face < 6; ++face) {
-                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA, 1, 1, 0,
-                             GL_RGBA, GL_UNSIGNED_BYTE, black);
+                glTextureSubImage3D(blackCubeTex.id, 0, 0, 0, face, 1, 1, 1,
+                                    GL_RGBA, GL_UNSIGNED_BYTE, black);
             }
         }
     }
@@ -616,905 +544,46 @@ void DeferredRenderer::initGLFW() {
         gSamplerClamp.id = *(GLuint*)samplerClamp_abstracted->GetNativeHandle();
     }
 
-    if (TextureServer::sBindlessSupported) {
-        if (whiteTex.id) {
-            fallbackWhiteHandle_ = glGetTextureHandleARB(whiteTex.id);
-            if (fallbackWhiteHandle_) glMakeTextureHandleResidentARB(fallbackWhiteHandle_);
-        }
-        if (blackTex.id) {
-            fallbackBlackHandle_ = glGetTextureHandleARB(blackTex.id);
-            if (fallbackBlackHandle_) glMakeTextureHandleResidentARB(fallbackBlackHandle_);
-        }
-        if (normalTex.id) {
-            fallbackNormalHandle_ = glGetTextureHandleARB(normalTex.id);
-            if (fallbackNormalHandle_) glMakeTextureHandleResidentARB(fallbackNormalHandle_);
-        }
-        if (blackCubeTex.id) {
-            fallbackBlackCubeHandle_ = glGetTextureHandleARB(blackCubeTex.id);
-            if (fallbackBlackCubeHandle_) glMakeTextureHandleResidentARB(fallbackBlackCubeHandle_);
-        }
-    }
-
-    NC::LOGGING::Log("[DEFERRED] initGLFW end framebuffer=", width, "x", height,
-                     " shaderManager=", (shaderManager ? 1 : 0),
-                     " particlesDisabled=", (ParticlesDisabled() ? 1 : 0));
-}
-
-void DeferredRenderer::initCascadedShadowMaps() {
-    using namespace NDEVC::Graphics;
-
-    for (int i = 0; i < NUM_CASCADES; i++) {
-        TextureDesc depthDesc;
-        depthDesc.type = TextureType::Texture2D;
-        depthDesc.format = Format::D32_FLOAT_S8_UINT;
-        depthDesc.width = SHADOW_WIDTH;
-        depthDesc.height = SHADOW_HEIGHT;
-
-        shadowMapTextures[i] = device_->CreateTexture(depthDesc);
-        shadowMapCascades[i].id = *(GLuint*)shadowMapTextures[i]->GetNativeHandle();
-
-        glGenFramebuffers(1, shadowFBOCascades[i].put());
-        glBindFramebuffer(GL_FRAMEBUFFER, shadowFBOCascades[i]);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-            GL_TEXTURE_2D, shadowMapCascades[i], 0);
-        glDrawBuffer(GL_NONE);
-        glReadBuffer(GL_NONE);
-
-        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (status != GL_FRAMEBUFFER_COMPLETE) {
-            NC::LOGGING::Error("[CSM] Cascade ", i, " FBO incomplete: 0x", std::hex, status, std::dec);
-        }
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    if (optRenderLOG) std::cout << "[CSM] Shadow Map Details:\n";
-    for (int i = 0; i < NUM_CASCADES; i++) {
-        if (optRenderLOG) std::cout << "  Cascade " << i << ": FBO=" << shadowFBOCascades[i]
-                  << " DepthTex=" << shadowMapCascades[i] << " Size=" << SHADOW_WIDTH << "x" << SHADOW_HEIGHT << "\n";
-    }
-    if (optRenderLOG) std::cout << "[CSM] Initialized " << NUM_CASCADES << " cascades\n";
-
-}
-
-void DeferredRenderer::initDeferred() {
-    glGenFramebuffers(1, gBuffer.put());
-    if (optRenderLOG) std::cout << "[InitDeferred] Created gBuffer FBO " << gBuffer << "\n";
-    glBindFramebuffer(GL_FRAMEBUFFER, gBuffer);
-
-    auto createLegacyTex2D = [&](NDEVC::GL::GLTexHandle& tex, GLint intFmt, GLenum fmt, GLenum type) {
-        glGenTextures(1, tex.put());
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, intFmt, width, height, 0, fmt, type, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    };
-
-    createLegacyTex2D(gPositionVS, GL_RGBA32F, GL_RGBA, GL_FLOAT);
-    createLegacyTex2D(gNormalDepthPacked, GL_RGBA16F, GL_RGBA, GL_FLOAT);
-    createLegacyTex2D(gAlbedoSpec, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
-    createLegacyTex2D(gPositionWS, GL_RGBA32F, GL_RGBA, GL_FLOAT);
-    createLegacyTex2D(gEmissive, GL_RGBA16F, GL_RGBA, GL_FLOAT);
-    createLegacyTex2D(gDepth, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8);
-
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gPositionVS, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, gNormalDepthPacked, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, gAlbedoSpec, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_TEXTURE_2D, gPositionWS, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT4, GL_TEXTURE_2D, gEmissive, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, gDepth, 0);
-
-    const GLenum gBufferDrawBuffers[5] = {
-        GL_COLOR_ATTACHMENT0,
-        GL_COLOR_ATTACHMENT1,
-        GL_COLOR_ATTACHMENT2,
-        GL_COLOR_ATTACHMENT3,
-        GL_COLOR_ATTACHMENT4
-    };
-    glDrawBuffers(5, gBufferDrawBuffers);
-    const GLenum gBufferStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (gBufferStatus != GL_FRAMEBUFFER_COMPLETE) {
-        NC::LOGGING::Error("[GBuffer ERROR] Status: 0x", std::hex, gBufferStatus, std::dec);
-    }
-
-    using namespace NDEVC::Graphics;
-
-    TextureDesc lightBufferDesc;
-    lightBufferDesc.type = TextureType::Texture2D;
-    lightBufferDesc.format = Format::RGBA16F;
-    lightBufferDesc.width = width;
-    lightBufferDesc.height = height;
-    lightBufferTex = device_->CreateTexture(lightBufferDesc);
-    lightBuffer.id = *(GLuint*)lightBufferTex->GetNativeHandle();
-
-    glGenFramebuffers(1, lightFBO.put());
-    glBindFramebuffer(GL_FRAMEBUFFER, lightFBO);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, lightBuffer, 0);
-    GLenum lightStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (lightStatus != GL_FRAMEBUFFER_COMPLETE)
-        NC::LOGGING::Error("[LightFBO ERROR] Status: 0x", std::hex, lightStatus, std::dec);
-
-    TextureDesc sceneColorDesc;
-    sceneColorDesc.type = TextureType::Texture2D;
-    sceneColorDesc.format = Format::RGBA16F;
-    sceneColorDesc.width = width;
-    sceneColorDesc.height = height;
-    sceneColorTex = device_->CreateTexture(sceneColorDesc);
-    sceneColor.id = *(GLuint*)sceneColorTex->GetNativeHandle();
-
-    glGenFramebuffers(1, sceneFBO.put());
-    glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneColor, 0);
-
-    TextureDesc depthStencilDesc;
-    depthStencilDesc.type = TextureType::Texture2D;
-    depthStencilDesc.format = Format::D24_UNORM_S8_UINT;
-    depthStencilDesc.width = width;
-    depthStencilDesc.height = height;
-    sceneDepthStencilTex = device_->CreateTexture(depthStencilDesc);
-    sceneDepthStencil.id = *(GLuint*)sceneDepthStencilTex->GetNativeHandle();
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, sceneDepthStencil, 0);
-
-    GLenum sceneStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (sceneStatus != GL_FRAMEBUFFER_COMPLETE)
-        NC::LOGGING::Error("[SceneFBO ERROR] Status: 0x", std::hex, sceneStatus, std::dec);
-
-    TextureDesc sceneColor2Desc;
-    sceneColor2Desc.type = TextureType::Texture2D;
-    sceneColor2Desc.format = Format::RGBA16F;
-    sceneColor2Desc.width = width;
-    sceneColor2Desc.height = height;
-    sceneColor2Tex = device_->CreateTexture(sceneColor2Desc);
-    sceneColor2.id = *(GLuint*)sceneColor2Tex->GetNativeHandle();
-
-    glGenFramebuffers(1, sceneFBO2.put());
-    glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO2);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneColor2, 0);
-    GLenum scene2Status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (scene2Status != GL_FRAMEBUFFER_COMPLETE)
-        NC::LOGGING::Error("[SceneFBO2 ERROR] Status: 0x", std::hex, scene2Status, std::dec);
-
-    glGenTextures(1, gPositionWSRead.put());
-    glBindTexture(GL_TEXTURE_2D, gPositionWSRead);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    Info(Category::Graphics, "initGLFW end framebuffer=", width, "x", height,
+                     " shaderManager=", (shaderManager ? 1 : 0));
 }
 
 void DeferredRenderer::resizeFramebuffers(int newWidth, int newHeight) {
     if (newWidth <= 0 || newHeight <= 0) return;
+    static const bool cameraTrace = CameraTraceEnabledByDefault();
+    if (cameraTrace) {
+        NC::LOGGING::Info(NC::LOGGING::Category::Graphics,
+            "[CAMERA_TRACE][RESIZE_FBO] old=", width, "x", height,
+            " new=", newWidth, "x", newHeight,
+            " defaultFb=", (window_ ? window_->GetDefaultFramebuffer() : 0));
+    }
     width = newWidth;
     height = newHeight;
-
-    if (shadowGraph) {
-        shadowGraph->setDimensions(SHADOW_WIDTH, SHADOW_HEIGHT);
-        shadowGraph->compile();
+    if (device_ && window_) {
+        device_->SetDefaultFramebuffer(window_->GetDefaultFramebuffer());
     }
-    if (geometryGraph) {
-        geometryGraph->setDimensions(width, height);
-        geometryGraph->compile();
-    }
-    if (decalGraph) {
-        decalGraph->setDimensions(width, height);
-        decalGraph->compile();
-    }
-    if (lightingGraph) {
-        lightingGraph->setDimensions(width, height);
-        lightingGraph->compile();
-    }
-    if (particleGraph) {
-        particleGraph->setDimensions(width, height);
-        particleGraph->compile();
-    }
-
-    auto resizeTex2D = [&](GLuint tex, GLint intFmt, GLenum fmt, GLenum type) {
-        if (tex == 0) return;
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, intFmt, width, height, 0, fmt, type, nullptr);
-    };
-
-    resizeTex2D(lightBuffer,        GL_RGBA16F, GL_RGBA, GL_FLOAT);
-    resizeTex2D(sceneColor,         GL_RGBA16F, GL_RGBA, GL_FLOAT);
-    resizeTex2D(sceneColor2,        GL_RGBA16F, GL_RGBA, GL_FLOAT);
-    resizeTex2D(sceneDepthStencil,  GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8);
-    resizeTex2D(gPositionVS,        GL_RGBA32F, GL_RGBA, GL_FLOAT);
-    resizeTex2D(gNormalDepthPacked, GL_RGBA16F, GL_RGBA, GL_FLOAT);
-    resizeTex2D(gAlbedoSpec,        GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
-    resizeTex2D(gPositionWS,        GL_RGBA32F, GL_RGBA, GL_FLOAT);
-    resizeTex2D(gDepth,             GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8);
-    resizeTex2D(gEmissive,          GL_RGBA16F, GL_RGBA, GL_FLOAT);
-    resizeTex2D(gPositionWSRead,    GL_RGBA32F, GL_RGBA, GL_FLOAT);
 
     glBindTexture(GL_TEXTURE_2D, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, device_ ? device_->GetDefaultFramebuffer() : 0);
 
     if (device_) {
         device_->SetViewport({0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f});
     }
+    if (renderResources_) {
+        renderResources_->Resize(width, height);
+    }
+    if (renderGraph_) {
+        renderGraph_->OnResize(width, height);
+    }
 
-    camera_.updateAspectRatio(width, height);
+    camera.updateAspectRatio(width, height);
 }
-
-void DeferredRenderer::generateSphereMesh() {
-    using namespace NDEVC::Graphics;
-
-    const int latSegments = 12;
-    const int lonSegments = 24;
-    std::vector<float> vertices;
-    std::vector<unsigned int> indices;
-
-    for (int lat = 0; lat <= latSegments; lat++) {
-        float theta = static_cast<float>(lat) * 3.14159265358979f / static_cast<float>(latSegments);
-        float sinTheta = std::sin(theta);
-        float cosTheta = std::cos(theta);
-        for (int lon = 0; lon <= lonSegments; lon++) {
-            float phi = static_cast<float>(lon) * 2.0f * 3.14159265358979f / static_cast<float>(lonSegments);
-            float x = std::cos(phi) * sinTheta;
-            float y = cosTheta;
-            float z = std::sin(phi) * sinTheta;
-            vertices.push_back(x);
-            vertices.push_back(y);
-            vertices.push_back(z);
-        }
-    }
-
-    for (int lat = 0; lat < latSegments; lat++) {
-        for (int lon = 0; lon < lonSegments; lon++) {
-            int current = lat * (lonSegments + 1) + lon;
-            int next = current + lonSegments + 1;
-            indices.push_back(current);
-            indices.push_back(next);
-            indices.push_back(current + 1);
-            indices.push_back(current + 1);
-            indices.push_back(next);
-            indices.push_back(next + 1);
-        }
-    }
-
-    sphereIndexCount = static_cast<int>(indices.size());
-
-    BufferDesc vboDesc;
-    vboDesc.type = BufferType::Vertex;
-    vboDesc.size = vertices.size() * sizeof(float);
-    vboDesc.initialData = vertices.data();
-    sphereVBO_abstracted = device_->CreateBuffer(vboDesc);
-    if (sphereVBO_abstracted) {
-        sphereVBO.id = *(GLuint*)sphereVBO_abstracted->GetNativeHandle();
-    }
-
-    BufferDesc eboDesc;
-    eboDesc.type = BufferType::Index;
-    eboDesc.size = indices.size() * sizeof(unsigned int);
-    eboDesc.initialData = indices.data();
-    sphereEBO_abstracted = device_->CreateBuffer(eboDesc);
-    if (sphereEBO_abstracted) {
-        sphereEBO.id = *(GLuint*)sphereEBO_abstracted->GetNativeHandle();
-    }
-
-    glGenVertexArrays(1, sphereVAO.put());
-    glBindVertexArray(sphereVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, sphereVBO);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sphereEBO);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
-
-    if (!pointLightInstanceVBO) {
-        glGenBuffers(1, pointLightInstanceVBO.put());
-    }
-    glBindBuffer(GL_ARRAY_BUFFER, pointLightInstanceVBO);
-    pointLightInstanceCapacity = 1;
-    glBufferData(GL_ARRAY_BUFFER, pointLightInstanceCapacity * sizeof(glm::vec4) * 2, nullptr, GL_DYNAMIC_DRAW);
-
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(glm::vec4) * 2, (void*)0);
-    glVertexAttribDivisor(1, 1);
-
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(glm::vec4) * 2, (void*)sizeof(glm::vec4));
-    glVertexAttribDivisor(2, 1);
-
-    glBindVertexArray(0);
-}
-
-void DeferredRenderer::renderCascadedShadows(const glm::vec3& camPos, const glm::vec3& camForward)
-{
-    frameProfile_.shadowGroup  = 0.0;
-    frameProfile_.shadowUpload = 0.0;
-    frameProfile_.shadowDraw   = 0.0;
-    frameProfile_.shadowSL     = 0.0;
-    frameProfile_.shadowCasterBuild = 0.0;
-    static int frameCount = 0;
-    static bool logShadows = (frameCount++ == 5);
-    glm::vec3 lightDirWorld = -kLightDirToSun;
-
-    auto tCasterStart = std::chrono::steady_clock::now();
-    const glm::mat4 viewMatrix = camera_.getViewMatrix();
-
-    if (shadowCastersDirty_) {
-        shadowCasters_.clear();
-        shadowCasters_.reserve(solidDraws.size());
-        simpleLayerShadowCasters_.clear();
-        simpleLayerShadowCasters_.reserve(simpleLayerDraws.size());
-
-        for (const auto& obj : solidDraws) {
-            if (!obj.mesh || obj.shadowFiltered) continue;
-
-            glm::vec3 wc;
-            float r;
-            if (obj.cullBoundsValid) {
-                wc = obj.cullWorldCenter;
-                r = obj.cullWorldRadius;
-            } else {
-                const glm::vec3 localCenter = (glm::vec3(obj.localBoxMin) + glm::vec3(obj.localBoxMax)) * 0.5f;
-                const float localRadius = glm::length(glm::vec3(obj.localBoxMax) - glm::vec3(obj.localBoxMin)) * 0.5f;
-                const float sx = glm::length(glm::vec3(obj.worldMatrix[0]));
-                const float sy = glm::length(glm::vec3(obj.worldMatrix[1]));
-                const float sz = glm::length(glm::vec3(obj.worldMatrix[2]));
-                r = localRadius * std::max(sx, std::max(sy, sz));
-                wc = glm::vec3(obj.worldMatrix * glm::vec4(localCenter, 1.0f));
-            }
-
-            const float vd = -(viewMatrix[0][2]*wc.x + viewMatrix[1][2]*wc.y + viewMatrix[2][2]*wc.z + viewMatrix[3][2]);
-            shadowCasters_.push_back(ShadowCaster{&obj, r, vd, wc});
-        }
-
-        // Pre-group solid casters by geomKey once — reused across cascades and frames
-        {
-            std::unordered_map<uint64_t, size_t> keyToIdx;
-            solidShadowGeomGroups_.clear();
-            for (uint32_t ci = 0; ci < static_cast<uint32_t>(shadowCasters_.size()); ++ci) {
-                const DrawCmd& obj = *shadowCasters_[ci].draw;
-                auto addGrp = [&](const Nvx2Group& g) {
-                    if (g.indexCount() == 0) return;
-                    const uint32_t cnt = g.indexCount();
-                    const uint32_t fIdx = obj.megaIndexOffset + g.firstIndex();
-                    const uint64_t gk = (static_cast<uint64_t>(cnt) << 32) | fIdx;
-                    auto [it, ins] = keyToIdx.try_emplace(gk, solidShadowGeomGroups_.size());
-                    if (ins) solidShadowGeomGroups_.push_back({cnt, fIdx, {}});
-                    solidShadowGeomGroups_[it->second].casterIndices.push_back(ci);
-                };
-                if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
-                    addGrp(obj.mesh->groups[obj.group]);
-                } else {
-                    for (const auto& g : obj.mesh->groups) addGrp(g);
-                }
-            }
-        }
-
-        for (const auto& obj : simpleLayerDraws) {
-            if (!obj.mesh) continue;
-
-            glm::vec3 wc;
-            float r;
-            if (obj.cullBoundsValid) {
-                wc = obj.cullWorldCenter;
-                r = obj.cullWorldRadius;
-            } else {
-                const glm::vec3 localCenter = (glm::vec3(obj.localBoxMin) + glm::vec3(obj.localBoxMax)) * 0.5f;
-                const float localRadius = glm::length(glm::vec3(obj.localBoxMax) - glm::vec3(obj.localBoxMin)) * 0.5f;
-                const float sx = glm::length(glm::vec3(obj.worldMatrix[0]));
-                const float sy = glm::length(glm::vec3(obj.worldMatrix[1]));
-                const float sz = glm::length(glm::vec3(obj.worldMatrix[2]));
-                r = localRadius * std::max(sx, std::max(sy, sz));
-                wc = glm::vec3(obj.worldMatrix * glm::vec4(localCenter, 1.0f));
-            }
-
-            const float vd = -(viewMatrix[0][2]*wc.x + viewMatrix[1][2]*wc.y + viewMatrix[2][2]*wc.z + viewMatrix[3][2]);
-            simpleLayerShadowCasters_.push_back(ShadowCaster{&obj, r, vd, wc});
-        }
-
-        shadowCastersDirty_ = false;
-        shadowCasterCacheHit_ = false;
-        shadowGroupCacheValid_ = false;
-    } else {
-        shadowCasterCacheHit_ = true;
-        const float vr0 = viewMatrix[0][2], vr1 = viewMatrix[1][2],
-                    vr2 = viewMatrix[2][2], vr3 = viewMatrix[3][2];
-        for (auto& c : shadowCasters_)
-            c.viewDepth = -(vr0*c.worldCenter.x + vr1*c.worldCenter.y + vr2*c.worldCenter.z + vr3);
-        for (auto& c : simpleLayerShadowCasters_)
-            c.viewDepth = -(vr0*c.worldCenter.x + vr1*c.worldCenter.y + vr2*c.worldCenter.z + vr3);
-    }
-
-    frameProfile_.shadowCasterBuild = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - tCasterStart).count();
-
-    if (logShadows) {
-        std::cout << "  Computing light space matrices for " << NUM_CASCADES << " cascades\n";
-        std::cout << "  Light direction: (" << lightDirWorld.x << ", " << lightDirWorld.y << ", " << lightDirWorld.z << ")\n";
-        std::cout << "  Shadow casters considered: " << shadowCasters_.size() << "/" << solidDraws.size() << "\n";
-        std::cout << "  SimpleLayer shadow casters considered: " << simpleLayerShadowCasters_.size() << "/" << simpleLayerDraws.size() << "\n";
-    }
-
-    const float fovY = glm::radians(camera_.getFov());
-    const float tanHalfFovY = std::tan(fovY * 0.5f);
-    const float aspect = std::max(0.001f, camera_.getAspectRatio());
-    const glm::mat4 invView = glm::inverse(viewMatrix);
-
-    for (int i = 0; i < NUM_CASCADES; i++) {
-        const float cascadeNear = cascadeSplits[i];
-        const float cascadeFar = cascadeSplits[i + 1];
-
-        const float nearHalfH = cascadeNear * tanHalfFovY;
-        const float nearHalfW = nearHalfH * aspect;
-        const float farHalfH = cascadeFar * tanHalfFovY;
-        const float farHalfW = farHalfH * aspect;
-
-        const glm::vec3 cornersVS[8] = {
-            {-nearHalfW,  nearHalfH, -cascadeNear},
-            { nearHalfW,  nearHalfH, -cascadeNear},
-            { nearHalfW, -nearHalfH, -cascadeNear},
-            {-nearHalfW, -nearHalfH, -cascadeNear},
-            {-farHalfW,   farHalfH,  -cascadeFar},
-            { farHalfW,   farHalfH,  -cascadeFar},
-            { farHalfW,  -farHalfH,  -cascadeFar},
-            {-farHalfW,  -farHalfH,  -cascadeFar}
-        };
-
-        glm::vec3 cornersWS[8];
-        glm::vec3 frustumCenterWS(0.0f);
-        for (int c = 0; c < 8; ++c) {
-            cornersWS[c] = glm::vec3(invView * glm::vec4(cornersVS[c], 1.0f));
-            frustumCenterWS += cornersWS[c];
-        }
-        frustumCenterWS /= 8.0f;
-
-        glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
-        if (std::abs(glm::dot(up, lightDirWorld)) > 0.99f) {
-            up = glm::vec3(0.0f, 0.0f, 1.0f);
-        }
-
-        const float lightDistance = cascadeFar + 500.0f;
-        // Keep orientation fixed from light direction, but anchor translation to
-        // the current cascade center to avoid large-coordinate precision drift.
-        const glm::vec3 lightEye = frustumCenterWS - lightDirWorld * lightDistance;
-        const glm::mat4 lightView = glm::lookAt(lightEye, frustumCenterWS, up);
-
-        glm::vec3 minLS(std::numeric_limits<float>::max());
-        glm::vec3 maxLS(std::numeric_limits<float>::lowest());
-        for (int c = 0; c < 8; ++c) {
-            const glm::vec3 cornerLS = glm::vec3(lightView * glm::vec4(cornersWS[c], 1.0f));
-            minLS = glm::min(minLS, cornerLS);
-            maxLS = glm::max(maxLS, cornerLS);
-        }
-
-        const float cascadeDepthPadding = 500.0f;
-        minLS.z -= cascadeDepthPadding;
-        maxLS.z += cascadeDepthPadding;
-
-        float radius = 0.0f;
-        for (int c = 0; c < 8; ++c) {
-            radius = std::max(radius, glm::length(cornersWS[c] - frustumCenterWS));
-        }
-
-        glm::vec2 centerLS = glm::vec2(lightView * glm::vec4(frustumCenterWS, 1.0f));
-        if (radius > 0.0f) {
-            const float texelSize = (radius * 2.0f) / static_cast<float>(SHADOW_WIDTH);
-            centerLS.x = std::round(centerLS.x / texelSize) * texelSize;
-            centerLS.y = std::round(centerLS.y / texelSize) * texelSize;
-        }
-
-        const float minX = centerLS.x - radius;
-        const float maxX = centerLS.x + radius;
-        const float minY = centerLS.y - radius;
-        const float maxY = centerLS.y + radius;
-
-        // GLM orthographic near/far are distances (positive), while points in front
-        // of the light camera are negative z in light-view space.
-        const float zNear = std::max(0.1f, -maxLS.z);
-        const float zFar = std::max(zNear + 1.0f, -minLS.z);
-        const glm::mat4 lightProjection = glm::ortho(minX, maxX, minY, maxY, zNear, zFar);
-        lightSpaceMatrices[i] = lightProjection * lightView;
-
-        if (logShadows) {
-            std::cout << "    Cascade " << i << ": range [" << cascadeNear << " - " << cascadeFar
-                      << "]m, radius=" << radius << "\n";
-        }
-    }
-
-    if (logShadows) std::cout << "  Rendering shadow maps for each cascade\n";
-
-    for (int cascade = 0; cascade < NUM_CASCADES; cascade++) {
-        const float cascadeNear = cascadeSplits[cascade];
-        const float cascadeFar = cascadeSplits[cascade + 1];
-
-        if (logShadows) {
-            std::cout << "\n    === Cascade " << cascade << " ===\n";
-            std::cout << "    FBO=" << shadowFBOCascades[cascade]
-                      << " Tex=" << shadowMapCascades[cascade]
-                      << " Size=" << SHADOW_WIDTH << "x" << SHADOW_HEIGHT
-                      << " Range=[" << cascadeNear << " - " << cascadeFar << "]\n";
-        }
-
-        glBindFramebuffer(GL_FRAMEBUFFER, shadowFBOCascades[cascade]);
-        glDrawBuffer(GL_NONE);
-        glReadBuffer(GL_NONE);
-        checkGLError("After bind shadow FBO");
-
-        if (logShadows) {
-            GLint currentFBO = 0;
-            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &currentFBO);
-            GLenum fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-            std::cout << "    Bound FBO: " << currentFBO << " Status: 0x" << std::hex << fboStatus << std::dec;
-            if (fboStatus == GL_FRAMEBUFFER_COMPLETE) std::cout << " (COMPLETE)";
-            else std::cout << " (INCOMPLETE!)";
-            std::cout << "\n";
-
-            GLint depthAttachment = 0;
-            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &depthAttachment);
-            std::cout << "    Depth attachment: " << depthAttachment << "\n";
-        }
-
-        glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
-        glClear(GL_DEPTH_BUFFER_BIT);
-        checkGLError("After clear shadow depth");
-
-        if (device_) {
-            NDEVC::Graphics::RenderStateDesc shadowState;
-            shadowState.depth.depthTest = true;
-            shadowState.depth.depthWrite = true;
-            shadowState.depth.depthFunc = NDEVC::Graphics::CompareFunc::Less;
-            device_->ApplyRenderState(device_->CreateRenderState(shadowState).get());
-        } else {
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(GL_LESS);
-            glDepthMask(GL_TRUE);
-        }
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-        checkGLError("After shadow state setup");
-
-        if (logShadows) {
-            GLboolean depthTest, depthMask;
-            GLint depthFunc;
-            glGetBooleanv(GL_DEPTH_TEST, &depthTest);
-            glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
-            glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
-            std::cout << "    Shadow GL State: DepthTest=" << (int)depthTest
-                      << " DepthMask=" << (int)depthMask
-                      << " DepthFunc=0x" << std::hex << depthFunc << std::dec << "\n";
-        }
-
-        auto shadowShaders = shaderManager->GetShader("lightShadows");
-        if (!shadowShaders) {
-            NC::LOGGING::Error("[SHADOW] light not found/not working");
-        } else {
-            shadowShaders->Use();
-            checkGLError("After use shadow shader");
-
-            if (logShadows) {
-                GLint currentProgram = shadowShaders->GetNativeHandle()
-                    ? static_cast<GLint>(*reinterpret_cast<GLuint*>(shadowShaders->GetNativeHandle()))
-                    : 0;
-                std::cout << "    Shadow shader program: " << currentProgram << "\n";
-            }
-
-            shadowShaders->SetMat4("lightSpaceMatrix", lightSpaceMatrices[cascade]);
-            checkGLError("After set lightSpaceMatrix");
-        }
-
-        if (shadowShaders) {
-            auto tGroupStart = std::chrono::steady_clock::now();
-            shadowMatrices_.clear();
-            shadowCommands_.clear();
-
-            const bool groupCacheHit = shadowGroupCacheValid_ &&
-                                       shadowCasterCacheHit_ &&
-                                       shadowGroupCacheViewMatrix_ == viewMatrix;
-            int triangleCount = 0;
-            if (groupCacheHit) {
-                shadowMatrices_ = shadowGroupCachedMatrices_[cascade];
-                shadowCommands_ = shadowGroupCachedCommands_[cascade];
-            } else {
-            shadowMatrices_.reserve(shadowCasters_.size());
-
-            for (const auto& grp : solidShadowGeomGroups_) {
-                const uint32_t firstMat = static_cast<uint32_t>(shadowMatrices_.size());
-                uint32_t inRange = 0;
-                for (uint32_t ci : grp.casterIndices) {
-                    const ShadowCaster& caster = shadowCasters_[ci];
-                    if (caster.draw->disabled) continue;
-                    if (caster.viewDepth + caster.radius < cascadeNear) continue;
-                    if (caster.viewDepth - caster.radius > cascadeFar) continue;
-                    shadowMatrices_.push_back(caster.draw->worldMatrix);
-                    ++inRange;
-                }
-                if (inRange > 0) {
-                    DrawCommand cmd{};
-                    cmd.count = grp.indexCount;
-                    cmd.instanceCount = inRange;
-                    cmd.firstIndex = grp.firstIndex;
-                    cmd.baseVertex = 0;
-                    cmd.baseInstance = firstMat;
-                    shadowCommands_.push_back(cmd);
-                    triangleCount += static_cast<int>(grp.indexCount / 3) * inRange;
-                }
-            }
-            shadowGroupCachedMatrices_[cascade] = shadowMatrices_;
-            shadowGroupCachedCommands_[cascade] = shadowCommands_;
-            } // end !groupCacheHit
-            frameProfile_.shadowGroup += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - tGroupStart).count();
-
-            if (!shadowCommands_.empty()) {
-                auto tUploadStart = std::chrono::steady_clock::now();
-                // Upload model matrices to SSBO at binding point 1
-                if (!shadowMatrixSSBO_) glGenBuffers(1, shadowMatrixSSBO_.put());
-                glBindBuffer(GL_SHADER_STORAGE_BUFFER, shadowMatrixSSBO_);
-                const size_t matrixBytes = shadowMatrices_.size() * sizeof(glm::mat4);
-                if (matrixBytes > shadowMatrixSSBOCapacity_) {
-                    shadowMatrixSSBOCapacity_ = matrixBytes * 2;
-                }
-                // Orphan previous storage to avoid sync stall with in-flight GPU reads
-                glBufferData(GL_SHADER_STORAGE_BUFFER,
-                             static_cast<GLsizeiptr>(shadowMatrixSSBOCapacity_),
-                             nullptr, GL_STREAM_DRAW);
-                glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                                static_cast<GLsizeiptr>(matrixBytes),
-                                shadowMatrices_.data());
-                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, shadowMatrixSSBO_);
-
-                // Upload indirect commands
-                if (!shadowIndirectBuffer_) glGenBuffers(1, shadowIndirectBuffer_.put());
-                glBindBuffer(GL_DRAW_INDIRECT_BUFFER, shadowIndirectBuffer_);
-                const size_t cmdBytes = shadowCommands_.size() * sizeof(DrawCommand);
-                if (cmdBytes > shadowIndirectBufferCapacity_) {
-                    shadowIndirectBufferCapacity_ = cmdBytes * 2;
-                }
-                glBufferData(GL_DRAW_INDIRECT_BUFFER,
-                             static_cast<GLsizeiptr>(shadowIndirectBufferCapacity_),
-                             nullptr, GL_STREAM_DRAW);
-                glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
-                                static_cast<GLsizeiptr>(cmdBytes),
-                                shadowCommands_.data());
-                frameProfile_.shadowUpload += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - tUploadStart).count();
-
-                // Single indirect draw for the entire cascade
-                auto tDrawStart = std::chrono::steady_clock::now();
-                MegaBuffer::instance().bind();
-                glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
-                                            nullptr,
-                                            static_cast<GLsizei>(shadowCommands_.size()),
-                                            0);
-                glBindVertexArray(0);
-                glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
-                frameProfile_.shadowDraw += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - tDrawStart).count();
-            }
-            checkGLError("After shadow draw calls");
-
-            if (logShadows) {
-                std::cout << "    Drew " << shadowCommands_.size() << " indirect commands, "
-                          << triangleCount << " triangles\n";
-            }
-        }
-
-        if (!simpleLayerShadowCasters_.empty()) {
-            auto tSLStart = std::chrono::steady_clock::now();
-            auto simpleLayerShadowShader = shaderManager->GetShader("simplelayer_shadow");
-            auto simpleLayerDepthShader  = shaderManager->GetShader("simplelayer_depth");
-            if (!simpleLayerShadowShader || !simpleLayerDepthShader) {
-                NC::LOGGING::Error("[SHADOW] simplelayer shadow/depth shader variants missing");
-            } else {
-                // Fix #4: batch simpleLayer shadow draws with instanced indirect rendering.
-                // Non-alphaTest (depth-only): group by geomKey, one glMultiDrawElementsIndirect.
-                // AlphaTest: group by (tex[0], cullMode), one instanced draw per unique group.
-
-                // ─── non-alphaTest depth pass ───────────────────────────────────────────
-                static thread_local std::unordered_map<uint64_t, ShadowInstancedGroup> slDepthGroups;
-                slDepthGroups.clear();
-                static thread_local std::vector<glm::mat4>   slDepthMats;
-                static thread_local std::vector<DrawCommand> slDepthCmds;
-                slDepthMats.clear();
-                slDepthCmds.clear();
-
-                // alphaTest groups keyed by (tex[0] ptr ^ cullMode bits)
-                struct SlAlphaGroup {
-                    NDEVC::Graphics::ITexture* tex0 = nullptr;
-                    int cullMode = 0;
-                    std::vector<glm::mat4>   mats;
-                    std::vector<DrawCommand> cmds;
-                    std::unordered_map<uint64_t, ShadowInstancedGroup> geomGroups;
-                };
-                static thread_local std::unordered_map<uint64_t, SlAlphaGroup> slAlphaGroups;
-                slAlphaGroups.clear();
-
-                for (const auto& caster : simpleLayerShadowCasters_) {
-                    const DrawCmd& obj = *caster.draw;
-                    if (obj.disabled) continue;
-                    if (caster.viewDepth + caster.radius < cascadeNear) continue;
-                    if (caster.viewDepth - caster.radius > cascadeFar) continue;
-                    if (!obj.mesh) continue;
-
-                    auto addToGeomGroup = [&](std::unordered_map<uint64_t, ShadowInstancedGroup>& groups,
-                                              const Nvx2Group& g) {
-                        if (g.indexCount() == 0) return;
-                        const uint32_t count      = g.indexCount();
-                        const uint32_t firstIndex = obj.megaIndexOffset + g.firstIndex();
-                        const uint64_t geomKey    = (static_cast<uint64_t>(count) << 32) | firstIndex;
-                        auto& grp = groups[geomKey];
-                        if (grp.count == 0) { grp.count = count; grp.firstIndex = firstIndex; }
-                        grp.matrices.push_back(obj.worldMatrix);
-                    };
-
-                    if (!obj.alphaTest) {
-                        if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
-                            addToGeomGroup(slDepthGroups, obj.mesh->groups[obj.group]);
-                        } else {
-                            for (const auto& g : obj.mesh->groups) addToGeomGroup(slDepthGroups, g);
-                        }
-                    } else {
-                        const uint64_t ak = (reinterpret_cast<uintptr_t>(obj.tex[0]) * 0x9e3779b97f4a7c15ull)
-                                          ^ static_cast<uint64_t>(static_cast<uint32_t>(obj.cullMode));
-                        auto& ag = slAlphaGroups[ak];
-                        ag.tex0     = obj.tex[0];
-                        ag.cullMode = obj.cullMode;
-                        if (obj.group >= 0 && obj.group < static_cast<int>(obj.mesh->groups.size())) {
-                            addToGeomGroup(ag.geomGroups, obj.mesh->groups[obj.group]);
-                        } else {
-                            for (const auto& g : obj.mesh->groups) addToGeomGroup(ag.geomGroups, g);
-                        }
-                    }
-                }
-
-                // Build flat arrays for depth pass
-                for (auto& [key, grp] : slDepthGroups) {
-                    (void)key;
-                    if (grp.matrices.empty()) continue;
-                    DrawCommand cmd{};
-                    cmd.count         = grp.count;
-                    cmd.instanceCount = static_cast<uint32_t>(grp.matrices.size());
-                    cmd.firstIndex    = grp.firstIndex;
-                    cmd.baseVertex    = 0;
-                    cmd.baseInstance  = static_cast<uint32_t>(slDepthMats.size());
-                    slDepthMats.insert(slDepthMats.end(), grp.matrices.begin(), grp.matrices.end());
-                    slDepthCmds.push_back(cmd);
-                }
-
-                MegaBuffer::instance().bind();
-
-                // Draw depth-only batch
-                if (!slDepthCmds.empty()) {
-                    if (!slShadowMatrixSSBO_) glGenBuffers(1, slShadowMatrixSSBO_.put());
-                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, slShadowMatrixSSBO_);
-                    const size_t mb = slDepthMats.size() * sizeof(glm::mat4);
-                    if (mb > slShadowMatrixSSBOCapacity_) {
-                        slShadowMatrixSSBOCapacity_ = mb * 2;
-                    }
-                    glBufferData(GL_SHADER_STORAGE_BUFFER,
-                                 static_cast<GLsizeiptr>(slShadowMatrixSSBOCapacity_),
-                                 nullptr, GL_STREAM_DRAW);
-                    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                                    static_cast<GLsizeiptr>(mb), slDepthMats.data());
-                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, slShadowMatrixSSBO_);
-
-                    if (!slShadowIndirectBuffer_) glGenBuffers(1, slShadowIndirectBuffer_.put());
-                    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slShadowIndirectBuffer_);
-                    const size_t cb = slDepthCmds.size() * sizeof(DrawCommand);
-                    if (cb > slShadowIndirectBufferCapacity_) {
-                        slShadowIndirectBufferCapacity_ = cb * 2;
-                    }
-                    glBufferData(GL_DRAW_INDIRECT_BUFFER,
-                                 static_cast<GLsizeiptr>(slShadowIndirectBufferCapacity_),
-                                 nullptr, GL_STREAM_DRAW);
-                    glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
-                                    static_cast<GLsizeiptr>(cb), slDepthCmds.data());
-
-                    glDisable(GL_CULL_FACE);
-                    simpleLayerDepthShader->Use();
-                    simpleLayerDepthShader->SetInt("UseInstancing", 1);
-                    simpleLayerDepthShader->SetMat4("lightSpaceMatrix", lightSpaceMatrices[cascade]);
-
-                    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
-                                                nullptr,
-                                                static_cast<GLsizei>(slDepthCmds.size()), 0);
-                    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
-                }
-
-                // Draw alphaTest batches (one per unique tex0/cullMode group)
-                if (!slAlphaGroups.empty()) {
-                    // Reuse the slShadowMatrixSSBO_ for each alphaTest group sequentially
-                    simpleLayerShadowShader->Use();
-                    simpleLayerShadowShader->SetInt("UseInstancing", 1);
-                    simpleLayerShadowShader->SetMat4("lightSpaceMatrix", lightSpaceMatrices[cascade]);
-                    simpleLayerShadowShader->SetInt("diffMapSampler", 0);
-
-                    static thread_local std::vector<glm::mat4>   agMats;
-                    static thread_local std::vector<DrawCommand> agCmds;
-
-                    for (auto& [key, ag] : slAlphaGroups) {
-                        (void)key;
-                        agMats.clear();
-                        agCmds.clear();
-
-                        for (auto& [gk, grp] : ag.geomGroups) {
-                            (void)gk;
-                            if (grp.matrices.empty()) continue;
-                            DrawCommand cmd{};
-                            cmd.count         = grp.count;
-                            cmd.instanceCount = static_cast<uint32_t>(grp.matrices.size());
-                            cmd.firstIndex    = grp.firstIndex;
-                            cmd.baseVertex    = 0;
-                            cmd.baseInstance  = static_cast<uint32_t>(agMats.size());
-                            agMats.insert(agMats.end(), grp.matrices.begin(), grp.matrices.end());
-                            agCmds.push_back(cmd);
-                        }
-                        if (agCmds.empty()) continue;
-
-                        if (ag.cullMode <= 0) glDisable(GL_CULL_FACE);
-                        else { glEnable(GL_CULL_FACE); glCullFace(ag.cullMode == 1 ? GL_FRONT : GL_BACK); }
-
-                        bindTexture(0, ag.tex0 ? toTextureHandle(ag.tex0) : whiteTex);
-                        bindSampler(0, gSamplerRepeat);
-
-                        glBindBuffer(GL_SHADER_STORAGE_BUFFER, slShadowMatrixSSBO_);
-                        const size_t mb = agMats.size() * sizeof(glm::mat4);
-                        if (mb > slShadowMatrixSSBOCapacity_) {
-                            slShadowMatrixSSBOCapacity_ = mb * 2;
-                        }
-                        glBufferData(GL_SHADER_STORAGE_BUFFER,
-                                     static_cast<GLsizeiptr>(slShadowMatrixSSBOCapacity_),
-                                     nullptr, GL_STREAM_DRAW);
-                        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                                        static_cast<GLsizeiptr>(mb), agMats.data());
-                        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, slShadowMatrixSSBO_);
-
-                        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slShadowIndirectBuffer_);
-                        const size_t cb = agCmds.size() * sizeof(DrawCommand);
-                        if (cb > slShadowIndirectBufferCapacity_) {
-                            slShadowIndirectBufferCapacity_ = cb * 2;
-                        }
-                        glBufferData(GL_DRAW_INDIRECT_BUFFER,
-                                     static_cast<GLsizeiptr>(slShadowIndirectBufferCapacity_),
-                                     nullptr, GL_STREAM_DRAW);
-                        glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
-                                        static_cast<GLsizeiptr>(cb), agCmds.data());
-
-                        glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
-                                                    nullptr,
-                                                    static_cast<GLsizei>(agCmds.size()), 0);
-                        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
-                    }
-                }
-
-                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0);
-                bindSampler(0, 0);
-                glDisable(GL_CULL_FACE);
-
-                if (logShadows) {
-                    std::cout << "    SimpleLayer shadow depth cmds: " << slDepthCmds.size()
-                              << " alphaTest groups: " << slAlphaGroups.size() << "\n";
-                }
-            }
-            frameProfile_.shadowSL += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - tSLStart).count();
-        }
-    }
-
-    // Update shadow group cache for next frame if any cascade computed new grouping
-    shadowGroupCacheViewMatrix_ = viewMatrix;
-    shadowGroupCacheValid_      = true;
-
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, width, height);
-    checkGLError("After shadow pass cleanup");
-
-    if (logShadows) std::cout << "  Shadow rendering complete, viewport restored\n";
-}
-
 
 void DeferredRenderer::Initialize() {
     const bool traceInit = ReadEnvToggle("NDEVC_INIT_TRACE");
-    NC::LOGGING::Log("[DEFERRED] Initialize begin trace=", (traceInit ? 1 : 0));
+    Info(Category::Graphics, "Initialize begin trace=", (traceInit ? 1 : 0));
     auto logInitStep = [&](const char* step) {
-        NC::LOGGING::Log("[DEFERRED][INIT] ", (step ? step : "<null>"));
+        Debug(Category::Graphics, "Init step: ", (step ? step : "<null>"));
         if (traceInit && step) {
             std::cerr << "[INIT TRACE] " << step << "\n";
         }
@@ -1528,34 +597,31 @@ void DeferredRenderer::Initialize() {
     logInitStep("start");
     MountPackageFromEnvironment();
     logInitStep("MountPackageFromEnvironment");
-    InstallNax3Provider();
     logInitStep("InstallNax3Provider");
     initGLFW();
     logInitStep("initGLFW");
-    TextureServer::sBindlessSupported = (GLAD_GL_ARB_bindless_texture != 0);
-    NC::LOGGING::Log("[DEFERRED][INIT] GL_ARB_bindless_texture=",
+
+    // Engineering Mandate: Support bindless textures on modern hardware.
+    // We only enable this if the extension is reported AND GLAD has successfully loaded the function pointers.
+    bool bindless = (GLAD_GL_ARB_bindless_texture != 0) && (glad_glGetTextureHandleARB != nullptr);
+    TextureServer::sBindlessSupported = bindless;
+
+    Info(Category::Graphics, "GL_ARB_bindless_texture=",
         TextureServer::sBindlessSupported ? "YES" : "NO");
-    initCascadedShadowMaps();
-    logInitStep("initCascadedShadowMaps");
     InitScreenQuad();
     logInitStep("InitScreenQuad");
+    InitEditorPreviewGrid();
+    logInitStep("InitEditorPreviewGrid");
     InitShadowSampler();
     logInitStep("InitShadowSampler");
-    generateSphereMesh();
-    logInitStep("generateSphereMesh");
-    ClearDisabledDraws();
-    logInitStep("ClearDisabledDraws");
-    scene_.Initialize(device_.get(), shaderManager.get());
-    logInitStep("SceneManager::Initialize");
-
     if (!viewportDisabled_) {
         const std::string startupMapPath = ResolveStartupMapPath();
         if (startupMapPath.empty()) {
-            NC::LOGGING::Log("[DEFERRED][INIT] Starting with empty scene (no startup map)");
+            Info(Category::Graphics, "Starting with empty scene (no startup map)");
         } else if (optRenderLOG) {
             std::cout << "[Init] Startup map: " << startupMapPath << "\n";
         }
-        NC::LOGGING::Log("[DEFERRED][INIT] StartupMapPath=", startupMapPath);
+        Debug(Category::Graphics, "StartupMapPath=", startupMapPath);
 
         MapLoader loader;
         std::unique_ptr<MapData> startupMapOwned;
@@ -1567,106 +633,33 @@ void DeferredRenderer::Initialize() {
         logInitStep("MapLoader::load_map");
         if (!startupMap) {
             if (!startupMapPath.empty()) {
-                NC::LOGGING::Error("[DEFERRED][INIT] map load FAILED: ", startupMapPath);
+                Error(Category::Graphics, "Map load FAILED: ", startupMapPath);
             }
         } else {
             if (optRenderLOG) std::cout << "Map loaded: " << startupMap->instances.size() << " instances\n";
-            NC::LOGGING::Log("[DEFERRED][INIT] Map loaded instances=", startupMap->instances.size());
-            scene_.LoadMap(startupMap, startupMapPath);
+            Info(Category::Graphics, "Map loaded instances=", startupMap->instances.size());
+            scene_->LoadMap(startupMap, startupMapPath);
             logInitStep("SceneManager::LoadMap");
         }
 
-        MeshServer::instance().buildMegaBuffer();
-        logInitStep("buildMegaBuffer");
-
-        scene_.PrepareDrawLists(camera_,
-            solidDraws, alphaTestDraws, decalDraws, particleDraws,
-            environmentDraws, environmentAlphaDraws, simpleLayerDraws,
-            refractionDraws, postAlphaUnlitDraws, waterDraws, animatedDraws);
-        logInitStep("SceneManager::PrepareDrawLists");
-        ApplyDisabledDrawFlags();
-        logInitStep("ApplyDisabledDrawFlags");
-
-        auto setMegaOffsets = [](std::vector<DrawCmd>& draws) {
-            for (auto& dc : draws) {
-                if (!dc.mesh) continue;
-                dc.megaVertexOffset = dc.mesh->megaVertexOffset;
-                dc.megaIndexOffset = dc.mesh->megaIndexOffset;
-            }
-        };
-
-        setMegaOffsets(solidDraws);
-        setMegaOffsets(simpleLayerDraws);
-        setMegaOffsets(alphaTestDraws);
-        setMegaOffsets(decalDraws);
-        setMegaOffsets(waterDraws);
-        setMegaOffsets(refractionDraws);
-        setMegaOffsets(environmentDraws);
-        setMegaOffsets(environmentAlphaDraws);
-        setMegaOffsets(postAlphaUnlitDraws);
-
-        solidBatchSystem_.init(solidDraws);
-        alphaTestBatchSystem_.init(alphaTestDraws);
-        environmentBatchSystem_.init(environmentDraws);
-        environmentAlphaBatchSystem_.init(environmentAlphaDraws);
-        decalBatchSystem_.init(decalDraws);
-        logInitStep("DrawBatchSystem::init");
-
-        if (TextureServer::sBindlessSupported) {
-            NC::LOGGING::Log("[DEFERRED][INIT] BindlessTextures resident=",
-                TextureServer::instance().residentTextureCount());
-        }
-
-        buildMaterialSSBO();
-        logInitStep("buildMaterialSSBO");
-
-        buildDecalMaterialSSBO();
-        logInitStep("buildDecalMaterialSSBO");
-
-        buildWaterMaterialSSBO();
-        logInitStep("buildWaterMaterialSSBO");
-
-        buildRefractionMaterialSSBO();
-        logInitStep("buildRefractionMaterialSSBO");
-
-        buildEnvAlphaMaterialSSBO();
-        logInitStep("buildEnvAlphaMaterialSSBO");
-
-        BuildVisibilityGrids();
-        logInitStep("BuildVisibilityGrids");
-
-        // Center the top-down camera above the map.
+        // Center the camera to view the map.
         if (startupMap) {
-            const MapInfo& info = startupMap->info;
-            const float halfDiag = glm::length(glm::vec2(info.extents.x, info.extents.z));
-            const float elevation = std::max(halfDiag * 1.2f, 200.0f);
-            camera_.setPosition(glm::vec3(info.center.x,
-                                          info.center.y + elevation,
-                                          info.center.z + elevation * 0.7f));
+            glm::vec3 pos(0.0f, 2.0f, 10.0f);
+            glm::vec3 target(0.0f);
+            if (BuildMapCameraFit(startupMap->info, pos, target)) {
+                camera.setPosition(pos);
+                camera.lookAt(target);
+            }
         } else {
-            camera_.setPosition(glm::vec3(0.0f, 0.0f, 5.0f));
-            camera_.lookAt(glm::vec3(0.0f, 0.0f, 0.0f));
+            camera.setPosition(glm::vec3(0.0f, 4.0f, 15.0f));
+            camera.lookAt(glm::vec3(0.0f, 0.0f, 0.0f));
         }
-
-        rebuildAnimatedDrawLists();
-        logInitStep("rebuildAnimatedDrawLists");
-        decalBatchDirty = true;
     }
     scenePrepared = true;
-    useLegacyDeferredInit_ = ReadEnvToggle("NDEVC_USE_LEGACY_DEFERRED_INIT");
-    NC::LOGGING::Log("[DEFERRED][INIT] LegacyDeferredInit=", (useLegacyDeferredInit_ ? 1 : 0));
+    lastFrame = GetTimeSeconds(); // Initialize lastFrame to current time
+    setupRenderPasses();
+    logInitStep("setupRenderPasses");
 
-    if (useLegacyDeferredInit_) {
-        initDeferred();
-        logInitStep("initDeferred");
-    } else {
-        setupRenderPasses();
-        logInitStep("setupRenderPasses");
-    }
-    WriteWebSnapshot("initialize");
-    logInitStep("WriteWebSnapshot");
-
-    // ── Initial Work/Play mode policy ────────────────────────────────────
     {
         RenderMode initialMode = RenderMode::Work;
 #if defined(_WIN32)
@@ -1686,328 +679,35 @@ void DeferredRenderer::Initialize() {
 #endif
         renderMode_ = initialMode;
         FramePolicy policy = BuildPolicy(initialMode);
-        // Preserve ImGui init-time editor config — docking/theme can't change post-init.
         policy.editorLayoutEnabled = editorModeEnabled_;
-        policy.viewportOnlyUI      = imguiViewportOnly_;
         ApplyPolicy(policy);
         LogPolicySnapshot("STARTUP");
     }
     logInitStep("ApplyPolicy");
 
+    scene_->LoadMap(nullptr);
+    NC::LOGGING::Log("[SCENE] Startup empty viewport: last-scene auto-load skipped");
+
     NC::LOGGING::Log("[DEFERRED] Initialize end");
 }
 
-void DeferredRenderer::buildMaterialSSBO() {
-    if (!TextureServer::sBindlessSupported) return;
-
-    const size_t solidCount = solidDraws.size();
-    const size_t alphaCount = alphaTestDraws.size();
-    const size_t totalCount = solidCount + alphaCount;
-    if (totalCount == 0) return;
-
-    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
-        if (!t) return fallback;
-        uint64_t h = t->GetBindlessHandle();
-        return h ? h : fallback;
-    };
-
-    std::vector<MaterialGPU> materials(totalCount);
-
-    auto fillMaterial = [&](MaterialGPU& m, const DrawCmd& dc) {
-        m.diffuseHandle  = texHandle(dc.tex[0], fallbackWhiteHandle_);
-        m.specularHandle = texHandle(dc.tex[1], fallbackBlackHandle_);
-        m.normalHandle   = texHandle(dc.tex[2], fallbackNormalHandle_);
-        m.emissiveHandle = texHandle(dc.tex[3], fallbackBlackHandle_);
-        m.emissiveIntensity = dc.cachedMatEmissiveIntensity;
-        m.specularIntensity = dc.cachedMatSpecularIntensity;
-        m.specularPower     = dc.cachedMatSpecularPower;
-        m.alphaCutoff       = dc.alphaCutoff;
-        m.flags = 0;
-        if (dc.alphaTest)       m.flags |= MATFLAG_ALPHA_TEST;
-        if (dc.cachedTwoSided)  m.flags |= MATFLAG_TWO_SIDED;
-        if (dc.cachedIsFlatNormal) m.flags |= MATFLAG_FLAT_NORMAL;
-        if (dc.receivesDecals)  m.flags |= MATFLAG_RECEIVES_DECALS;
-        if (dc.cachedIsAdditive) m.flags |= MATFLAG_ADDITIVE;
-        if (dc.cachedHasSpecMap) m.flags |= MATFLAG_HAS_SPEC_MAP;
-        m.bumpScale         = dc.cachedBumpScale;
-        m.intensity0        = dc.cachedIntensity0;
-        m.alphaBlendFactor  = dc.cachedAlphaBlendFactor;
-        m.diffMap1Handle = texHandle(dc.tex[4], 0);
-        m.specMap1Handle = texHandle(dc.tex[5], 0);
-        m.bumpMap1Handle = texHandle(dc.tex[6], 0);
-        m.maskMapHandle  = texHandle(dc.tex[7], 0);
-        m.alphaMapHandle = texHandle(dc.tex[8], 0);
-        m.cubeMapHandle  = texHandle(dc.tex[9], fallbackBlackCubeHandle_);
-        m.velocityX = dc.cachedVelocity.x;
-        m.velocityY = dc.cachedVelocity.y;
-        m.scale     = dc.cachedScale;
-        m.pad0      = 0.0f;
-    };
-
-    for (size_t i = 0; i < solidCount; ++i) {
-        solidDraws[i].gpuMaterialIndex = static_cast<uint32_t>(i);
-        fillMaterial(materials[i], solidDraws[i]);
-    }
-    for (size_t i = 0; i < alphaCount; ++i) {
-        const uint32_t idx = static_cast<uint32_t>(solidCount + i);
-        alphaTestDraws[i].gpuMaterialIndex = idx;
-        fillMaterial(materials[idx], alphaTestDraws[i]);
-    }
-
-    const size_t bytes = totalCount * sizeof(MaterialGPU);
-    if (!materialSSBO_.valid()) glGenBuffers(1, materialSSBO_.put());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, materialSSBO_);
-    if (bytes > materialSSBOCapacity_) {
-        materialSSBOCapacity_ = bytes;
-        glBufferData(GL_SHADER_STORAGE_BUFFER,
-            static_cast<GLsizeiptr>(materialSSBOCapacity_),
-            nullptr, GL_STATIC_DRAW);
-    }
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-        static_cast<GLsizeiptr>(bytes), materials.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-
-    materialSSBOCount_ = totalCount;
-    materialSSBODirty_ = false;
-
-    NC::LOGGING::Log("[DEFERRED] MaterialSSBO built count=", totalCount,
-        " solid=", solidCount, " alpha=", alphaCount,
-        " bytes=", bytes);
-}
-
-void DeferredRenderer::buildDecalMaterialSSBO() {
-    if (!TextureServer::sBindlessSupported) return;
-    if (decalDraws.empty()) return;
-
-    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
-        if (!t) return fallback;
-        uint64_t h = t->GetBindlessHandle();
-        return h ? h : fallback;
-    };
-
-    const size_t count = decalDraws.size();
-    std::vector<DecalMaterialGPU> materials(count);
-    for (size_t i = 0; i < count; ++i) {
-        DrawCmd& dc = decalDraws[i];
-        DecalMaterialGPU& m = materials[i];
-        m.diffuseHandle  = texHandle(dc.tex[0], fallbackWhiteHandle_);
-        m.emissiveHandle = texHandle(dc.tex[3], fallbackBlackHandle_);
-        m.decalScale = dc.decalScale;
-        auto it = dc.shaderParamsInt.find("DecalDiffuseMode");
-        m.decalDiffuseMode = (it != dc.shaderParamsInt.end()) ? static_cast<uint32_t>(it->second) : 0u;
-        m.pad0 = 0.0f;
-        m.pad1 = 0.0f;
-        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
-    }
-
-    const size_t bytes = count * sizeof(DecalMaterialGPU);
-    if (!decalMaterialSSBO_.valid()) glGenBuffers(1, decalMaterialSSBO_.put());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, decalMaterialSSBO_);
-    if (bytes > decalMaterialSSBOCapacity_) {
-        decalMaterialSSBOCapacity_ = bytes;
-        glBufferData(GL_SHADER_STORAGE_BUFFER,
-            static_cast<GLsizeiptr>(decalMaterialSSBOCapacity_),
-            nullptr, GL_STATIC_DRAW);
-    }
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-        static_cast<GLsizeiptr>(bytes), materials.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-
-    decalMaterialSSBOCount_ = count;
-
-    NC::LOGGING::Log("[DEFERRED] DecalMaterialSSBO built count=", count, " bytes=", bytes);
-}
-
-void DeferredRenderer::buildWaterMaterialSSBO() {
-    if (!TextureServer::sBindlessSupported) return;
-    if (waterDraws.empty()) return;
-
-    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
-        if (!t) return fallback;
-        uint64_t h = t->GetBindlessHandle();
-        return h ? h : fallback;
-    };
-
-    const size_t count = waterDraws.size();
-    std::vector<WaterMaterialGPU> materials(count);
-    for (size_t i = 0; i < count; ++i) {
-        DrawCmd& dc = waterDraws[i];
-        WaterMaterialGPU& m = materials[i];
-        m.diffuseHandle     = texHandle(dc.tex[0], fallbackWhiteHandle_);
-        m.bumpHandle        = texHandle(dc.tex[2], fallbackNormalHandle_);
-        m.emissiveHandle    = texHandle(dc.tex[3], fallbackBlackHandle_);
-        m.cubeHandle        = texHandle(dc.tex[9], fallbackBlackCubeHandle_);
-        m.intensity0        = dc.cachedIntensity0;
-        m.emissiveIntensity = dc.cachedMatEmissiveIntensity;
-        m.specularIntensity = dc.cachedMatSpecularIntensity;
-        m.bumpScale         = dc.cachedBumpScale;
-        float uvs = dc.cachedScale;
-        if (uvs <= 0.0f) uvs = 1.0f;
-        m.uvScale           = uvs;
-        m.velocityX         = dc.cachedVelocity.x;
-        m.velocityY         = dc.cachedVelocity.y;
-        m.flags = 0;
-        if (dc.cachedHasVelocity) m.flags |= WATER_FLAG_HAS_VELOCITY;
-        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
-    }
-
-    const size_t bytes = count * sizeof(WaterMaterialGPU);
-    if (!waterMaterialSSBO_.valid()) glGenBuffers(1, waterMaterialSSBO_.put());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, waterMaterialSSBO_);
-    if (bytes > waterMaterialSSBOCapacity_) {
-        waterMaterialSSBOCapacity_ = bytes;
-        glBufferData(GL_SHADER_STORAGE_BUFFER,
-            static_cast<GLsizeiptr>(waterMaterialSSBOCapacity_),
-            nullptr, GL_STATIC_DRAW);
-    }
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-        static_cast<GLsizeiptr>(bytes), materials.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    waterMaterialSSBOCount_ = count;
-    NC::LOGGING::Log("[DEFERRED] WaterMaterialSSBO built count=", count, " bytes=", bytes);
-}
-
-void DeferredRenderer::buildRefractionMaterialSSBO() {
-    if (!TextureServer::sBindlessSupported) return;
-    if (refractionDraws.empty()) return;
-
-    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
-        if (!t) return fallback;
-        uint64_t h = t->GetBindlessHandle();
-        return h ? h : fallback;
-    };
-
-    const size_t count = refractionDraws.size();
-    std::vector<RefractionMaterialGPU> materials(count);
-    for (size_t i = 0; i < count; ++i) {
-        DrawCmd& dc = refractionDraws[i];
-        RefractionMaterialGPU& m = materials[i];
-        m.distortHandle = texHandle(dc.tex[0], fallbackWhiteHandle_);
-        m.velocityX = dc.cachedVelocity.x;
-        m.velocityY = dc.cachedVelocity.y;
-        float distScale = dc.cachedIntensity0;
-        auto it = dc.shaderParamsFloat.find("distortionScale");
-        if (it != dc.shaderParamsFloat.end()) distScale = it->second;
-        m.distortionScale = distScale;
-        m.pad0 = 0.0f;
-        m.pad1 = 0.0f;
-        m.pad2 = 0.0f;
-        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
-    }
-
-    const size_t bytes = count * sizeof(RefractionMaterialGPU);
-    if (!refractionMaterialSSBO_.valid()) glGenBuffers(1, refractionMaterialSSBO_.put());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, refractionMaterialSSBO_);
-    if (bytes > refractionMaterialSSBOCapacity_) {
-        refractionMaterialSSBOCapacity_ = bytes;
-        glBufferData(GL_SHADER_STORAGE_BUFFER,
-            static_cast<GLsizeiptr>(refractionMaterialSSBOCapacity_),
-            nullptr, GL_STATIC_DRAW);
-    }
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-        static_cast<GLsizeiptr>(bytes), materials.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    refractionMaterialSSBOCount_ = count;
-    NC::LOGGING::Log("[DEFERRED] RefractionMaterialSSBO built count=", count, " bytes=", bytes);
-}
-
-void DeferredRenderer::buildEnvAlphaMaterialSSBO() {
-    if (!TextureServer::sBindlessSupported) return;
-    if (environmentAlphaDraws.empty()) return;
-
-    auto texHandle = [](const NDEVC::Graphics::ITexture* t, uint64_t fallback) -> uint64_t {
-        if (!t) return fallback;
-        uint64_t h = t->GetBindlessHandle();
-        return h ? h : fallback;
-    };
-
-    const size_t count = environmentAlphaDraws.size();
-    std::vector<EnvAlphaMaterialGPU> materials(count);
-    for (size_t i = 0; i < count; ++i) {
-        DrawCmd& dc = environmentAlphaDraws[i];
-        EnvAlphaMaterialGPU& m = materials[i];
-        m.diffuseHandle     = texHandle(dc.tex[0], fallbackWhiteHandle_);
-        m.specHandle        = texHandle(dc.tex[1], fallbackWhiteHandle_);
-        m.bumpHandle        = texHandle(dc.tex[2], fallbackNormalHandle_);
-        m.emsvHandle        = texHandle(dc.tex[3], fallbackBlackHandle_);
-        m.envCubeHandle     = texHandle(dc.tex[9], fallbackBlackCubeHandle_);
-        m.reflectivity      = dc.cachedIntensity0;
-        m.specularIntensity = dc.cachedMatSpecularIntensity;
-        m.alphaBlendFactor  = dc.cachedAlphaBlendFactor;
-        m.flags = 0;
-        if (dc.cachedTwoSided)    m.flags |= ENVALPHA_FLAG_TWO_SIDED;
-        if (dc.cachedIsFlatNormal) m.flags |= ENVALPHA_FLAG_FLAT_NORMAL;
-        m.pad0 = 0.0f;
-        m.pad1 = 0.0f;
-        dc.gpuMaterialIndex = static_cast<uint32_t>(i);
-    }
-
-    const size_t bytes = count * sizeof(EnvAlphaMaterialGPU);
-    if (!envAlphaMaterialSSBO_.valid()) glGenBuffers(1, envAlphaMaterialSSBO_.put());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, envAlphaMaterialSSBO_);
-    if (bytes > envAlphaMaterialSSBOCapacity_) {
-        envAlphaMaterialSSBOCapacity_ = bytes;
-        glBufferData(GL_SHADER_STORAGE_BUFFER,
-            static_cast<GLsizeiptr>(envAlphaMaterialSSBOCapacity_),
-            nullptr, GL_STATIC_DRAW);
-    }
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-        static_cast<GLsizeiptr>(bytes), materials.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    envAlphaMaterialSSBOCount_ = count;
-    NC::LOGGING::Log("[DEFERRED] EnvAlphaMaterialSSBO built count=", count, " bytes=", bytes);
-}
 
 void DeferredRenderer::Shutdown() {
-    NC::LOGGING::Log("[DEFERRED] Shutdown begin");
     if (shutdownComplete_) return;
     shutdownComplete_ = true;
 
+    // Stop the render thread before reclaiming the GL context.
+    // gate_.Stop() unblocks WaitFrame() so the thread exits cleanly.
+    gate_.Stop();
+    if (renderThread_.joinable()) renderThread_.join();
+
+    // Reclaim the GL context on the main thread for shutdown GL cleanup.
     if (window_) {
         window_->MakeCurrent();
     }
 
-    ShutdownImGui();
-    ClearDisabledDraws();
-    Particles::ParticleServer::Instance().Close();
-
-    solidDraws.clear();
-    decalDraws.clear();
-    alphaTestDraws.clear();
-    simpleLayerDraws.clear();
-    environmentDraws.clear();
-    environmentAlphaDraws.clear();
-    refractionDraws.clear();
-    waterDraws.clear();
-    postAlphaUnlitDraws.clear();
-    particleDraws.clear();
-
-    scene_.Clear();
-    animatedDraws.clear();
-    pointLights.clear();
-    gClips.clear();
-    gAnimPose.clear();
-    ClearAnimationOwnerData();
-    selectedObject = nullptr;
-    selectedIndex = -1;
-    cachedObj = DrawCmd{};
-    cachedIndex = -1;
-    visibleCells_.clear();
-    lastVisibleCells_.clear();
-    visibilityStage_.Reset();
-    visibilityStageFrameIndex_ = 0;
+    scene_->Clear();
     scenePrepared = false;
-
-    shadowGraph.reset();
-    geometryGraph.reset();
-    decalGraph.reset();
-    lightingGraph.reset();
-    particleGraph.reset();
-    solidBatchSystem_.reset(true);
-    alphaTestBatchSystem_.reset(true);
-    environmentBatchSystem_.reset(true);
-    environmentAlphaBatchSystem_.reset(true);
-    decalBatchSystem_.reset(true);
 
     bool hasGLContext = false;
     if (window_) {
@@ -2022,37 +722,13 @@ void DeferredRenderer::Shutdown() {
         for (int i = 0; i < kMaxFramesInFlight + 1; ++i) {
             if (frameFences_[i]) { glDeleteSync(frameFences_[i]); frameFences_[i] = nullptr; }
         }
-        solidBatchSystem_.shutdownGL();
-        alphaTestBatchSystem_.shutdownGL();
-        environmentBatchSystem_.shutdownGL();
-        environmentAlphaBatchSystem_.shutdownGL();
-        decalBatchSystem_.shutdownGL();
-        if (fallbackWhiteHandle_) { glMakeTextureHandleNonResidentARB(fallbackWhiteHandle_); fallbackWhiteHandle_ = 0; }
-        if (fallbackBlackHandle_) { glMakeTextureHandleNonResidentARB(fallbackBlackHandle_); fallbackBlackHandle_ = 0; }
-        if (fallbackNormalHandle_) { glMakeTextureHandleNonResidentARB(fallbackNormalHandle_); fallbackNormalHandle_ = 0; }
-        if (fallbackBlackCubeHandle_) { glMakeTextureHandleNonResidentARB(fallbackBlackCubeHandle_); fallbackBlackCubeHandle_ = 0; }
-        materialSSBO_.reset();
-        materialSSBOCapacity_ = 0;
-        materialSSBOCount_ = 0;
         TextureServer::instance().clearCache(true);
         releaseOwnedGLResources();
     } else {
         const bool hasLeakedGLState =
-            solidBatchSystem_.hasGLResources() ||
-            alphaTestBatchSystem_.hasGLResources() ||
-            environmentBatchSystem_.hasGLResources() ||
-            environmentAlphaBatchSystem_.hasGLResources() ||
-            decalBatchSystem_.hasGLResources() ||
             MegaBuffer::instance().hasGLResources() ||
             TextureServer::instance().hasCachedTextures() ||
-            shadowMatrixSSBO_ || shadowIndirectBuffer_ || pointLightInstanceVBO ||
-            materialSSBO_.valid() ||
-            quadVAO || quadVBO || sphereVAO || debugCellVAO_ || debugCellVBO_ ||
-            debugLineProgram_ || gDepthCopyReadFBO || gDepthDecalFBO ||
-            gBuffer || lightFBO || sceneFBO || sceneFBO2 ||
-            gPositionVS || gPositionWS || gPosition || gNormalDepthPacked ||
-            gAlbedoSpec || gDepth || gEmissive || gPositionWSRead ||
-            shadowFBOCascades[0] || shadowFBOCascades[1];
+            quadVAO || quadVBO;
         if (hasLeakedGLState) {
             NC::LOGGING::Error("[DEFERRED][RAII] Shutdown without active GL context while GL resources are still live");
         }
@@ -2061,21 +737,14 @@ void DeferredRenderer::Shutdown() {
     MeshServer::instance().clearCache();
     ModelServer::instance().clearCache();
 
-    for (auto& tex : shadowMapTextures) tex.reset();
     whiteTex_abstracted.reset();
     blackTex_abstracted.reset();
     normalTex_abstracted.reset();
     blackCubeTex_abstracted.reset();
-    lightBufferTex.reset();
-    sceneColorTex.reset();
-    sceneDepthStencilTex.reset();
-    sceneColor2Tex.reset();
 
     samplerRepeat_abstracted.reset();
     samplerClamp_abstracted.reset();
     samplerShadow_abstracted.reset();
-    sphereVBO_abstracted.reset();
-    sphereEBO_abstracted.reset();
 
     whiteTex.id = 0;
     blackTex.id = 0;
@@ -2083,18 +752,7 @@ void DeferredRenderer::Shutdown() {
     blackCubeTex.id = 0;
     gSamplerRepeat.id = 0;
     gSamplerClamp.id = 0;
-    gPositionVS.id = 0;
-    gPositionWS.id = 0;
-    gPosition.id = 0;
-    gNormalDepthPacked.id = 0;
-    gAlbedoSpec.id = 0;
-    gDepth.id = 0;
-    gEmissive.id = 0;
-    gDepthDecal.id = 0;
-    sceneDepthStencil.id = 0;
-    sceneColor.id = 0;
-    sceneColor2.id = 0;
-    lightBuffer.id = 0;
+    gSamplerShadow.id = 0;
 
     if (shaderManager) shaderManager->Shutdown();
     shaderManager.reset();
@@ -2116,13 +774,209 @@ void DeferredRenderer::RenderFrame() {
     NC::LOGGING::Log("[DEFERRED] RenderFrame loop end");
 }
 
+void DeferredRenderer::UpdateFrameTime() {
+    const double currentFrame = GetTimeSeconds();
+    deltaTime = currentFrame - lastFrame;
+    lastFrame = currentFrame;
+
+    // Sanitize deltaTime to prevent instability
+    if (deltaTime <= 0.0 || !std::isfinite(deltaTime)) deltaTime = 1.0 / 60.0;
+    if (deltaTime > 1.0 / 30.0) deltaTime = 1.0 / 30.0;  // 33ms max, prevents 10x frame time variance
+}
+
+void DeferredRenderer::SetFrameDeltaTime(double dt) {
+    deltaTime = dt;
+}
+
 void DeferredRenderer::PollEvents() {
-    if (window_) {
-        window_->PollEvents();
+    if (!window_) return;
+
+    window_->PollEvents();
+
+    // ── Mouse / Keyboard Input Handling (Previously PollFrameInput) ───────
+    bool allowViewportKeyboardInput = editorHosted_ || !editorViewportInputRouting_;
+    if (!allowViewportKeyboardInput && editorModeEnabled_ && editorViewportInputRouting_) {
+        if (sceneViewportValid_) {
+            double cursorX = 0.0, cursorY = 0.0;
+            window_->GetCursorPos(cursorX, cursorY);
+            allowViewportKeyboardInput = IsSceneViewportInputActive() || IsSceneViewportPointerInside(cursorX, cursorY);
+        } else {
+            allowViewportKeyboardInput = true;
+        }
+    }
+
+    static bool lastLoggedState = false;
+    if (allowViewportKeyboardInput != lastLoggedState) {
+        NC::LOGGING::Info(NC::LOGGING::Category::Graphics,
+            "[INPUT] allowViewportKeyboardInput=", (allowViewportKeyboardInput ? 1 : 0),
+            " editorHosted=", (editorHosted_ ? 1 : 0),
+            " editorModeEnabled=", (editorModeEnabled_ ? 1 : 0),
+            " editorViewportInputRouting=", (editorViewportInputRouting_ ? 1 : 0),
+            " sceneViewportValid=", (sceneViewportValid_ ? 1 : 0));
+        lastLoggedState = allowViewportKeyboardInput;
+    }
+
+    if (allowViewportKeyboardInput) {
+        currentInput_.moveForward = window_->IsKeyPressed(GLFW_KEY_W);
+        currentInput_.moveBackward = window_->IsKeyPressed(GLFW_KEY_S);
+        currentInput_.moveRight = window_->IsKeyPressed(GLFW_KEY_D);
+        currentInput_.moveLeft = window_->IsKeyPressed(GLFW_KEY_A);
+        currentInput_.moveUp = window_->IsKeyPressed(GLFW_KEY_E) || window_->IsKeyPressed(GLFW_KEY_SPACE);
+        currentInput_.moveDown = window_->IsKeyPressed(GLFW_KEY_Q) || window_->IsKeyPressed(GLFW_KEY_LEFT_CONTROL);
+
+        bool anyMovement = currentInput_.moveForward || currentInput_.moveBackward ||
+                          currentInput_.moveLeft || currentInput_.moveRight ||
+                          currentInput_.moveUp || currentInput_.moveDown;
+        if (anyMovement) {
+            MarkDirty();
+        }
+
+        // Mouse Rotation — record input for fixed timestep update
+        double mouseX = 0.0, mouseY = 0.0;
+        window_->GetCursorPos(mouseX, mouseY);
+        const bool rmbDown = window_->IsMouseButtonPressed(GLFW_MOUSE_BUTTON_RIGHT);
+        
+        bool pointerAllowed = !(editorModeEnabled_ && editorViewportInputRouting_) || !sceneViewportValid_ || IsSceneViewportPointerInside(mouseX, mouseY);
+        if (isRotating_) pointerAllowed = true; // Lock focus while dragging
+
+        currentInput_.mouseRotateX = 0.0f;
+        currentInput_.mouseRotateY = 0.0f;
+        if (!rmbDown || !pointerAllowed) {
+            isRotating_ = false;
+        } else {
+            if (!isRotating_) {
+                lastMouseX_ = mouseX;
+                lastMouseY_ = mouseY;
+                isRotating_ = true;
+            } else {
+                const float dx = static_cast<float>(mouseX - lastMouseX_);
+                const float dy = static_cast<float>(lastMouseY_ - mouseY);
+                lastMouseX_ = mouseX;
+                lastMouseY_ = mouseY;
+                if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
+                    currentInput_.mouseRotateX += dx;
+                    currentInput_.mouseRotateY += dy;
+                    MarkDirty();
+                }
+            }
+        }
+
+        // Scroll Handling — record for fixed timestep update
+        if (std::abs(accumulatedScrollDelta_) > 0.001f) {
+            bool scrollAllowed = !(editorModeEnabled_ && editorViewportInputRouting_) || !sceneViewportValid_ || IsSceneViewportPointerInside(mouseX, mouseY);
+            if (scrollAllowed) {
+                currentInput_.scrollDelta += accumulatedScrollDelta_;
+                MarkDirty();
+            }
+            accumulatedScrollDelta_ = 0.0f;
+        }
+
+        static const bool cameraTrace = CameraTraceEnabledByDefault();
+        static uint64_t inputSeq = 0;
+        ++inputSeq;
+        const bool hasScroll = std::abs(currentInput_.scrollDelta) > 0.001f;
+        if (cameraTrace && (inputSeq % 60 == 0 || hasScroll || !pointerAllowed)) {
+            NC::LOGGING::Info(NC::LOGGING::Category::Input,
+                "[CAMERA_TRACE][INPUT] seq=", inputSeq,
+                " rendererDt=", deltaTime,
+                " allow=", (allowViewportKeyboardInput ? 1 : 0),
+                " W=", (currentInput_.moveForward ? 1 : 0),
+                " A=", (currentInput_.moveLeft ? 1 : 0),
+                " S=", (currentInput_.moveBackward ? 1 : 0),
+                " D=", (currentInput_.moveRight ? 1 : 0),
+                " Up=", (currentInput_.moveUp ? 1 : 0),
+                " Down=", (currentInput_.moveDown ? 1 : 0),
+                " mouse=", mouseX, ",", mouseY,
+                " rmb=", (rmbDown ? 1 : 0),
+                " pointerAllowed=", (pointerAllowed ? 1 : 0),
+                " rotating=", (isRotating_ ? 1 : 0),
+                " mouseDelta=", currentInput_.mouseRotateX, ",", currentInput_.mouseRotateY,
+                " scroll=", currentInput_.scrollDelta);
+        }
+    }
+
+    const bool lmbDown = window_->IsMouseButtonPressed(GLFW_MOUSE_BUTTON_LEFT);
+    if (lmbDown && !lmbWasDown_)
+        shiftHeldAtLastLeftClick_ = (window_->IsKeyPressed(GLFW_KEY_LEFT_SHIFT) || window_->IsKeyPressed(GLFW_KEY_RIGHT_SHIFT));
+    lmbWasDown_ = lmbDown;
+
+    constexpr double actualDeltaThreshold = 0.1;
+    if (deltaTime > actualDeltaThreshold) {
+        NC::LOGGING::Warning(NC::LOGGING::Category::Graphics,
+            "[PERF WARNING] Frame stall detected: deltaTime=", deltaTime, "s (clamped from larger value)");
     }
     HandleDroppedPaths();
     if (inputSystem_) {
         inputSystem_->Update();
+    }
+}
+
+void DeferredRenderer::UpdateCameraFixed() {
+    static const bool cameraTrace = CameraTraceEnabledByDefault();
+    static uint64_t cameraSeq = 0;
+    ++cameraSeq;
+
+    const float shiftMultiplier = 4.0f;
+    double cameraDt = deltaTime;
+    if (cameraDt <= 0.0 || !std::isfinite(cameraDt)) {
+        cameraDt = 1.0 / 60.0;
+    }
+    if (cameraDt > 1.0 / 30.0) {
+        cameraDt = 1.0 / 30.0;
+    }
+    const float dt = static_cast<float>(cameraDt);
+    const glm::dvec3 beforePos = camera.getPosition();
+    const double beforeYaw = camera.getYaw();
+    const double beforePitch = camera.getPitch();
+    const bool anyMovement =
+        currentInput_.moveForward || currentInput_.moveBackward ||
+        currentInput_.moveLeft || currentInput_.moveRight ||
+        currentInput_.moveUp || currentInput_.moveDown;
+    const float pendingMouseX = currentInput_.mouseRotateX;
+    const float pendingMouseY = currentInput_.mouseRotateY;
+    const float pendingScroll = currentInput_.scrollDelta;
+
+    if (currentInput_.moveForward)
+        camera.processKeyboard(Camera::CameraMovement::FORWARD, dt, shiftMultiplier);
+    if (currentInput_.moveBackward)
+        camera.processKeyboard(Camera::CameraMovement::BACKWARD, dt, shiftMultiplier);
+    if (currentInput_.moveRight)
+        camera.processKeyboard(Camera::CameraMovement::RIGHT, dt, shiftMultiplier);
+    if (currentInput_.moveLeft)
+        camera.processKeyboard(Camera::CameraMovement::LEFT, dt, shiftMultiplier);
+    if (currentInput_.moveUp)
+        camera.processKeyboard(Camera::CameraMovement::UP, dt, shiftMultiplier);
+    if (currentInput_.moveDown)
+        camera.processKeyboard(Camera::CameraMovement::DOWN, dt, shiftMultiplier);
+
+    if (std::abs(currentInput_.mouseRotateX) > 0.001f || std::abs(currentInput_.mouseRotateY) > 0.001f) {
+        camera.processMouseMovement(currentInput_.mouseRotateX, currentInput_.mouseRotateY);
+        currentInput_.mouseRotateX = 0.0f;
+        currentInput_.mouseRotateY = 0.0f;
+    }
+
+    if (std::abs(currentInput_.scrollDelta) > 0.001f) {
+        camera.processMouseScroll(currentInput_.scrollDelta);
+        currentInput_.scrollDelta = 0.0f;
+    }
+
+    const glm::dvec3 afterPos = camera.getPosition();
+    const glm::dvec3 deltaPos = afterPos - beforePos;
+    const double moveLen = glm::length(deltaPos);
+    if (cameraTrace && (cameraSeq % 60 == 0)) {
+        NC::LOGGING::Info(NC::LOGGING::Category::Graphics,
+            "[CAMERA_TRACE][CAMERA_STEP] seq=", cameraSeq,
+            " cameraDt=", dt,
+            " rendererDt=", deltaTime,
+            " movedInput=", (anyMovement ? 1 : 0),
+            " pendingMouse=", pendingMouseX, ",", pendingMouseY,
+            " pendingScroll=", pendingScroll,
+            " posBefore=", beforePos.x, ",", beforePos.y, ",", beforePos.z,
+            " posAfter=", afterPos.x, ",", afterPos.y, ",", afterPos.z,
+            " delta=", deltaPos.x, ",", deltaPos.y, ",", deltaPos.z,
+            " deltaLen=", moveLen,
+            " yaw=", beforeYaw, "->", camera.getYaw(),
+            " pitch=", beforePitch, "->", camera.getPitch());
     }
 }
 
@@ -2138,9 +992,7 @@ void DeferredRenderer::HandleDroppedPaths() {
     std::string mapDropPath;
     for (const std::string& path : droppedPaths) {
         if (IsMapFilePath(path)) {
-            if (mapDropPath.empty()) {
-                mapDropPath = path;
-            }
+            mapDropPath = path;
         } else {
             shaderDropPaths.push_back(path);
         }
@@ -2157,11 +1009,39 @@ void DeferredRenderer::HandleDroppedPaths() {
     QueueDroppedMapLoad(mapDropPath);
 }
 
+void DeferredRenderer::QueueDroppedPaths(const std::vector<std::string>& paths) {
+    if (paths.empty()) return;
+    bool hasMap = false;
+    std::string lastMapPath;
+    std::vector<std::string> nonMapPaths;
+    nonMapPaths.reserve(paths.size());
+    for (const std::string& path : paths) {
+        if (IsMapFilePath(path)) {
+            hasMap = true;
+            lastMapPath = path;
+        } else {
+            nonMapPaths.push_back(path);
+        }
+    }
+
+    if (hasMap) {
+        pendingDroppedPaths_.erase(
+            std::remove_if(pendingDroppedPaths_.begin(), pendingDroppedPaths_.end(), IsMapFilePath),
+            pendingDroppedPaths_.end());
+        pendingDroppedPaths_.insert(pendingDroppedPaths_.end(), nonMapPaths.begin(), nonMapPaths.end());
+        pendingDroppedPaths_.push_back(lastMapPath);
+        NC::LOGGING::Log("[SCENE] Queued dropped map path=", lastMapPath);
+    } else {
+        pendingDroppedPaths_.insert(pendingDroppedPaths_.end(), paths.begin(), paths.end());
+    }
+    MarkDirty();
+}
+
 void DeferredRenderer::QueueDroppedMapLoad(const std::string& mapDropPath) {
     mapDropLoadStage_ = MapDropLoadStage::Queued;
     mapDropLoadPath_ = mapDropPath;
     mapDropLoadedMap_.reset();
-    mapDropLoadStartSec_ = glfwGetTime();
+    mapDropLoadStartSec_ = GetTimeSeconds();
     mapDropLoadFileSec_ = 0.0;
     mapDropLoadApplySec_ = 0.0;
     mapDropLoadTotalSec_ = 0.0;
@@ -2178,10 +1058,8 @@ bool DeferredRenderer::ProcessPendingDroppedMapLoad(double currentFrame) {
 
     auto presentProgressFrame = [&]() {
         if (window_) {
-            RenderImGui();
             window_->SwapBuffers();
         }
-        lastFrameDrawCalls_ = 0;
     };
 
     if (mapDropLoadStage_ == MapDropLoadStage::Queued) {
@@ -2194,13 +1072,13 @@ bool DeferredRenderer::ProcessPendingDroppedMapLoad(double currentFrame) {
 
     if (mapDropLoadStage_ == MapDropLoadStage::LoadFile) {
         mapDropLoadStatus_ = "Reading map file...";
-        const double t0 = glfwGetTime();
+        const double t0 = GetTimeSeconds();
         MapLoader loader;
         mapDropLoadedMap_ = loader.load_map(mapDropLoadPath_);
-        mapDropLoadFileSec_ = glfwGetTime() - t0;
+        mapDropLoadFileSec_ = GetTimeSeconds() - t0;
 
         if (!mapDropLoadedMap_) {
-            mapDropLoadTotalSec_ = glfwGetTime() - mapDropLoadStartSec_;
+            mapDropLoadTotalSec_ = GetTimeSeconds() - mapDropLoadStartSec_;
             mapDropLoadProgress_ = 0.0f;
             char failedMsg[96] = {};
             std::snprintf(failedMsg, sizeof(failedMsg), "Map load failed (%.2fs)", mapDropLoadTotalSec_);
@@ -2220,50 +1098,36 @@ bool DeferredRenderer::ProcessPendingDroppedMapLoad(double currentFrame) {
     }
 
     if (mapDropLoadStage_ == MapDropLoadStage::ApplyScene) {
-        const double t0 = glfwGetTime();
+        const double t0 = GetTimeSeconds();
         const MapData* droppedMapPtr = mapDropLoadedMap_.get();
-        scene_.ImportMapAsEditableScene(droppedMapPtr, mapDropLoadPath_);
+        scene_->ImportMapAsEditableScene(droppedMapPtr, mapDropLoadPath_);
+        SaveLastScenePath(mapDropLoadPath_);
 
-        ClearDisabledDraws();
-        InvalidateSelection();
-        visFrustumCacheValid_ = false;
-        visGridRevealedAll_ = false;
-        visibilityStage_.Reset();
-        visibilityStageFrameIndex_ = 0;
-        visibleCells_.clear();
-        lastVisibleCells_.clear();
-        slGBufCacheValid_ = false;
-        slViewProjCacheValid_ = false;
-        shadowGroupCacheValid_ = false;
-        shadowCastersDirty_ = true;
-
-        if (droppedMapPtr && !droppedMapPtr->instances.empty()) {
-            glm::vec3 minPos(std::numeric_limits<float>::max());
-            glm::vec3 maxPos(std::numeric_limits<float>::lowest());
-            for (const auto& inst : droppedMapPtr->instances) {
-                minPos.x = std::min(minPos.x, inst.pos.x);
-                minPos.y = std::min(minPos.y, inst.pos.y);
-                minPos.z = std::min(minPos.z, inst.pos.z);
-                maxPos.x = std::max(maxPos.x, inst.pos.x);
-                maxPos.y = std::max(maxPos.y, inst.pos.y);
-                maxPos.z = std::max(maxPos.z, inst.pos.z);
+        if (droppedMapPtr) {
+            glm::vec3 pos(0.0f, 2.0f, 10.0f);
+            glm::vec3 target(0.0f);
+            if (!BuildMapCameraFit(droppedMapPtr->info, pos, target) && !droppedMapPtr->instances.empty()) {
+                glm::vec3 minPos(std::numeric_limits<float>::max());
+                glm::vec3 maxPos(std::numeric_limits<float>::lowest());
+                for (const auto& inst : droppedMapPtr->instances) {
+                    minPos.x = std::min(minPos.x, inst.pos.x);
+                    minPos.y = std::min(minPos.y, inst.pos.y);
+                    minPos.z = std::min(minPos.z, inst.pos.z);
+                    maxPos.x = std::max(maxPos.x, inst.pos.x);
+                    maxPos.y = std::max(maxPos.y, inst.pos.y);
+                    maxPos.z = std::max(maxPos.z, inst.pos.z);
+                }
+                target = 0.5f * (minPos + maxPos);
+                const float halfDiag = 0.5f * glm::length(glm::vec2(maxPos.x - minPos.x, maxPos.z - minPos.z));
+                pos = target + glm::vec3(halfDiag * 0.8f, halfDiag * 0.5f, halfDiag * 0.8f);
             }
-            const glm::vec3 center = 0.5f * (minPos + maxPos);
-            const float halfDiag = 0.5f * glm::length(glm::vec2(maxPos.x - minPos.x, maxPos.z - minPos.z));
-            const float elevation = std::max(halfDiag * 1.6f, 200.0f);
-            camera_.setPosition(glm::vec3(center.x, center.y + elevation, center.z + elevation * 0.7f));
-            camera_.lookAt(center);
-        } else if (droppedMapPtr) {
-            const MapInfo& info = droppedMapPtr->info;
-            const float halfDiag = glm::length(glm::vec2(info.extents.x, info.extents.z));
-            const float elevation = std::max(halfDiag * 1.2f, 200.0f);
-            const glm::vec3 center(info.center.x, info.center.y, info.center.z);
-            camera_.setPosition(glm::vec3(center.x, center.y + elevation, center.z + elevation * 0.7f));
-            camera_.lookAt(center);
+            camera.setPosition(pos);
+            camera.lookAt(target);
+            NC::LOGGING::Log("[SCENE] Camera fit target=(", target.x, ",", target.y, ",", target.z,
+                             ") pos=(", camera.getPosition().x, ",", camera.getPosition().y, ",", camera.getPosition().z, ")");
         }
-
-        mapDropLoadApplySec_ = glfwGetTime() - t0;
-        mapDropLoadTotalSec_ = glfwGetTime() - mapDropLoadStartSec_;
+        mapDropLoadApplySec_ = GetTimeSeconds() - t0;
+        mapDropLoadTotalSec_ = GetTimeSeconds() - mapDropLoadStartSec_;
         mapDropLoadProgress_ = 1.0f;
         char loadedMsg[128] = {};
         std::snprintf(loadedMsg, sizeof(loadedMsg), "Map loaded %.2fs (file %.2fs + scene %.2fs)",
@@ -2271,6 +1135,7 @@ bool DeferredRenderer::ProcessPendingDroppedMapLoad(double currentFrame) {
         mapDropLoadStatus_ = loadedMsg;
         mapDropLoadDisplayUntilSec_ = currentFrame + 2.0;
         mapDropLoadStage_ = MapDropLoadStage::Complete;
+
         MarkDirty();
         NC::LOGGING::Log("[SCENE] Dropped map loaded path=", mapDropLoadPath_,
                          " instances=", droppedMapPtr ? droppedMapPtr->instances.size() : 0,
@@ -2278,12 +1143,23 @@ bool DeferredRenderer::ProcessPendingDroppedMapLoad(double currentFrame) {
                          " fileSec=", mapDropLoadFileSec_,
                          " applySec=", mapDropLoadApplySec_);
         mapDropLoadedMap_.reset();
-        presentProgressFrame();
-        return true;
+        mapDropLoadStage_ = MapDropLoadStage::Idle;
+        mapDropLoadPath_.clear();
+        mapDropLoadStatus_.clear();
+        mapDropLoadProgress_ = 0.0f;
+        return false;
     }
 
     if (mapDropLoadStage_ == MapDropLoadStage::Complete ||
         mapDropLoadStage_ == MapDropLoadStage::Failed) {
+        if (mapDropLoadStage_ == MapDropLoadStage::Complete) {
+            mapDropLoadStage_ = MapDropLoadStage::Idle;
+            mapDropLoadPath_.clear();
+            mapDropLoadStatus_.clear();
+            mapDropLoadProgress_ = 0.0f;
+            MarkDirty();
+            return false;
+        }
         if (currentFrame >= mapDropLoadDisplayUntilSec_) {
             mapDropLoadStage_ = MapDropLoadStage::Idle;
             mapDropLoadPath_.clear();
@@ -2312,31 +1188,45 @@ bool DeferredRenderer::ShouldClose() const {
 
 void DeferredRenderer::Resize(int newWidth, int newHeight) {
     if (newWidth <= 0 || newHeight <= 0) return;
+    static const bool cameraTrace = CameraTraceEnabledByDefault();
+    if (newWidth == width && newHeight == height) {
+        if (cameraTrace) {
+            NC::LOGGING::Info(NC::LOGGING::Category::Graphics,
+                "[CAMERA_TRACE][RESIZE_SKIP] size=", newWidth, "x", newHeight);
+        }
+        return;
+    }
+    if (cameraTrace) {
+        NC::LOGGING::Info(NC::LOGGING::Category::Graphics,
+            "[CAMERA_TRACE][RESIZE] old=", width, "x", height,
+            " new=", newWidth, "x", newHeight);
+    }
     NC::LOGGING::Log("[DEFERRED] Resize old=", width, "x", height, " new=", newWidth, "x", newHeight);
-    width = newWidth;
-    height = newHeight;
+    if (device_ && window_) {
+        device_->SetDefaultFramebuffer(window_->GetDefaultFramebuffer());
+    }
     resizeFramebuffers(newWidth, newHeight);
+    MarkDirty();
 }
 
 void DeferredRenderer::AppendModel(const std::string& path, const glm::vec3& pos,
     const glm::quat& rot, const glm::vec3& scale) {
-    scene_.AppendModel(path, pos, rot, scale);
+    scene_->AppendModel(path, pos, rot, scale);
 }
 
 void DeferredRenderer::LoadMap(const MapData* map) {
     NC::LOGGING::Log("[DEFERRED] LoadMap ptr=", (map ? 1 : 0));
-    scene_.LoadMap(map);
+    scene_->LoadMap(map);
 }
 
 void DeferredRenderer::ReloadMapWithCurrentMode() {
     NC::LOGGING::Log("[DEFERRED] ReloadMapWithCurrentMode");
-    scene_.ReloadMap();
+    scene_->ReloadMap();
 }
 
 void DeferredRenderer::SetCheckGLErrors(bool enabled) {
     NC::LOGGING::Log("[DEFERRED] SetCheckGLErrors ", (enabled ? 1 : 0));
     optCheckGLErrors = enabled;
-    SetGLErrorChecking(enabled);
 }
 
 bool DeferredRenderer::GetCheckGLErrors() const {
@@ -2347,23 +1237,81 @@ void DeferredRenderer::SetRenderLog(bool enabled) {
     optRenderLOG = enabled;
 }
 
+void DeferredRenderer::AttachScene(SceneManager& scene) {
+    scene_ = &scene;
+}
+
 SceneManager& DeferredRenderer::GetScene() {
-    return scene_;
-}
-
-DrawCmd* DeferredRenderer::GetSelectedObject() {
-    ValidateSelectionPointer();
-    return selectedObject;
-}
-
-int DeferredRenderer::GetSelectedIndex() const {
-    return selectedIndex;
+    return *scene_;
 }
 
 Camera& DeferredRenderer::GetCamera() {
-    return camera_;
+    return camera;
 }
 
 const Camera& DeferredRenderer::GetCamera() const {
-    return camera_;
+    return camera;
+}
+
+void DeferredRenderer::SaveLastScenePath(const std::string& scenePath) {
+    const char* envConfigPath = std::getenv("NDEVC_LAST_SCENE_CONFIG");
+    std::string configPath = (envConfigPath && envConfigPath[0]) ? envConfigPath : "ndevc_last_scene.cfg";
+
+    std::ofstream outFile(configPath, std::ios::out | std::ios::trunc);
+    if (!outFile.is_open()) {
+        NC::LOGGING::Error("[SCENE] Failed to open config file for writing: ", configPath);
+        return;
+    }
+
+    outFile << scenePath << "\n";
+    outFile.close();
+    NC::LOGGING::Log("[SCENE] Saved last scene path to config: ", scenePath);
+}
+
+std::string DeferredRenderer::LoadLastScenePath() const {
+    const char* envConfigPath = std::getenv("NDEVC_LAST_SCENE_CONFIG");
+    std::string configPath = (envConfigPath && envConfigPath[0]) ? envConfigPath : "ndevc_last_scene.cfg";
+
+    std::ifstream inFile(configPath);
+    if (!inFile.is_open()) {
+        NC::LOGGING::Log("[SCENE] No saved scene config found: ", configPath);
+        return "";
+    }
+
+    std::string scenePath;
+    if (std::getline(inFile, scenePath)) {
+        inFile.close();
+        if (!scenePath.empty()) {
+            NC::LOGGING::Log("[SCENE] Loaded last scene path from config: ", scenePath);
+            return scenePath;
+        }
+    }
+    inFile.close();
+    return "";
+}
+
+void DeferredRenderer::AutoLoadLastScene() {
+    std::string lastScenePath = LoadLastScenePath();
+    if (lastScenePath.empty()) {
+        NC::LOGGING::Log("[SCENE] No last scene to auto-load");
+        return;
+    }
+
+    std::ifstream sceneFile(lastScenePath);
+    if (!sceneFile.is_open()) {
+        NC::LOGGING::Error("[SCENE] Last scene file not found or inaccessible: ", lastScenePath);
+        return;
+    }
+    sceneFile.close();
+
+    MapLoader loader;
+    std::unique_ptr<MapData> loadedMap = loader.load_map(lastScenePath);
+    if (!loadedMap) {
+        NC::LOGGING::Error("[SCENE] Failed to load last scene: ", lastScenePath);
+        return;
+    }
+
+    scene_->ImportMapAsEditableScene(loadedMap.get(), lastScenePath);
+
+    NC::LOGGING::Log("[SCENE] Auto-loaded last scene: ", lastScenePath);
 }

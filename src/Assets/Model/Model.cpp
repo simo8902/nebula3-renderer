@@ -9,9 +9,10 @@ bool Model::loadFromFile(const std::string& filepath, Reporter& rep, const Optio
     Parser parser(rep, opt);
     if (!parser.parse_file(filepath)) return false;
 
-    rootNode = parser.getRootNode();
-    nodeList = parser.getNodeList();
-    nodeStorage = std::move(parser.getNodeStorage());
+    nodeStorage = parser.takeNodeStorage();
+    nodeList.reserve(nodeStorage.size());
+    for (Node& n : nodeStorage) nodeList.push_back(&n);
+    rootNode = nodeList.empty() ? nullptr : nodeList[0];
     modelType = parser.getModelType();
     modelName = parser.getModelName();
     version = parser.getVersion();

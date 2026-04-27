@@ -78,10 +78,8 @@ public:
         uint16_t len;
         if (!readU16(len)) return false;
         if (len == 0) { out.clear(); return true; }
-        char* buf = new char[len];
-        if (!read(buf, len)) { delete[] buf; return false; }
-        out.assign(buf, len);
-        delete[] buf;
+        out.resize(len);
+        if (!read(out.data(), len)) { out.clear(); return false; }
         return true;
     }
 
